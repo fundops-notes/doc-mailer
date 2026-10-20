@@ -157,6 +157,14 @@ def read_spreadsheet(path):
         return rows
 
 
+def _normalize_word_html(html):
+    """Word 另存的 HTML 会把 {{字段}} 按语言标记拆进多个 span，
+    导致占位符替换失效——这里把字段内部夹杂的标签剥掉，让字段复原成连续文本。"""
+    def rejoin(m):
+        return re.sub(r"<[^>]+>", "", m.group(0))
+    return re.sub(r"\{\{[^}]*?\}\}", rejoin, html)
+
+
 def render_template(tpl, rec):
     mapping = {
         "{{LP名称}}": rec.get("name", ""),
@@ -484,96 +492,129 @@ class App:
 
     # ----- Tab2: 邮件模板 -----
 
+    _word_app = None
+
     def build_tab_tpl(self):
         f = self.tab_tpl
         ttk.Label(f, text="邮件标题模板：").pack(anchor="w", padx=8, pady=(8, 0))
         self.subject_var = tk.StringVar(value=self.data.get("subject", DEFAULT_SUBJECT))
         ttk.Entry(f, textvariable=self.subject_var, width=110).pack(fill="x", padx=8)
 
-        main = ttk.Frame(f)
-        main.pack(fill="both", expand=True, padx=8, pady=4)
-
-        # 左：源码 + 工具栏
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="both", expand=True)
-        bar = ttk.Frame(left)
-        bar.pack(fill="x", pady=(0, 2))
-
-        def wrap_sel(tag):
-            t = self.body_text
-            try:
-                a, b = t.index("sel.first"), t.index("sel.last")
-            except tk.TclError:
-                return
-            sel = t.get(a, b)
-            t.delete(a, b)
-            t.insert(a, f"<{tag}>{sel}</{tag}>")
-
-        for text, tag in [("B", "b"), ("I", "i"), ("U", "u")]:
-            ttk.Button(bar, text=text, width=3,
-                       command=lambda tg=tag: wrap_sel(tg)).pack(side="left", padx=1)
-
-        def color_sel():
-            from tkinter import colorchooser
-            c = colorchooser.askcolor(parent=self.root, title="文字颜色")
-            if not c or not c[1]:
-                return
-            t = self.body_text
-            try:
-                a, b = t.index("sel.first"), t.index("sel.last")
-            except tk.TclError:
-                return
-            sel = t.get(a, b)
-            t.delete(a, b)
-            t.insert(a, f'<span style="color:{c[1]}">{sel}</span>')
-
-        ttk.Button(bar, text="颜色", width=5, command=color_sel).pack(side="left", padx=1)
-
-        def insert_pw_block():
-            t = self.body_text
-            t.insert("insert",
-                     '\n<p style="padding:10px 16px;background:#f5f6f8;'
-                     'border-left:3px solid #4a6fa5;"><b>打开口令：{{打开口令}}</b></p>\n')
-
-        ttk.Button(bar, text="插入口令框", command=insert_pw_block).pack(side="left", padx=4)
-
-        fields = ttk.Menubutton(bar, text="插入字段 ▾")
-        menu = tk.Menu(fields, tearoff=0)
-        for fld in FIELDS:
-            menu.add_command(label=fld,
-                             command=lambda t=fld: self.body_text.insert("insert", t))
-        fields["menu"] = menu
-        fields.pack(side="left", padx=4)
-
-        self.auto_preview = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="自动预览", variable=self.auto_preview).pack(
-            side="left", padx=10)
-        ttk.Button(bar, text="刷新预览", command=self.refresh_preview).pack(side="left", padx=2)
-        ttk.Button(bar, text="浏览器精确预览", command=self.preview).pack(side="left", padx=2)
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bar, text="在 Word 中编辑正文（所见即所得）",
+                   command=self.edit_body_in_word).pack(side="left")
+        ttk.Button(bar, text="刷新预览", command=self.refresh_preview).pack(side="left", padx=6)
         ttk.Button(bar, text="保存模板", command=self.save_template).pack(side="right")
         ttk.Button(bar, text="恢复默认", command=self.reset_template).pack(side="right", padx=2)
 
-        self.body_text = tk.Text(left, height=18, wrap="none", font=("Consolas", 10))
-        self.body_text.pack(fill="both", expand=True)
-        self.body_text.insert("1.0", self.data.get("body", DEFAULT_BODY))
-        self.body_text.bind("<KeyRelease>", self._on_edit)
+        ttk.Label(f, foreground="#666", justify="left", text=(
+            "点上方按钮用 Word 编辑正文：可直接粘贴带格式的富文本（Word / 网页 / Excel 表格均可），"
+            "用 Word 工具栏加粗、调色、插表格图片。\n"
+            "可用字段（在正文里原样输入这些占位符）：{{LP名称}}  {{水印名称}}  {{打开口令}}  {{日期}}\n"
+            "没有权限口令字段——权限口令按规则永远不进入邮件。"
+        )).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # 右：实时预览（PyMuPDF Story 近似渲染，Outlook 实际效果以浏览器/草稿为准）
-        right = ttk.Frame(main)
-        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        ttk.Label(right, text="实时预览（近似渲染）", foreground="#666").pack(anchor="w")
-        self.preview_label = tk.Label(right, anchor="nw", justify="left",
-                                      background="#ffffff")
-        self.preview_label.pack(fill="both", expand=True)
-        ttk.Label(right, foreground="#888",
-                  text="预览为近似效果；「浏览器精确预览」更接近 Outlook 实际显示。"
-                  ).pack(anchor="w")
+        self.preview_label = tk.Label(f, anchor="nw", background="#ffffff")
+        self.preview_label.pack(fill="both", expand=True, padx=8, pady=4)
 
-    def _on_edit(self, _e=None):
-        if self._after_id:
-            self.root.after_cancel(self._after_id)
-        if self.auto_preview.get():
-            self._after_id = self.root.after(900, self.refresh_preview)
+    def edit_body_in_word(self):
+        import win32com.client as win32
+        html_path = app_dir() / "邮件正文模板_编辑中.html"
+        full = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
+                '<title>邮件正文模板</title></head><body>'
+                + self.data.get("body", DEFAULT_BODY) + "</body></html>")
+        html_path.write_text(full, encoding="utf-8")
+        try:
+            word = win32.DispatchEx("Word.Application")
+            word.Visible = True
+            doc = word.Documents.Open(str(html_path))
+        except Exception as e:
+            messagebox.showerror("需要 Word",
+                                 f"无法用 Word 打开正文编辑：{e}\n请确认本机已安装 Word。")
+            return
+        self._word_app = (word, str(html_path))
+        try:
+            word.Activate()
+        except Exception:
+            pass
+        win = tk.Toplevel(self.root)
+        win.title("Word 编辑中")
+        tk.Label(win, justify="left", padx=14, pady=10, text=(
+            "已用 Word 打开模板正文。\n\n"
+            "· 可直接粘贴富文本，用 Word 工具栏排版\n"
+            "· 编辑完成后点【读取并更新模板】\n"
+            "· 之后可关闭 Word")).pack()
+        bb = ttk.Frame(win)
+        bb.pack(pady=8)
+
+        def do_read():
+            if self._read_word_body():
+                win.destroy()
+
+        ttk.Button(bb, text="读取并更新模板", command=do_read).pack(side="left", padx=6)
+        ttk.Button(bb, text="取消", command=win.destroy).pack(side="left", padx=6)
+
+    def _read_word_body(self):
+        import os
+        import re
+        import tempfile
+        candidates = []
+        if getattr(self, "_word_app", None):
+            word, path = self._word_app
+            try:
+                for d in word.Documents:
+                    if d.FullName.lower() == path.lower():
+                        try:
+                            d.WebOptions.Encoding = 65001  # UTF-8
+                        except Exception:
+                            pass
+                        fd, tmp = tempfile.mkstemp(suffix=".html")
+                        os.close(fd)
+                        d.SaveAs2(tmp, 10)  # 10 = wdFormatFilteredHTML
+                        candidates.append(Path(tmp))
+                        import shutil
+                        shutil.copyfile(tmp, path)  # 让原文档路径保持最新内容
+                        break
+            except Exception:
+                pass  # Word 已被用户关闭等情况，走文件回退
+        f = app_dir() / "邮件正文模板_编辑中.html"
+        if f.exists():
+            candidates.append(f)
+        import re as _re
+        for c in candidates:
+            try:
+                txt = c.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                txt = c.read_text(encoding="gbk", errors="ignore")
+            m = _re.search(r"<body[^>]*>(.*)</body>", txt, _re.S | _re.I)
+            if m and len(m.group(1).strip()) > 10:
+                body = _normalize_word_html(m.group(1).strip())
+                self.data["body"] = body
+                self.save_data()
+                self.refresh_preview()
+                return True
+        messagebox.showwarning(
+            "未读取到内容",
+            "没读到已保存的正文。请在 Word 中编辑后点【读取并更新模板】\n"
+            "（若已关闭 Word，请先在 Word 里 Ctrl+S 保存过再试）。")
+        return False
+
+    def collect_template(self):
+        return (self.subject_var.get().strip(),
+                self.data.get("body", DEFAULT_BODY))
+
+    def save_template(self):
+        self.data["subject"], self.data["body"] = self.collect_template()
+        self.save_data()
+        self.refresh_preview()
+        messagebox.showinfo("模板", "已保存")
+
+    def reset_template(self):
+        self.subject_var.set(DEFAULT_SUBJECT)
+        self.data["body"] = DEFAULT_BODY
+        self.save_data()
+        self.refresh_preview()
 
     def refresh_preview(self):
         try:
@@ -588,37 +629,16 @@ class App:
                     f'{render_template(body, rec)}</div>')
             png = render_preview_pixmap(html)
             img = Image.open(io.BytesIO(png))
-            # 预览区宽度自适应，等比缩放
             w = max(self.preview_label.winfo_width(), 200) - 4
             if w > 20 and img.width > w:
                 h = int(img.height * w / img.width)
                 img = img.resize((w, h))
             self._preview_img = ImageTk.PhotoImage(img)
-            self.preview_label.configure(image=self._preview_img)
+            self.preview_label.configure(image=self._preview_img, text="")
             self.preview_label.image = self._preview_img
         except Exception as e:
             self.preview_label.configure(
-                image="", text=f"预览渲染失败：{e}\n（可点「浏览器精确预览」）")
-
-    def insert_field(self, text):
-        widget = self.root.focus_get()
-        if widget is self.body_text:
-            self.body_text.insert("insert", text)
-        else:
-            self.subject_var.set(self.subject_var.get() + text)
-
-    def collect_template(self):
-        return self.subject_var.get().strip(), self.body_text.get("1.0", "end").strip()
-
-    def save_template(self):
-        self.data["subject"], self.data["body"] = self.collect_template()
-        self.save_data()
-        messagebox.showinfo("模板", "已保存")
-
-    def reset_template(self):
-        self.subject_var.set(DEFAULT_SUBJECT)
-        self.body_text.delete("1.0", "end")
-        self.body_text.insert("1.0", DEFAULT_BODY)
+                image="", text=f"预览渲染失败：{e}\n（可点「刷新预览」重试）")
 
     def preview(self):
         idx = self.selected_index()
@@ -719,19 +739,23 @@ class App:
         frm = ttk.Frame(win)
         frm.pack(padx=10, pady=8, fill="x")
         self._wm_vars = {}
+        _row = [0]
 
-        def add_row(label, widget):
-            r = len(frm.grid_size()[1])
+        def add_row(label, widget, hint=""):
+            r = _row[0]
+            _row[0] += 1
             ttk.Label(frm, text=label).grid(row=r, column=0, sticky="e", padx=6, pady=3)
             widget.grid(row=r, column=1, sticky="w", padx=6, pady=3)
+            if hint:
+                ttk.Label(frm, foreground="#888", text=hint).grid(
+                    row=r, column=2, sticky="w")
 
         # 布局
         lay = ttk.Combobox(frm, state="readonly", width=18,
                            values=[n for n, _ in self.LAYOUT_OPTS])
         lay.set(dict((v, n) for n, v in self.LAYOUT_OPTS).get(cur.get("layout"), "自动（推荐）"))
-        add_row("布局方式：", lay); self._wm_vars["layout"] = lay
-        ttk.Label(frm, foreground="#888", text="自动=可读则单行缩号，否则折行",
-                  ).grid(row=frm.grid_size()[1] - 1, column=2, sticky="w")
+        add_row("布局方式：", lay, hint="自动=可读则单行缩号，否则折行")
+        self._wm_vars["layout"] = lay
 
         # 字体 / 字号 / 角度
         fnt = ttk.Combobox(frm, state="readonly", width=18,
