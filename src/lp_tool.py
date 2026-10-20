@@ -165,6 +165,214 @@ def _normalize_word_html(html):
     return re.sub(r"\{\{[^}]*?\}\}", rejoin, html)
 
 
+# ---------- 内置富文本编辑器：HTML ↔ tk Text 双向转换 ----------
+
+import html as _htmlmod
+from html.parser import HTMLParser as _HTMLParser
+
+_TAG_STYLE = {}  # tk 标签名 -> 样式 dict（导出时反查）
+
+
+def _style_key(st):
+    return "st:" + ",".join(f"{k}={v}" for k, v in sorted(st.items()) if v)
+
+
+def _ensure_tag(tw, st):
+    name = _style_key(st)
+    if name not in _TAG_STYLE:
+        fam = "Microsoft YaHei"
+        size = st.get("s") or 12
+        styles = []
+        if st.get("b"):
+            styles.append("bold")
+        if st.get("i"):
+            styles.append("italic")
+        if st.get("u"):
+            styles.append("underline")
+        cfg = {"font": tuple([fam, size] + styles)}
+        if st.get("c"):
+            cfg["foreground"] = st["c"]
+        if st.get("bg"):
+            cfg["background"] = st["bg"]
+        if st.get("al") in ("center", "right"):
+            cfg["justify"] = st["al"]
+        tw.tag_configure(name, **cfg)
+        _TAG_STYLE[name] = st
+    return name
+
+
+class _HTML2Runs(_HTMLParser):
+    """把 HTML 解析成 (纯文本, [(起,止,样式)])，样式用于生成 tk 标签。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.stack = [{}]
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        st = dict(self.stack[-1])
+        if tag in ("b", "strong"):
+            st["b"] = 1
+        elif tag in ("i", "em"):
+            st["i"] = 1
+        elif tag == "u":
+            st["u"] = 1
+        elif tag in ("span", "font", "p", "div", "h1", "h2", "h3", "li"):
+            style = a.get("style") or ""
+            for kv in style.replace("：", ":").split(";"):
+                if ":" not in kv:
+                    continue
+                k, v = (x.strip() for x in kv.split(":", 1))
+                k = k.lower()
+                if k == "color" and v.startswith("#"):
+                    st["c"] = v
+                elif k in ("background", "background-color") and v.startswith("#"):
+                    st["bg"] = v
+                elif k == "font-size":
+                    num = v.replace("px", "").replace("pt", "").strip()
+                    try:
+                        if float(num) > 0:
+                            st["s"] = int(float(num))
+                    except ValueError:
+                        pass
+                elif k == "text-align" and v in ("center", "right"):
+                    st["al"] = v
+            if tag == "font" and (a.get("color") or "").startswith("#"):
+                st["c"] = a["color"]
+            if tag == "h1":
+                st.update(b=1, s=20)
+            elif tag == "h2":
+                st.update(b=1, s=17)
+            elif tag == "h3":
+                st.update(b=1, s=14)
+            if a.get("align") in ("center", "right"):
+                st["al"] = a["align"]
+        if tag == "li":
+            self.parts.append(("• ", dict(self.stack[-1])))
+        if tag in ("p", "div", "h1", "h2", "h3", "li", "br", "tr", "table"):
+            self.parts.append(("\n", dict(st)))
+        if tag in ("span", "font", "b", "strong", "i", "em", "u",
+                   "p", "div", "h1", "h2", "h3", "li"):
+            self.stack.append(st)
+
+    def handle_endtag(self, tag):
+        if tag in ("span", "font", "b", "strong", "i", "em", "u",
+                   "p", "div", "h1", "h2", "h3", "li") and len(self.stack) > 1:
+            self.stack.pop()
+
+    def handle_data(self, d):
+        if d and d != "\n":
+            self.parts.append((d, dict(self.stack[-1])))
+
+
+def html_to_runs(html_str):
+    p = _HTML2Runs()
+    p.feed(_normalize_word_html(html_str or ""))
+    p.close()
+    text = "".join(x[0] for x in p.parts)
+    runs, pos = [], 0
+    for frag, st in p.parts:
+        key = _style_key(st)
+        if runs and runs[-1][2] == key:
+            runs[-1][1] = pos + len(frag)
+        else:
+            runs.append([pos, pos + len(frag), dict(st)])
+        pos += len(frag)
+    return text, runs
+
+
+def load_html(tw, html_str):
+    text, runs = html_to_runs(html_str)
+    tw.delete("1.0", "end")
+    tw.insert("1.0", text)
+    for a, b, st in runs:
+        if a < b:
+            tw.tag_add(_ensure_tag(tw, st), f"1.0+{a}c", f"1.0+{b}c")
+
+
+def _style_at(tw, index):
+    st = {}
+    for t in tw.tag_names(index):
+        if t in _TAG_STYLE:
+            st.update(_TAG_STYLE[t])
+    return st
+
+
+def text_to_html(tw, base=(14, "#333333")):
+    """把编辑器内容序列化为 HTML（逐行成段，等样式合并成 span）。"""
+    n_lines = int(tw.index("end-1c").split(".")[0])
+    out = []
+    for ln in range(1, n_lines + 1):
+        raw = tw.get(f"{ln}.0", f"{ln}.end")
+        parts = []
+        for i in range(len(raw)):
+            st = _style_at(tw, f"{ln}.{i}")
+            k = _style_key(st)
+            if parts and parts[-1][2] == k:
+                parts[-1][0] += raw[i]
+            else:
+                parts.append([raw[i], st, k])
+        align = parts[0][1].get("al") if parts else None
+        seg = ""
+        for txt_, st, _k in parts:
+            esc = _htmlmod.escape(txt_)
+            if not any(st.get(x) for x in ("b", "i", "u", "c", "s", "bg")):
+                seg += esc
+                continue
+            inner = esc
+            if st.get("b"):
+                inner = f"<b>{inner}</b>"
+            if st.get("i"):
+                inner = f"<i>{inner}</i>"
+            if st.get("u"):
+                inner = f"<u>{inner}</u>"
+            style = ""
+            if st.get("c"):
+                style += f"color:{st['c']};"
+            if st.get("s") and st["s"] != base[0]:
+                style += f"font-size:{st['s']}px;"
+            if st.get("bg"):
+                style += f"background:{st['bg']};"
+            if style:
+                inner = f'<span style="{style[:-1]}">{inner}</span>'
+            seg += inner
+        alattr = f' align="{align}"' if align else ""
+        out.append(f"<p{alattr}>{seg}</p>" if seg else "<p><br></p>")
+    return ('<div style="font-family:微软雅黑,Segoe UI,Arial;'
+            f'font-size:{base[0]}px;color:{base[1]};line-height:1.8">'
+            + "".join(out) + "</div>")
+
+
+def clip_html_fragment():
+    """读取剪贴板里的 HTML 格式（从 Word/网页复制时存在），失败返回 None。"""
+    try:
+        import win32clipboard
+        fmt = win32clipboard.RegisterClipboardFormat("HTML Format")
+        win32clipboard.OpenClipboard()
+        try:
+            if not win32clipboard.IsClipboardFormatAvailable(fmt):
+                return None
+            raw = win32clipboard.GetClipboardData(fmt)
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", errors="replace")
+            head = raw[:512].decode("ascii", errors="ignore")
+            import re as _re
+            ms = _re.search(r"StartFragment:(\d+)", head)
+            me = _re.search(r"EndFragment:(\d+)", head)
+            if ms and me:
+                s, e = int(ms.group(1)), int(me.group(1))
+                frag = raw[s:e].decode("utf-8", errors="replace")
+            else:
+                frag = raw.decode("utf-8", errors="replace")
+            m = _re.search(r"<body[^>]*>(.*)</body>", frag, _re.S | _re.I)
+            return (m.group(1) if m else frag).strip() or None
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+
+
 def render_template(tpl, rec):
     mapping = {
         "{{LP名称}}": rec.get("name", ""),
@@ -492,8 +700,6 @@ class App:
 
     # ----- Tab2: 邮件模板 -----
 
-    _word_app = None
-
     def build_tab_tpl(self):
         f = self.tab_tpl
         ttk.Label(f, text="邮件标题模板：").pack(anchor="w", padx=8, pady=(8, 0))
@@ -502,15 +708,15 @@ class App:
 
         bar = ttk.Frame(f)
         bar.pack(fill="x", padx=8, pady=6)
-        ttk.Button(bar, text="在 Word 中编辑正文（所见即所得）",
-                   command=self.edit_body_in_word).pack(side="left")
+        ttk.Button(bar, text="打开正文编辑器（所见即所得）",
+                   command=self.open_body_editor).pack(side="left")
         ttk.Button(bar, text="刷新预览", command=self.refresh_preview).pack(side="left", padx=6)
         ttk.Button(bar, text="保存模板", command=self.save_template).pack(side="right")
         ttk.Button(bar, text="恢复默认", command=self.reset_template).pack(side="right", padx=2)
 
         ttk.Label(f, foreground="#666", justify="left", text=(
-            "点上方按钮用 Word 编辑正文：可直接粘贴带格式的富文本（Word / 网页 / Excel 表格均可），"
-            "用 Word 工具栏加粗、调色、插表格图片。\n"
+            "编辑器支持富文本粘贴（Word / 网页复制后 Ctrl+V 自动保留加粗、颜色、字号等），"
+            "工具栏可继续调整。\n"
             "可用字段（在正文里原样输入这些占位符）：{{LP名称}}  {{水印名称}}  {{打开口令}}  {{日期}}\n"
             "没有权限口令字段——权限口令按规则永远不进入邮件。"
         )).pack(anchor="w", padx=8, pady=(0, 4))
@@ -518,87 +724,168 @@ class App:
         self.preview_label = tk.Label(f, anchor="nw", background="#ffffff")
         self.preview_label.pack(fill="both", expand=True, padx=8, pady=4)
 
-    def edit_body_in_word(self):
-        import win32com.client as win32
-        html_path = app_dir() / "邮件正文模板_编辑中.html"
-        full = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
-                '<title>邮件正文模板</title></head><body>'
-                + self.data.get("body", DEFAULT_BODY) + "</body></html>")
-        html_path.write_text(full, encoding="utf-8")
-        try:
-            word = win32.DispatchEx("Word.Application")
-            word.Visible = True
-            doc = word.Documents.Open(str(html_path))
-        except Exception as e:
-            messagebox.showerror("需要 Word",
-                                 f"无法用 Word 打开正文编辑：{e}\n请确认本机已安装 Word。")
-            return
-        self._word_app = (word, str(html_path))
-        try:
-            word.Activate()
-        except Exception:
-            pass
+    def open_body_editor(self):
         win = tk.Toplevel(self.root)
-        win.title("Word 编辑中")
-        tk.Label(win, justify="left", padx=14, pady=10, text=(
-            "已用 Word 打开模板正文。\n\n"
-            "· 可直接粘贴富文本，用 Word 工具栏排版\n"
-            "· 编辑完成后点【读取并更新模板】\n"
-            "· 之后可关闭 Word")).pack()
-        bb = ttk.Frame(win)
-        bb.pack(pady=8)
+        win.title("正文编辑器（所见即所得）")
+        win.geometry("1000x660")
+        win.grab_set()
 
-        def do_read():
-            if self._read_word_body():
-                win.destroy()
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=6)
 
-        ttk.Button(bb, text="读取并更新模板", command=do_read).pack(side="left", padx=6)
-        ttk.Button(bb, text="取消", command=win.destroy).pack(side="left", padx=6)
+        t = tk.Text(win, undo=True, wrap="word", font=("Microsoft YaHei", 12),
+                    spacing1=4, spacing3=4)
+        self._ed_text = t
 
-    def _read_word_body(self):
-        import os
-        import re
-        import tempfile
-        candidates = []
-        if getattr(self, "_word_app", None):
-            word, path = self._word_app
+        def need_sel():
             try:
-                for d in word.Documents:
-                    if d.FullName.lower() == path.lower():
-                        try:
-                            d.WebOptions.Encoding = 65001  # UTF-8
-                        except Exception:
-                            pass
-                        fd, tmp = tempfile.mkstemp(suffix=".html")
-                        os.close(fd)
-                        d.SaveAs2(tmp, 10)  # 10 = wdFormatFilteredHTML
-                        candidates.append(Path(tmp))
-                        import shutil
-                        shutil.copyfile(tmp, path)  # 让原文档路径保持最新内容
-                        break
-            except Exception:
-                pass  # Word 已被用户关闭等情况，走文件回退
-        f = app_dir() / "邮件正文模板_编辑中.html"
-        if f.exists():
-            candidates.append(f)
-        import re as _re
-        for c in candidates:
+                a, b = t.index("sel.first"), t.index("sel.last")
+                return a, b
+            except tk.TclError:
+                return None
+
+        def restyle(**changes):
+            sel = need_sel()
+            if not sel:
+                t.configure(background="#fff4f4")
+                t.after(300, lambda: t.configure(background="white"))
+                return
+            a, b = sel
+            st = _style_at(t, a)
+            for k in list(_TAG_STYLE):
+                t.tag_remove(k, a, b)
+            st.update(changes)
+            st = {k: v for k, v in st.items() if v}
+            t.tag_add(_ensure_tag(t, st), a, b)
+
+        def toggle(opt):
+            sel = need_sel()
+            if not sel:
+                return
+            cur = _style_at(t, sel[0]).get(opt)
+            restyle(**{opt: None if cur else 1})
+
+        for label, opt in [("B", "b"), ("I", "i"), ("U", "u")]:
+            w = tk.Button(bar, text=label, width=3, font=("", 10, "bold" if opt == "b" else "normal"),
+                          relief="groove", command=lambda o=opt: toggle(o))
+            w.pack(side="left", padx=1)
+
+        ttk.Label(bar, text=" 字号").pack(side="left")
+        sz = ttk.Combobox(bar, width=3, state="readonly",
+                          values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24)])
+        sz.set("14")
+        sz.pack(side="left", padx=2)
+
+        def set_size(_e=None):
+            sel = need_sel()
+            if sel:
+                restyle(s=int(sz.get()))
+
+        sz.bind("<Return>", set_size)
+        ttk.Button(bar, text="设定", width=4, command=set_size).pack(side="left", padx=1)
+
+        def pick_fg():
+            from tkinter import colorchooser
+            c = colorchooser.askcolor(parent=win, title="文字颜色")
+            if c and c[1]:
+                restyle(c=c[1])
+
+        def pick_bg():
+            from tkinter import colorchooser
+            c = colorchooser.askcolor(parent=win, title="背景高亮",
+                                      initialcolor="#f5f6f8")
+            if c and c[1]:
+                restyle(bg=c[1])
+
+        ttk.Button(bar, text="文字色", width=6, command=pick_fg).pack(side="left", padx=2)
+        ttk.Button(bar, text="高亮", width=5, command=pick_bg).pack(side="left", padx=1)
+        ttk.Button(bar, text="居中", width=4,
+                   command=lambda: restyle(al="center")).pack(side="left", padx=2)
+        ttk.Button(bar, text="左对齐", width=6,
+                   command=lambda: restyle(al=None)).pack(side="left", padx=1)
+        ttk.Button(bar, text="清除格式", width=8,
+                   command=lambda: restyle(b=None, i=None, u=None, c=None, s=None,
+                                           bg=None, al=None)).pack(side="left", padx=8)
+
+        flds = ttk.Menubutton(bar, text="插入字段 ▾")
+        m = tk.Menu(flds, tearoff=0)
+        for fld in FIELDS:
+            m.add_command(label=fld, command=lambda x=fld: t.insert("insert", x))
+        flds["menu"] = m
+        flds.pack(side="left", padx=2)
+
+        # 富文本粘贴：优先读剪贴板 HTML 格式，保留样式
+        def rich_paste(_e=None):
+            frag = clip_html_fragment()
+            if frag:
+                text, runs = html_to_runs(frag)
+                pos = t.index("insert")
+                t.insert(pos, text)
+                for a, b, st in runs:
+                    if a < b:
+                        t.tag_add(_ensure_tag(t, st),
+                                  f"{pos}+{a}c", f"{pos}+{b}c")
+                return "break"
+            return None  # 无 HTML 格式则走默认纯文本粘贴
+
+        t.bind("<<Paste>>", rich_paste)
+
+        main = ttk.Frame(win)
+        main.pack(fill="both", expand=True, padx=8)
+        t.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(main, command=t.yview)
+        sb.pack(side="left", fill="y")
+        t.configure(yscrollcommand=sb.set)
+
+        pvpane = ttk.Frame(main)
+        pvpane.pack(side="right", fill="y", padx=(6, 0))
+        ttk.Label(pvpane, text="预览（近似）", foreground="#666").pack(anchor="w")
+        pv = tk.Label(pvpane, anchor="nw", background="#ffffff")
+        pv.pack(fill="both", expand=True)
+        ttk.Button(pvpane, text="刷新预览", command=lambda: refresh_pv()).pack(anchor="w", pady=4)
+        self._ed_preview = pv
+
+        def refresh_pv():
             try:
-                txt = c.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                txt = c.read_text(encoding="gbk", errors="ignore")
-            m = _re.search(r"<body[^>]*>(.*)</body>", txt, _re.S | _re.I)
-            if m and len(m.group(1).strip()) > 10:
-                body = _normalize_word_html(m.group(1).strip())
-                self.data["body"] = body
-                self.save_data()
-                self.refresh_preview()
-                return True
-        messagebox.showwarning(
-            "未读取到内容",
-            "没读到已保存的正文。请在 Word 中编辑后点【读取并更新模板】\n"
-            "（若已关闭 Word，请先在 Word 里 Ctrl+S 保存过再试）。")
-        return False
+                import io
+                from PIL import Image, ImageTk
+                rec = {"name": "【示例LP名称】", "wm": "【示例水印名称】",
+                       "open_pw": "【示例口令】"}
+                idx = self.selected_index()
+                if idx is not None and self.data["lps"]:
+                    rec = self.data["lps"][idx]
+                html = render_template(text_to_html(t), rec)
+                png = render_preview_pixmap(html)
+                img = Image.open(io.BytesIO(png))
+                w = 360
+                img = img.resize((w, int(img.height * w / img.width)))
+                self._ed_img = ImageTk.PhotoImage(img)
+                pv.configure(image=self._ed_img, text="")
+            except Exception as e:
+                pv.configure(image="", text=f"预览失败：{e}")
+
+        def on_key(_e=None):
+            if getattr(self, "_ed_after", None):
+                win.after_cancel(self._ed_after)
+            self._ed_after = win.after(1200, refresh_pv)
+
+        t.bind("<KeyRelease>", on_key)
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=6)
+        load_html(t, self.data.get("body", DEFAULT_BODY))
+        refresh_pv()
+
+        def save():
+            self.data["body"] = text_to_html(t)
+            self.save_data()
+            self.refresh_preview()
+            win.destroy()
+
+        ttk.Button(btns, text="保存并关闭", command=save).pack(side="left", padx=8)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
+        ttk.Label(btns, foreground="#888",
+                  text="粘贴提示：从 Word/网页复制后直接 Ctrl+V 自动保留样式").pack(side="left", padx=10)
 
     def collect_template(self):
         return (self.subject_var.get().strip(),
