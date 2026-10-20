@@ -1,0 +1,31 @@
+name: Build Windows exe
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build exe
+        run: pyinstaller --onefile --noconsole --name LP_Tool src/lp_tool.py
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "release_pkg"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item dist/LP_Tool.exe $dir/
+          Copy-Item examples/lp_data.example.json $dir/
+          Copy-Item docs/使用说明.txt $dir/
+          Compress-Archive -Path $dir/* -DestinationPath LP_Tool_win64.zip
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LP_Tool_win64.zip

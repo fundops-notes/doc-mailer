@@ -1,0 +1,14 @@
+本仓库（LP 文档分发助手 / lp-doc-mailer）按 AGPL-3.0 分发。
+
+原因：程序捆绑的 PyMuPDF（MuPDF）采用 AGPL-3.0 许可，对外分发二进制时
+整体需以 AGPL 兼容方式提供源码——本仓库即为该源码。
+
+⚠️ 公开（转 public）之前，请将 GNU 官网的 AGPL-3.0 完整许可证文本
+（https://www.gnu.org/licenses/agpl-3.0.txt）原样粘贴替换本文件，
+不要手工转写或节选。
+
+主要依赖及许可：
+  PyMuPDF / MuPDF   AGPL-3.0（或 Artifex 商业许可）
+  pywin32           PSF 许可
+  openpyxl          MIT
+  Pillow            HPND (MIT-CMU)
