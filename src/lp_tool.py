@@ -651,16 +651,11 @@ class App:
 
         opt = ttk.Frame(f)
         opt.pack(fill="x", padx=8, pady=2)
-        ttk.Label(opt, text="水印不透明度：").pack(side="left")
-        self.opacity_var = tk.DoubleVar(value=0.25)
-        ttk.Spinbox(opt, from_=0.10, to=0.40, increment=0.05, width=5,
-                    textvariable=self.opacity_var).pack(side="left", padx=(2, 12))
-        self.repeat_var = tk.IntVar(value=1)
-        ttk.Checkbutton(opt, text="三份水印（防裁剪）",
-                        variable=self.repeat_var,
-                        onvalue=3, offvalue=1).pack(side="left")
+        ttk.Button(opt, text="水印设置…", command=self.open_wm_settings).pack(side="left")
+        self.wm_summary = ttk.Label(opt, text="")
+        self.wm_summary.pack(side="left", padx=10)
         ttk.Label(opt, foreground="#888",
-                  text="    水印文字 = 每个 LP 的「水印名称」列").pack(side="left")
+                  text="水印文字 = 每个 LP 的「水印名称」列").pack(side="left")
 
         runbar = ttk.Frame(f)
         runbar.pack(fill="x", padx=8, pady=6)
@@ -676,6 +671,7 @@ class App:
         self.log_text = tk.Text(f, height=14, state="disabled",
                                 font=("Consolas", 10), background="#fafafa")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=4)
+        self.update_wm_summary()
 
     def add_pdf(self):
         files = filedialog.askopenfilenames(title="选择原件 PDF",
@@ -694,6 +690,148 @@ class App:
         d = filedialog.askdirectory(title="输出目录")
         if d:
             self.outdir_var.set(d)
+
+    # ----- 水印设置 -----
+
+    LAYOUT_OPTS = [("自动（推荐）", "auto"), ("强制单行", "single"), ("强制折行", "wrap")]
+    REPEAT_OPTS = [("单个", 1), ("三份（防裁剪）", 3), ("平铺 2列×3行", "tile")]
+    ANGLE_OPTS = [("自动（沿对角线）", -1.0), ("45°", 45.0), ("30°", 30.0), ("水平", 0.0)]
+    FONT_OPTS = [("默认", ""), ("黑体", "黑体"), ("楷体", "楷体"),
+                 ("仿宋", "仿宋"), ("宋体", "宋体"), ("微软雅黑", "微软雅黑")]
+
+    def update_wm_summary(self):
+        c = dict(wm.WM_DEFAULTS, **(self.data.get("wm_settings") or {}))
+        layout = dict(self.LAYOUT_OPTS).get(c.get("layout"), c.get("layout"))
+        rep = {1: "单个", 3: "三份", "tile": "平铺"}.get(c.get("repeat"), c.get("repeat"))
+        ang = "对角线" if float(c.get("angle", -1) or -1) < 0 else f"{c.get('angle'):.0f}°"
+        fs = c.get("fs_max") or "自动"
+        font = c.get("font") or "默认"
+        self.wm_summary.configure(
+            text=f"{layout} · {font} · 字号上限{fs} · {ang} · {rep} · "
+                 f"浓度{float(c.get('opacity', 0.25)):.2f}")
+
+    def open_wm_settings(self):
+        cur = dict(wm.WM_DEFAULTS, **(self.data.get("wm_settings") or {}))
+        win = tk.Toplevel(self.root)
+        win.title("水印设置")
+        win.grab_set()
+
+        frm = ttk.Frame(win)
+        frm.pack(padx=10, pady=8, fill="x")
+        self._wm_vars = {}
+
+        def add_row(label, widget):
+            r = len(frm.grid_size()[1])
+            ttk.Label(frm, text=label).grid(row=r, column=0, sticky="e", padx=6, pady=3)
+            widget.grid(row=r, column=1, sticky="w", padx=6, pady=3)
+
+        # 布局
+        lay = ttk.Combobox(frm, state="readonly", width=18,
+                           values=[n for n, _ in self.LAYOUT_OPTS])
+        lay.set(dict((v, n) for n, v in self.LAYOUT_OPTS).get(cur.get("layout"), "自动（推荐）"))
+        add_row("布局方式：", lay); self._wm_vars["layout"] = lay
+        ttk.Label(frm, foreground="#888", text="自动=可读则单行缩号，否则折行",
+                  ).grid(row=frm.grid_size()[1] - 1, column=2, sticky="w")
+
+        # 字体 / 字号 / 角度
+        fnt = ttk.Combobox(frm, state="readonly", width=18,
+                           values=[n for n, _ in self.FONT_OPTS])
+        fnt.set(dict((v, n) for n, v in self.FONT_OPTS).get(cur.get("font"), "默认"))
+        add_row("字体：", fnt); self._wm_vars["font"] = fnt
+
+        fsbox = ttk.Frame(frm)
+        auto_fs = tk.BooleanVar(value=not cur.get("fs_max"))
+        fs_spin_var = tk.IntVar(value=cur.get("fs_max") or 34)
+        cbs = ttk.Checkbutton(fsbox, text="自动", variable=auto_fs)
+        cbs.pack(side="left")
+        sp = ttk.Spinbox(fsbox, from_=16, to=48, width=4, textvariable=fs_spin_var)
+        sp.pack(side="left", padx=4)
+        add_row("最大字号：", fsbox)
+        self._wm_vars["_auto_fs"], self._wm_vars["fs_max"] = auto_fs, fs_spin_var
+
+        ang = ttk.Combobox(frm, state="readonly", width=18,
+                           values=[n for n, _ in self.ANGLE_OPTS])
+        cur_ang = float(cur.get("angle", -1) or -1)
+        ang.set(dict((v, n) for n, v in self.ANGLE_OPTS).get(cur_ang, "自动（沿对角线）"))
+        add_row("角度：", ang); self._wm_vars["angle"] = ang
+
+        rep = ttk.Combobox(frm, state="readonly", width=18,
+                           values=[n for n, _ in self.REPEAT_OPTS])
+        rep.set({1: "单个", 3: "三份（防裁剪）", "tile": "平铺 2列×3行"}
+                .get(cur.get("repeat"), "单个"))
+        add_row("份数：", rep); self._wm_vars["repeat"] = rep
+
+        # 颜色 / 不透明度
+        cbox = ttk.Frame(frm)
+        color_var = tk.StringVar(value=cur.get("color") or "#737373")
+
+        def pick_color():
+            from tkinter import colorchooser
+            c = colorchooser.askcolor(parent=win, title="水印颜色",
+                                      initialcolor=color_var.get())
+            if c and c[1]:
+                color_var.set(c[1])
+
+        ttk.Entry(cbox, textvariable=color_var, width=10).pack(side="left")
+        ttk.Button(cbox, text="选色…", command=pick_color, width=6).pack(side="left", padx=4)
+        add_row("颜色：", cbox); self._wm_vars["color"] = color_var
+
+        opv = tk.DoubleVar(value=float(cur.get("opacity", 0.25)))
+        op = ttk.Spinbox(frm, from_=0.05, to=0.50, increment=0.05, width=5, textvariable=opv)
+        add_row("不透明度：", op); self._wm_vars["opacity"] = opv
+
+        def collect():
+            return {
+                "layout": dict(self.LAYOUT_OPTS).get(lay.get(), "auto"),
+                "font": dict(self.FONT_OPTS).get(fnt.get(), ""),
+                "fs_max": 0 if auto_fs.get() else max(10, min(60, fs_spin_var.get())),
+                "angle": dict(self.ANGLE_OPTS).get(ang.get(), -1.0),
+                "repeat": dict(self.REPEAT_OPTS).get(rep.get(), 1),
+                "color": color_var.get(),
+                "opacity": float(opv.get()),
+            }
+
+        # 预览区
+        ttk.Separator(win).pack(fill="x", padx=10)
+        pf = ttk.Frame(win)
+        pf.pack(padx=10, pady=6, fill="both", expand=True)
+        self._wm_preview_label = tk.Label(pf, anchor="nw", background="#ffffff")
+        self._wm_preview_label.pack(side="left", fill="both", expand=True)
+
+        def refresh_preview():
+            idx = self.selected_index()
+            text = (self.data["lps"][idx].get("wm") if idx is not None
+                    and self.data["lps"] else "新疆乌鲁木齐市泓远红杉股权投资合伙企业（有限合伙）")
+            try:
+                import io
+                from PIL import Image, ImageTk
+                doc = fitz.open()
+                page = doc.new_page()  # A4
+                wm.add_watermark(page, text, collect())
+                png = page.get_pixmap(dpi=72).tobytes("png")
+                img = Image.open(io.BytesIO(png))
+                w = 340
+                img = img.resize((w, int(img.height * w / img.width)))
+                self._wm_preview_img = ImageTk.PhotoImage(img)
+                self._wm_preview_label.configure(image=self._wm_preview_img, text="")
+            except Exception as e:
+                self._wm_preview_label.configure(image="", text=f"预览失败：{e}")
+
+        ttk.Button(pf, text="刷新预览", command=refresh_preview).pack(side="left",
+                                                                      padx=8, anchor="n")
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=8)
+        ttk.Button(btns, text="保存", command=lambda: save_and_close()).pack(
+            side="left", padx=8)
+
+        def save_and_close():
+            self.data["wm_settings"] = collect()
+            self.save_data()
+            self.update_wm_summary()
+            win.destroy()
+
+        refresh_preview()
 
     def log(self, msg):
         def append():
@@ -724,8 +862,7 @@ class App:
         pdfs = list(self.pdfs)
         outdir = Path(self.outdir_var.get())
         outdir.mkdir(parents=True, exist_ok=True)
-        opacity = float(self.opacity_var.get())
-        repeat = int(self.repeat_var.get())
+        cfg = dict(self.data.get("wm_settings") or {})
         lps = [dict(r) for r in self.data["lps"]]
         self.running = True
         self.btn_files.state(["disabled"])
@@ -741,7 +878,7 @@ class App:
                         out = outdir / f"{Path(src).stem}_{sanitize_filename(rec['name'])}.pdf"
                         try:
                             wm.process_one(Path(src), out, rec["wm"], rec["open_pw"],
-                                           rec["owner_pw"], False, repeat, opacity)
+                                           rec["owner_pw"], False, wm_cfg=cfg)
                             outs.append(out)
                             self.log(f"[文件OK] {out.name}")
                         except Exception as e:
