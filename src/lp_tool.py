@@ -249,9 +249,10 @@ class _HTML2Runs(_HTMLParser):
             if a.get("align") in ("center", "right"):
                 st["al"] = a["align"]
         if tag == "li":
-            self.parts.append(("• ", dict(self.stack[-1])))
+            self.parts.append(("• ", {}))
         if tag in ("p", "div", "h1", "h2", "h3", "li", "br", "tr", "table"):
-            self.parts.append(("\n", dict(st)))
+            # 换行符必须不带样式：tk 中带背景标签的换行符会把色条画到编辑区右缘
+            self.parts.append(("\n", {}))
         if tag in ("span", "font", "b", "strong", "i", "em", "u",
                    "p", "div", "h1", "h2", "h3", "li"):
             self.stack.append(st)
@@ -284,11 +285,24 @@ def html_to_runs(html_str):
 
 def load_html(tw, html_str):
     text, runs = html_to_runs(html_str)
+    lead = len(text) - len(text.lstrip("\n"))  # 去掉段首累积出的空行
+    text = text[lead:]
     tw.delete("1.0", "end")
     tw.insert("1.0", text)
     for a, b, st in runs:
+        a, b = max(0, a - lead), max(0, b - lead)
         if a < b:
             tw.tag_add(_ensure_tag(tw, st), f"1.0+{a}c", f"1.0+{b}c")
+    # 对齐标签扩展到整行（tk 的 justify 需要覆盖整行才生效）
+    n_lines = int(tw.index("end-1c").split(".")[0])
+    for ln in range(1, n_lines + 1):
+        al = None
+        for i in range(len(tw.get(f"{ln}.0", f"{ln}.end"))):
+            al = _style_at(tw, f"{ln}.{i}").get("al")
+            if al:
+                break
+        if al:
+            tw.tag_add(_ensure_tag(tw, {"al": al}), f"{ln}.0", f"{ln}.end")
 
 
 def _style_at(tw, index):
@@ -704,192 +718,183 @@ class App:
         f = self.tab_tpl
         ttk.Label(f, text="邮件标题模板：").pack(anchor="w", padx=8, pady=(8, 0))
         self.subject_var = tk.StringVar(value=self.data.get("subject", DEFAULT_SUBJECT))
-        ttk.Entry(f, textvariable=self.subject_var, width=110).pack(fill="x", padx=8)
+        ttk.Entry(f, textvariable=self.subject_var).pack(fill="x", padx=8)
 
-        bar = ttk.Frame(f)
-        bar.pack(fill="x", padx=8, pady=6)
-        ttk.Button(bar, text="打开正文编辑器（所见即所得）",
-                   command=self.open_body_editor).pack(side="left")
-        ttk.Button(bar, text="刷新预览", command=self.refresh_preview).pack(side="left", padx=6)
-        ttk.Button(bar, text="保存模板", command=self.save_template).pack(side="right")
-        ttk.Button(bar, text="恢复默认", command=self.reset_template).pack(side="right", padx=2)
+        self._build_editor_toolbar(f)
 
-        ttk.Label(f, foreground="#666", justify="left", text=(
-            "编辑器支持富文本粘贴（Word / 网页复制后 Ctrl+V 自动保留加粗、颜色、字号等），"
-            "工具栏可继续调整。\n"
-            "可用字段（在正文里原样输入这些占位符）：{{LP名称}}  {{水印名称}}  {{打开口令}}  {{日期}}\n"
-            "没有权限口令字段——权限口令按规则永远不进入邮件。"
-        )).pack(anchor="w", padx=8, pady=(0, 4))
+        # pack 顺序决定空间分配：底部按钮和右侧预览必须先占位，编辑区最后扩展
+        bot = ttk.Frame(f)
+        bot.pack(side="bottom", fill="x", padx=8, pady=4)
+        ttk.Button(bot, text="保存模板", command=self.save_template).pack(side="left")
+        ttk.Button(bot, text="导入HTML文件…", command=self.import_html).pack(side="left", padx=6)
+        ttk.Button(bot, text="恢复默认", command=self.reset_template).pack(side="left")
+        ttk.Button(bot, text="刷新预览", command=self.refresh_preview).pack(side="left", padx=6)
+        ttk.Label(bot, foreground="#888", text=(
+            "Word/网页复制后 Ctrl+V 自动保留样式　|　"
+            "字段：{{LP名称}} {{水印名称}} {{打开口令}} {{日期}}（无权限口令字段）"
+        )).pack(side="left", padx=8)
 
-        self.preview_label = tk.Label(f, anchor="nw", background="#ffffff")
-        self.preview_label.pack(fill="both", expand=True, padx=8, pady=4)
+        main = ttk.Frame(f)
+        main.pack(fill="both", expand=True, padx=8, pady=4)
+        pvpane = tk.Frame(main, width=350, background="#ffffff")
+        pvpane.pack_propagate(False)  # 固定预览列宽
+        pvpane.pack(side="right", fill="y", padx=(8, 0))
+        ttk.Label(pvpane, text="预览（近似渲染）", foreground="#666",
+                  background="#ffffff").pack(anchor="w", padx=4, pady=2)
+        self.preview_label = tk.Label(pvpane, anchor="nw", background="#ffffff")
+        self.preview_label.pack(fill="both", expand=True)
 
-    def open_body_editor(self):
-        win = tk.Toplevel(self.root)
-        win.title("正文编辑器（所见即所得）")
-        win.geometry("1000x660")
-        win.grab_set()
-
-        bar = ttk.Frame(win)
-        bar.pack(fill="x", padx=8, pady=6)
-
-        t = tk.Text(win, undo=True, wrap="word", font=("Microsoft YaHei", 12),
-                    spacing1=4, spacing3=4)
-        self._ed_text = t
-
-        def need_sel():
-            try:
-                a, b = t.index("sel.first"), t.index("sel.last")
-                return a, b
-            except tk.TclError:
-                return None
-
-        def restyle(**changes):
-            sel = need_sel()
-            if not sel:
-                t.configure(background="#fff4f4")
-                t.after(300, lambda: t.configure(background="white"))
-                return
-            a, b = sel
-            st = _style_at(t, a)
-            for k in list(_TAG_STYLE):
-                t.tag_remove(k, a, b)
-            st.update(changes)
-            st = {k: v for k, v in st.items() if v}
-            t.tag_add(_ensure_tag(t, st), a, b)
-
-        def toggle(opt):
-            sel = need_sel()
-            if not sel:
-                return
-            cur = _style_at(t, sel[0]).get(opt)
-            restyle(**{opt: None if cur else 1})
-
-        for label, opt in [("B", "b"), ("I", "i"), ("U", "u")]:
-            w = tk.Button(bar, text=label, width=3, font=("", 10, "bold" if opt == "b" else "normal"),
-                          relief="groove", command=lambda o=opt: toggle(o))
-            w.pack(side="left", padx=1)
-
-        ttk.Label(bar, text=" 字号").pack(side="left")
-        sz = ttk.Combobox(bar, width=3, state="readonly",
-                          values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24)])
-        sz.set("14")
-        sz.pack(side="left", padx=2)
-
-        def set_size(_e=None):
-            sel = need_sel()
-            if sel:
-                restyle(s=int(sz.get()))
-
-        sz.bind("<Return>", set_size)
-        ttk.Button(bar, text="设定", width=4, command=set_size).pack(side="left", padx=1)
-
-        def pick_fg():
-            from tkinter import colorchooser
-            c = colorchooser.askcolor(parent=win, title="文字颜色")
-            if c and c[1]:
-                restyle(c=c[1])
-
-        def pick_bg():
-            from tkinter import colorchooser
-            c = colorchooser.askcolor(parent=win, title="背景高亮",
-                                      initialcolor="#f5f6f8")
-            if c and c[1]:
-                restyle(bg=c[1])
-
-        ttk.Button(bar, text="文字色", width=6, command=pick_fg).pack(side="left", padx=2)
-        ttk.Button(bar, text="高亮", width=5, command=pick_bg).pack(side="left", padx=1)
-        ttk.Button(bar, text="居中", width=4,
-                   command=lambda: restyle(al="center")).pack(side="left", padx=2)
-        ttk.Button(bar, text="左对齐", width=6,
-                   command=lambda: restyle(al=None)).pack(side="left", padx=1)
-        ttk.Button(bar, text="清除格式", width=8,
-                   command=lambda: restyle(b=None, i=None, u=None, c=None, s=None,
-                                           bg=None, al=None)).pack(side="left", padx=8)
-
-        flds = ttk.Menubutton(bar, text="插入字段 ▾")
-        m = tk.Menu(flds, tearoff=0)
-        for fld in FIELDS:
-            m.add_command(label=fld, command=lambda x=fld: t.insert("insert", x))
-        flds["menu"] = m
-        flds.pack(side="left", padx=2)
-
-        # 富文本粘贴：优先读剪贴板 HTML 格式，保留样式
-        def rich_paste(_e=None):
-            frag = clip_html_fragment()
-            if frag:
-                text, runs = html_to_runs(frag)
-                pos = t.index("insert")
-                t.insert(pos, text)
-                for a, b, st in runs:
-                    if a < b:
-                        t.tag_add(_ensure_tag(t, st),
-                                  f"{pos}+{a}c", f"{pos}+{b}c")
-                return "break"
-            return None  # 无 HTML 格式则走默认纯文本粘贴
-
-        t.bind("<<Paste>>", rich_paste)
-
-        main = ttk.Frame(win)
-        main.pack(fill="both", expand=True, padx=8)
+        t = tk.Text(main, undo=True, wrap="word", font=("Microsoft YaHei", 12),
+                    spacing1=4, spacing3=4, padx=12, pady=8,
+                    relief="solid", borderwidth=1)
+        self.body_text = t
         t.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(main, command=t.yview)
         sb.pack(side="left", fill="y")
         t.configure(yscrollcommand=sb.set)
+        t.bind("<<Paste>>", self._ed_rich_paste)
+        t.bind("<KeyRelease>", self._ed_on_key)
 
-        pvpane = ttk.Frame(main)
-        pvpane.pack(side="right", fill="y", padx=(6, 0))
-        ttk.Label(pvpane, text="预览（近似）", foreground="#666").pack(anchor="w")
-        pv = tk.Label(pvpane, anchor="nw", background="#ffffff")
-        pv.pack(fill="both", expand=True)
-        ttk.Button(pvpane, text="刷新预览", command=lambda: refresh_pv()).pack(anchor="w", pady=4)
-        self._ed_preview = pv
-
-        def refresh_pv():
-            try:
-                import io
-                from PIL import Image, ImageTk
-                rec = {"name": "【示例LP名称】", "wm": "【示例水印名称】",
-                       "open_pw": "【示例口令】"}
-                idx = self.selected_index()
-                if idx is not None and self.data["lps"]:
-                    rec = self.data["lps"][idx]
-                html = render_template(text_to_html(t), rec)
-                png = render_preview_pixmap(html)
-                img = Image.open(io.BytesIO(png))
-                w = 360
-                img = img.resize((w, int(img.height * w / img.width)))
-                self._ed_img = ImageTk.PhotoImage(img)
-                pv.configure(image=self._ed_img, text="")
-            except Exception as e:
-                pv.configure(image="", text=f"预览失败：{e}")
-
-        def on_key(_e=None):
-            if getattr(self, "_ed_after", None):
-                win.after_cancel(self._ed_after)
-            self._ed_after = win.after(1200, refresh_pv)
-
-        t.bind("<KeyRelease>", on_key)
-
-        btns = ttk.Frame(win)
-        btns.pack(pady=6)
         load_html(t, self.data.get("body", DEFAULT_BODY))
-        refresh_pv()
 
-        def save():
-            self.data["body"] = text_to_html(t)
-            self.save_data()
-            self.refresh_preview()
-            win.destroy()
+    # ----- 内嵌富文本编辑器 -----
 
-        ttk.Button(btns, text="保存并关闭", command=save).pack(side="left", padx=8)
-        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
-        ttk.Label(btns, foreground="#888",
-                  text="粘贴提示：从 Word/网页复制后直接 Ctrl+V 自动保留样式").pack(side="left", padx=10)
+    def _build_editor_toolbar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=8, pady=(6, 2))
+        for label, opt in [("B", "b"), ("I", "i"), ("U", "u")]:
+            tk.Button(bar, text=label, width=3,
+                      font=("", 10, "bold" if opt == "b" else "normal"),
+                      relief="groove",
+                      command=lambda o=opt: self._ed_toggle(o)).pack(side="left", padx=1)
+        ttk.Label(bar, text=" 字号").pack(side="left")
+        self._ed_size = ttk.Combobox(bar, width=3, state="readonly",
+                                     values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24)])
+        self._ed_size.set("14")
+        self._ed_size.pack(side="left", padx=2)
+
+        def set_size(_e=None):
+            self._ed_restyle(s=int(self._ed_size.get()))
+
+        self._ed_size.bind("<Return>", set_size)
+        ttk.Button(bar, text="设定", width=4, command=set_size).pack(side="left", padx=1)
+        ttk.Button(bar, text="文字色", width=6, command=self._ed_pick_fg).pack(side="left", padx=2)
+        ttk.Button(bar, text="高亮", width=5, command=self._ed_pick_bg).pack(side="left", padx=1)
+        ttk.Button(bar, text="居中", width=4,
+                   command=lambda: self._ed_align("center")).pack(side="left", padx=2)
+        ttk.Button(bar, text="左对齐", width=6,
+                   command=lambda: self._ed_align(None)).pack(side="left", padx=1)
+        ttk.Button(bar, text="清除格式", width=8,
+                   command=lambda: self._ed_restyle(b=None, i=None, u=None, c=None,
+                                                    s=None, bg=None)).pack(side="left", padx=8)
+        flds = ttk.Menubutton(bar, text="插入字段 ▾")
+        m = tk.Menu(flds, tearoff=0)
+        for fld in FIELDS:
+            m.add_command(label=fld,
+                          command=lambda x=fld: self.body_text.insert("insert", x))
+        flds["menu"] = m
+        flds.pack(side="left", padx=2)
+
+    def _ed_need_sel(self):
+        try:
+            return self.body_text.index("sel.first"), self.body_text.index("sel.last")
+        except tk.TclError:
+            return None
+
+    def _ed_restyle(self, **changes):
+        t = self.body_text
+        sel = self._ed_need_sel()
+        if not sel:
+            t.configure(background="#fff4f4")
+            t.after(300, lambda: t.configure(background="white"))
+            return
+        a, b = sel
+        st = _style_at(t, a)
+        for k in list(_TAG_STYLE):
+            t.tag_remove(k, a, b)
+        st.update(changes)
+        st = {k: v for k, v in st.items() if v}
+        t.tag_add(_ensure_tag(t, st), a, b)
+
+    def _ed_toggle(self, opt):
+        sel = self._ed_need_sel()
+        if not sel:
+            return
+        cur = _style_at(self.body_text, sel[0]).get(opt)
+        self._ed_restyle(**{opt: None if cur else 1})
+
+    def _ed_align(self, mode):
+        """对齐作用于整行（tk 的 justify 需要覆盖整行才生效）。"""
+        t = self.body_text
+        sel = self._ed_need_sel()
+        if not sel:
+            return
+        a = t.index(f"{sel[0]} linestart")
+        b = t.index(f"{sel[1]} lineend")
+        for k, st in list(_TAG_STYLE.items()):
+            if st.get("al"):
+                t.tag_remove(k, a, b)
+        if mode:
+            t.tag_add(_ensure_tag(t, {"al": mode}), a, b)
+
+    def _ed_pick_fg(self):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(parent=self.root, title="文字颜色")
+        if c and c[1]:
+            self._ed_restyle(c=c[1])
+
+    def _ed_pick_bg(self):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(parent=self.root, title="背景高亮",
+                                  initialcolor="#f5f6f8")
+        if c and c[1]:
+            self._ed_restyle(bg=c[1])
+
+    def _ed_rich_paste(self, _e=None):
+        """富文本粘贴：优先读剪贴板 HTML 格式，保留样式。"""
+        frag = clip_html_fragment()
+        if not frag:
+            return None  # 无 HTML 格式则走默认纯文本粘贴
+        t = self.body_text
+        text, runs = html_to_runs(frag)
+        pos = t.index("insert")
+        t.insert(pos, text)
+        for a, b, st in runs:
+            if a < b:
+                t.tag_add(_ensure_tag(t, st), f"{pos}+{a}c", f"{pos}+{b}c")
+        self._ed_on_key()
+        return "break"
+
+    def _ed_on_key(self, _e=None):
+        if getattr(self, "_ed_after", None):
+            self.root.after_cancel(self._ed_after)
+        self._ed_after = self.root.after(1200, self.refresh_preview)
+
+    def import_html(self):
+        path = filedialog.askopenfilename(title="导入正文 HTML",
+                                          filetypes=[("HTML/文本", "*.html;*.htm;*.txt")])
+        if not path:
+            return
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raw = Path(path).read_text(encoding="gbk", errors="ignore")
+        m = re.search(r"<body[^>]*>(.*)</body>", raw, re.S | re.I)
+        body = m.group(1).strip() if m else raw.strip()
+        if not body:
+            messagebox.showwarning("导入", "文件内容为空")
+            return
+        load_html(self.body_text, body)
+        self.data["body"] = text_to_html(self.body_text)
+        self.save_data()
+        self.refresh_preview()
+        messagebox.showinfo("导入完成", "已导入并保存为当前模板。")
 
     def collect_template(self):
-        return (self.subject_var.get().strip(),
-                self.data.get("body", DEFAULT_BODY))
+        body = (text_to_html(self.body_text)
+                if getattr(self, "body_text", None) is not None
+                else self.data.get("body", DEFAULT_BODY))
+        return self.subject_var.get().strip(), body
 
     def save_template(self):
         self.data["subject"], self.data["body"] = self.collect_template()
@@ -899,6 +904,8 @@ class App:
 
     def reset_template(self):
         self.subject_var.set(DEFAULT_SUBJECT)
+        if getattr(self, "body_text", None) is not None:
+            load_html(self.body_text, DEFAULT_BODY)
         self.data["body"] = DEFAULT_BODY
         self.save_data()
         self.refresh_preview()
