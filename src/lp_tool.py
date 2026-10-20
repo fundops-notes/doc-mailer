@@ -1030,9 +1030,17 @@ class App:
         b_rm.pack(side="left", padx=4)
         ToolTip(b_rm, "从左侧列表移除选中的原件。")
         ttk.Label(top, text="    输出目录：").pack(side="left")
-        self.outdir_var = tk.StringVar(value=str(app_dir() / "out_wm"))
-        ttk.Entry(top, textvariable=self.outdir_var, width=50).pack(side="left", padx=4)
-        ttk.Button(top, text="浏览", command=self.browse_outdir).pack(side="left")
+        # 默认输出到当前用户「文档\LP分发输出」，不暴露程序所在路径；记住上次选择
+        self.outdir_var = tk.StringVar(
+            value=self.data.get("outdir")
+            or str(Path.home() / "Documents" / "LP分发输出"))
+        e_dir = ttk.Entry(top, textvariable=self.outdir_var, width=50)
+        e_dir.pack(side="left", padx=4)
+        ToolTip(e_dir, "默认：文档\\LP分发输出（跟随当前用户）。\n可点「浏览」更改，"
+                       "上次使用的目录会被记住。")
+        b_dir = ttk.Button(top, text="浏览", command=self.browse_outdir)
+        b_dir.pack(side="left")
+        ToolTip(b_dir, "选择输出目录（存放生成的加密文件）。")
 
         self.pdf_list = tk.Listbox(f, height=5)
         self.pdf_list.pack(fill="x", padx=8, pady=4)
@@ -1275,6 +1283,8 @@ class App:
         pdfs = list(self.pdfs)
         outdir = Path(self.outdir_var.get())
         outdir.mkdir(parents=True, exist_ok=True)
+        self.data["outdir"] = str(outdir)  # 记住本次输出目录
+        self.save_data()
         cfg = dict(self.data.get("wm_settings") or {})
         lps = [dict(r) for r in self.data["lps"]]
         self.running = True
