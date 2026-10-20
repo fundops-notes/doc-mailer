@@ -734,26 +734,32 @@ class App:
             "字段：{{LP名称}} {{水印名称}} {{打开口令}} {{日期}}（无权限口令字段）"
         )).pack(side="left", padx=8)
 
-        main = ttk.Frame(f)
-        main.pack(fill="both", expand=True, padx=8, pady=4)
-        pvpane = tk.Frame(main, width=350, background="#ffffff")
-        pvpane.pack_propagate(False)  # 固定预览列宽
-        pvpane.pack(side="right", fill="y", padx=(8, 0))
-        ttk.Label(pvpane, text="预览（近似渲染）", foreground="#666",
+        # 可拖动左右分栏：中缝分隔条可拉动，预览按新宽度重渲染
+        pw = ttk.PanedWindow(f, orient="horizontal")
+        pw.pack(fill="both", expand=True, padx=8, pady=4)
+
+        pvpane = tk.Frame(pw, width=350, background="#ffffff")
+        pvpane.pack_propagate(False)  # 初始宽度
+        ttk.Label(pvpane, text="预览（近似渲染，可拖中缝调整）", foreground="#666",
                   background="#ffffff").pack(anchor="w", padx=4, pady=2)
         self.preview_label = tk.Label(pvpane, anchor="nw", background="#ffffff")
         self.preview_label.pack(fill="both", expand=True)
 
-        t = tk.Text(main, undo=True, wrap="word", font=("Microsoft YaHei", 12),
+        editpane = ttk.Frame(pw)
+        t = tk.Text(editpane, undo=True, wrap="word", font=("Microsoft YaHei", 12),
                     spacing1=4, spacing3=4, padx=12, pady=8,
                     relief="solid", borderwidth=1)
         self.body_text = t
         t.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(main, command=t.yview)
+        sb = ttk.Scrollbar(editpane, command=t.yview)
         sb.pack(side="left", fill="y")
         t.configure(yscrollcommand=sb.set)
         t.bind("<<Paste>>", self._ed_rich_paste)
         t.bind("<KeyRelease>", self._ed_on_key)
+
+        pw.add(editpane, weight=1)
+        pw.add(pvpane, weight=0)
+        pw.bind("<ButtonRelease-1>", lambda _e: self.refresh_preview())  # 拖完中缝重渲染
 
         load_html(t, self.data.get("body", DEFAULT_BODY))
 
