@@ -474,6 +474,40 @@ def render_preview_pixmap(html, width=620, dpi=110):
             pass
 
 
+# ---------- 悬停提示 ----------
+
+class ToolTip:
+    def __init__(self, widget, text, delay=450):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.tip = None
+        self.id = None
+        widget.bind("<Enter>", self._enter)
+        widget.bind("<Leave>", self._leave)
+        widget.bind("<ButtonPress>", self._leave)
+
+    def _enter(self, _e):
+        self.id = self.widget.after(self.delay, self._show)
+
+    def _leave(self, _e):
+        if self.id:
+            self.widget.after_cancel(self.id)
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+    def _show(self):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, justify="left", background="#ffffe8",
+                 relief="solid", borderwidth=1, font=("Microsoft YaHei", 9),
+                 padx=8, pady=5, wraplength=380).pack()
+
+
 # ---------- GUI ----------
 
 class App:
@@ -533,22 +567,38 @@ class App:
         except Exception as e:
             messagebox.showerror("保存失败", f"无法写入 {DATA_FILE}\n{e}")
 
+    def _guide(self, parent, text):
+        """页顶部的流程指引条。"""
+        ttk.Label(parent, text=text, background="#eef3fa", foreground="#2b4a75",
+                  padding=(10, 7), wraplength=1150, justify="left").pack(
+            fill="x", padx=6, pady=(6, 2))
+
     # ----- Tab1: LP 管理 -----
 
     def build_tab_lp(self):
         f = self.tab_lp
+        self._guide(f, "总流程：①本页导入/维护 LP 清单 → ②页编辑邮件模板 → ③页添加原件 PDF 生成"
+                      "加密文件与 Outlook 草稿 → 到 Outlook 草稿箱逐封复核后手动发送。\n"
+                      "本页操作：双击行编辑；导入时同名覆盖更新、异名新增；口令列留空自动生成随机口令。")
         bar = ttk.Frame(f)
         bar.pack(fill="x", pady=4, padx=6)
-        for text, cmd in [
-            ("导入 Excel/CSV", self.do_import),
-            ("导出空白模板", self.export_template),
-            ("导出示例清单", self.export_sample),
-            ("新增", lambda: self.edit_dialog(None)),
-            ("编辑", lambda: self.edit_selected()),
-            ("删除", self.delete_selected),
-            ("补齐缺失口令", self.fill_passwords),
+        for text, cmd, tip in [
+            ("导入 Excel/CSV", self.do_import,
+             "从 xlsx/csv 批量导入 LP 清单。\n按表头名识别列（LP名称/收件人/抄送/标题/口令等），"
+             "多余的列忽略。\n同名 LP 覆盖更新，新的追加；口令留空自动生成。"),
+            ("导出空白模板", self.export_template,
+             "导出一份只有表头和示例行的空白 Excel，发给业务方填写后再导回来。"),
+            ("导出示例清单", self.export_sample,
+             "导出 8 条虚构演示数据，用于体验/测试全流程，可直接导入。"),
+            ("新增", lambda: self.edit_dialog(None), "手工添加一条 LP（权限口令默认遮蔽）。"),
+            ("编辑", lambda: self.edit_selected(), "编辑选中行（也可直接双击行）。"),
+            ("删除", self.delete_selected, "删除选中行的 LP 记录。"),
+            ("补齐缺失口令", self.fill_passwords,
+             "为清单里打开口令/权限口令为空的 LP 批量生成随机口令（导入时一般已自动补齐）。"),
         ]:
-            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=3)
+            b = ttk.Button(bar, text=text, command=cmd)
+            b.pack(side="left", padx=3)
+            ToolTip(b, tip)
 
         cols = ["name", "wm", "to", "cc", "open_pw", "owner_pw", "subject"]
         heads = ["LP名称", "水印名称", "收件人(To)", "抄送(CC)",
@@ -716,6 +766,9 @@ class App:
 
     def build_tab_tpl(self):
         f = self.tab_tpl
+        self._guide(f, "本页编辑邮件标题与正文模板（所见即所得）：左侧编辑、右侧实时预览，"
+                      "中缝可拖动调整宽度；从 Word/网页复制后 Ctrl+V 自动保留样式。"
+                      "{{字段}} 会按每个 LP 自动替换，③页生成时生效。")
         ttk.Label(f, text="邮件标题模板：").pack(anchor="w", padx=8, pady=(8, 0))
         self.subject_var = tk.StringVar(value=self.data.get("subject", DEFAULT_SUBJECT))
         ttk.Entry(f, textvariable=self.subject_var).pack(fill="x", padx=8)
@@ -725,10 +778,17 @@ class App:
         # pack 顺序决定空间分配：底部按钮和右侧预览必须先占位，编辑区最后扩展
         bot = ttk.Frame(f)
         bot.pack(side="bottom", fill="x", padx=8, pady=4)
-        ttk.Button(bot, text="保存模板", command=self.save_template).pack(side="left")
-        ttk.Button(bot, text="导入HTML文件…", command=self.import_html).pack(side="left", padx=6)
-        ttk.Button(bot, text="恢复默认", command=self.reset_template).pack(side="left")
-        ttk.Button(bot, text="刷新预览", command=self.refresh_preview).pack(side="left", padx=6)
+        for text, cmd, tip in [
+            ("保存模板", self.save_template, "把当前标题+正文保存为模板（关窗时也会自动保存）。"),
+            ("导入HTML文件…", self.import_html,
+             "从 .html/.htm/.txt 文件导入正文（自动识别编码并抽取 <body>），导入即保存。"),
+            ("恢复默认", self.reset_template, "恢复出厂默认模板（覆盖当前内容）。"),
+            ("刷新预览", self.refresh_preview,
+             "用当前选中的 LP（无选中用示例值）重新渲染右侧预览。"),
+        ]:
+            b = ttk.Button(bot, text=text, command=cmd)
+            b.pack(side="left") if text == "保存模板" else b.pack(side="left", padx=6)
+            ToolTip(b, tip)
         ttk.Label(bot, foreground="#888", text=(
             "Word/网页复制后 Ctrl+V 自动保留样式　|　"
             "字段：{{LP名称}} {{水印名称}} {{打开口令}} {{日期}}（无权限口令字段）"
@@ -957,10 +1017,18 @@ class App:
 
     def build_tab_run(self):
         f = self.tab_run
+        self._guide(f, "操作步骤：1.「添加原件PDF」（可多选，用未打水印的原件）→ 2. 需要时点「水印设置…」"
+                      "调整并预览 → 3. 点「生成加密文件 + Outlook草稿」（或先「仅生成加密文件」）→ "
+                      "4. 到 Outlook 草稿箱逐封复核，人工发送。\n"
+                      "每个 LP 生成一份独立文件（输出名：原件名_LP名.pdf）+ 一封草稿；下方日志逐条显示结果。")
         top = ttk.Frame(f)
         top.pack(fill="x", padx=8, pady=6)
-        ttk.Button(top, text="添加原件PDF", command=self.add_pdf).pack(side="left")
-        ttk.Button(top, text="移除选中", command=self.remove_pdf).pack(side="left", padx=4)
+        b_add = ttk.Button(top, text="添加原件PDF", command=self.add_pdf)
+        b_add.pack(side="left")
+        ToolTip(b_add, "选择要分发的原始 PDF（未打水印的版本），可一次多选。")
+        b_rm = ttk.Button(top, text="移除选中", command=self.remove_pdf)
+        b_rm.pack(side="left", padx=4)
+        ToolTip(b_rm, "从左侧列表移除选中的原件。")
         ttk.Label(top, text="    输出目录：").pack(side="left")
         self.outdir_var = tk.StringVar(value=str(app_dir() / "out_wm"))
         ttk.Entry(top, textvariable=self.outdir_var, width=50).pack(side="left", padx=4)
@@ -971,9 +1039,13 @@ class App:
 
         opt = ttk.Frame(f)
         opt.pack(fill="x", padx=8, pady=2)
-        ttk.Button(opt, text="水印设置…", command=self.open_wm_settings).pack(side="left")
+        b_wm = ttk.Button(opt, text="水印设置…", command=self.open_wm_settings)
+        b_wm.pack(side="left")
+        ToolTip(b_wm, "布局/字体/字号/颜色/角度/份数均可调，弹窗内即时预览。设置对所有 LP 生效，"
+                      "水印文字本身取每个 LP 的「水印名称」。")
         self.wm_summary = ttk.Label(opt, text="")
         self.wm_summary.pack(side="left", padx=10)
+        ToolTip(self.wm_summary, "当前水印参数摘要，点「水印设置…」修改。")
         ttk.Label(opt, foreground="#888",
                   text="水印文字 = 每个 LP 的「水印名称」列").pack(side="left")
 
@@ -982,9 +1054,12 @@ class App:
         self.btn_files = ttk.Button(runbar, text="仅生成加密文件",
                                     command=lambda: self.run_batch(False))
         self.btn_files.pack(side="left")
+        ToolTip(self.btn_files, "只生成各 LP 的水印加密 PDF，不创建 Outlook 草稿。")
         self.btn_draft = ttk.Button(runbar, text="生成加密文件 + Outlook草稿",
                                     command=lambda: self.run_batch(True))
         self.btn_draft.pack(side="left", padx=8)
+        ToolTip(self.btn_draft, "生成加密文件，并按邮件模板为每个 LP 创建一封 Outlook 草稿"
+                                "（含附件）。草稿只入草稿箱，绝不自动发送；无收件人的 LP 自动跳过草稿。")
         ttk.Label(runbar, foreground="#b00",
                   text="草稿只写入 Outlook 草稿箱，不会发送；发送前请人工复核。").pack(side="left")
 
@@ -1055,6 +1130,9 @@ class App:
                            values=[n for n, _ in self.LAYOUT_OPTS])
         lay.set(dict((v, n) for n, v in self.LAYOUT_OPTS).get(cur.get("layout"), "自动（推荐）"))
         add_row("布局方式：", lay, hint="自动=可读则单行缩号，否则折行")
+        ToolTip(lay, "自动：名称短就单行大字，太长自动折行，保证完整不截断（推荐）。\n"
+                     "强制单行：无论多长都缩成一行（超长名会变得很小）。\n"
+                     "强制折行：保持大字号、拆成多行。")
         self._wm_vars["layout"] = lay
 
         # 字体 / 字号 / 角度
@@ -1077,13 +1155,24 @@ class App:
                            values=[n for n, _ in self.ANGLE_OPTS])
         cur_ang = float(cur.get("angle", -1) or -1)
         ang.set(dict((v, n) for n, v in self.ANGLE_OPTS).get(cur_ang, "自动（沿对角线）"))
-        add_row("角度：", ang); self._wm_vars["angle"] = ang
+        add_row("角度：", ang)
+        ToolTip(ang, "自动：沿页面对角线（充分利用页面宽度）。\n45°/30°：更常见的固定斜角。\n水平：不倾斜，正式感更强但遮挡正文更集中。")
+        self._wm_vars["angle"] = ang
 
         rep = ttk.Combobox(frm, state="readonly", width=18,
                            values=[n for n, _ in self.REPEAT_OPTS])
         rep.set({1: "单个", 3: "三份（防裁剪）", "tile": "平铺 2列×3行"}
                 .get(cur.get("repeat"), "单个"))
-        add_row("份数：", rep); self._wm_vars["repeat"] = rep
+        add_row("份数：", rep)
+        ToolTip(rep, "单个：页面中央一条主水印（默认）。\n\n"
+                     "三份（防裁剪）：沿对角线放 3 处（中间大、两侧小更淡）。"
+                     "单个水印只占中央，对方若只截图/裁剪页面的边角区域，"
+                     "截图里可能一条水印都没有、无法溯源；三份让页面任何较大的局部"
+                     "都至少带上一处水印。\n\n"
+                     "平铺 2列×3行：整页 6 处，防裁剪最强、存在感也最强，"
+                     "建议配合较低不透明度（约 0.15）。\n\n"
+                     "提示：三种都防不住打印重扫或 P 图擦除——那是水印的普遍局限。")
+        self._wm_vars["repeat"] = rep
 
         # 颜色 / 不透明度
         cbox = ttk.Frame(frm)
