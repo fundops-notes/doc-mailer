@@ -136,11 +136,17 @@ def _make_stamp(text, font, side, cfg):
         tw = fitz.TextWriter(tp.rect)
         line_h = fs * 1.35
         n = len(lines)
+        try:
+            ang = float(cfg.get("angle", -1))
+        except (TypeError, ValueError):
+            ang = -1
         for i, ln in enumerate(lines):
             w = font.text_length(ln, fontsize=fs)
-            tw.append(fitz.Point(cx - w / 2,
-                                 cy - (i - (n - 1) / 2) * line_h + fs * 0.36),
-                      ln, font=font, fontsize=fs)
+            # 斜排水印（左下→右上）多行按阅读方向阶梯排：第1行在左下；
+            # 水平水印保持常规自上而下
+            off = (i - (n - 1) / 2) * line_h
+            y = (cy + off if ang != 0 else cy - off) + fs * 0.36
+            tw.append(fitz.Point(cx - w / 2, y), ln, font=font, fontsize=fs)
         tw.write_text(tp, color=color, opacity=op)
 
     rep = cfg.get("repeat", 1)
@@ -219,6 +225,10 @@ def process_one(src: Path, out: Path, name, open_pw, owner_pw, no_encrypt,
     doc = fitz.open(src)
     for page in doc:
         add_watermark(page, name, cfg)
+    try:
+        doc.subset_fonts()  # 字体子集化：只保留用到的字形，防止嵌入完整CJK字体导致文件膨胀
+    except Exception:
+        pass
 
     if no_encrypt:
         doc.save(out, garbage=3, deflate=True)
