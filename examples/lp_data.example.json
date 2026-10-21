@@ -1,78 +1,94 @@
 {
   "lps": [
     {
-      "name": "苏州启衡创业投资合伙企业（有限合伙）",
-      "wm": "苏州启衡创业投资合伙企业（有限合伙）",
+      "name": "苏州启衡科技有限公司",
+      "wm": "苏州启衡科技有限公司",
       "to": "ir@qiheng-demo.cn",
       "cc": "fin@qiheng-demo.cn",
+      "bcc": "",
       "subject": "",
-      "open_pw": "jt2SCxDu3a",
-      "owner_pw": "7MzY4ywGqw"
+      "files": "",
+      "open_pw": "fcKKza7e6G",
+      "owner_pw": "kptPNfXDFC"
     },
     {
-      "name": "宁波梅山保税港区晨曦汐诺股权投资合伙企业（有限合伙）",
-      "wm": "宁波梅山保税港区晨曦汐诺股权投资合伙企业（有限合伙）",
+      "name": "宁波晨曦汐诺供应链股份有限公司",
+      "wm": "宁波晨曦汐诺供应链股份有限公司",
       "to": "contact@chenxi-demo.cn",
       "cc": "",
+      "bcc": "",
       "subject": "",
+      "files": "",
       "open_pw": "Demo-Open-88",
-      "owner_pw": "cXGygYzSCK"
+      "owner_pw": "eqea9twvw9"
     },
     {
-      "name": "新疆乌鲁木齐市泓远红杉股权投资合伙企业（有限合伙）",
-      "wm": "新疆乌鲁木齐市泓远红杉股权投资合伙企业（有限合伙）",
+      "name": "新疆乌鲁木齐市泓远红杉智能科技有限公司",
+      "wm": "新疆乌鲁木齐市泓远红杉智能科技有限公司",
       "to": "admin@hongyuan-demo.cn",
       "cc": "ir@hongyuan-demo.cn",
+      "bcc": "audit@hongyuan-demo.cn",
       "subject": "",
-      "open_pw": "MA9jtAkvvE",
-      "owner_pw": "u8E43zE5Gw"
+      "files": "",
+      "open_pw": "Q9gF8cfRDp",
+      "owner_pw": "PNeUMv9pk5"
     },
     {
-      "name": "上海临港科创一期私募投资基金合伙企业（有限合伙）",
-      "wm": "上海临港科创一期私募投资基金合伙企业（有限合伙）",
+      "name": "上海临港科创一期产业投资有限公司",
+      "wm": "上海临港科创一期产业投资有限公司",
       "to": "lg@chuangxin-demo.cn",
       "cc": "",
-      "subject": "临港科创一期2026年度文件",
-      "open_pw": "9Nvg78SJ6b",
-      "owner_pw": "Tj248VuXwE"
+      "bcc": "",
+      "subject": "临港科创2026年度交付文件",
+      "files": "",
+      "open_pw": "qPe8f2f3Da",
+      "owner_pw": "v7EprY8ScC"
     },
     {
-      "name": "珠海横琴粤澳深谋股权投资合伙企业（有限合伙）",
-      "wm": "珠海横琴粤澳深谋股权投资合伙企业（有限合伙）",
+      "name": "珠海横琴粤澳深谋咨询服务有限公司",
+      "wm": "珠海横琴粤澳深谋咨询服务有限公司",
       "to": "gp@henqin-demo.cn",
       "cc": "fin@henqin-demo.cn",
+      "bcc": "",
       "subject": "",
-      "open_pw": "JbQDyJFKCn",
+      "files": "",
+      "open_pw": "W4a8M6g8K6",
       "owner_pw": "Demo-Owner-66"
     },
     {
-      "name": "北京中关军融创启股权投资合伙企业（有限合伙）",
-      "wm": "北京中关军融创启股权投资合伙企业（有限合伙）",
+      "name": "北京中关军融创启信息技术有限公司",
+      "wm": "北京中关军融创启信息技术有限公司",
       "to": "zg@rongchuang-demo.cn",
       "cc": "",
+      "bcc": "",
       "subject": "",
-      "open_pw": "NZNPHG6ZB5",
-      "owner_pw": "3BpMPkSPjH"
+      "files": "演示专用水印",
+      "open_pw": "NStSrsPrCp",
+      "owner_pw": "XPUyj7S6NZ"
     },
     {
-      "name": "深圳前海深港现代服务业合作区汇金聚富投资合伙企业（有限合伙）",
-      "wm": "演示专用水印",
+      "name": "深圳前海深港现代服务业合作区汇金聚富实业有限公司",
+      "wm": "深圳前海深港现代服务业合作区汇金聚富实业有限公司",
       "to": "huijin@qianhai-demo.cn",
       "cc": "",
+      "bcc": "",
       "subject": "",
-      "open_pw": "Vyvh3rWbhw",
-      "owner_pw": "tCkJE5KFsk"
+      "files": "",
+      "open_pw": "WrrcFkz7Ge",
+      "owner_pw": "hYgquwWYFC"
     },
     {
-      "name": "杭州西湖区云栖数字经济股权投资合伙企业（有限合伙）",
-      "wm": "杭州西湖区云栖数字经济股权投资合伙企业（有限合伙）",
+      "name": "杭州西湖区云栖数字经济研究院",
+      "wm": "杭州西湖区云栖数字经济研究院",
       "to": "yunqi@xihu-demo.cn",
       "cc": "ir@xihu-demo.cn",
+      "bcc": "",
       "subject": "",
-      "open_pw": "h34t548T7H",
-      "owner_pw": "xJj5XCYdNZ"
+      "files": "",
+      "open_pw": "a4HFYsSVqT",
+      "owner_pw": "hJ6EQDVqZ6"
     }
   ],
-  "subject": "基金运营文件（{{LP名称}} 专属）",
-  "body": "<div style=\"font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;\">\n<p><b>{{LP名称}}</b> 您好：</p>\n<p>附件为贵司专属的基金文件（已加密并加盖专属水印），请使用以下打开口令查阅：</p>\n<p style=\"padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;\">\n<b>打开口令：{{打开口令}}</b></p>\n<p style=\"color:#888;font-size:12px;\">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>\n<p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【基金管理人名称】<br>{{日期}}</p>\n</div>"
+  "subject": "机密文件（{{收件人名称}} 专属）",
+  "body": "<div style=\"font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;\">\n<p><b>{{收件人名称}}</b> 您好：</p>\n<p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>\n<p style=\"padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;\">\n<b>打开口令：{{打开口令}}</b></p>\n<p style=\"color:#888;font-size:12px;\">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>\n<p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>\n</div>"
 }
