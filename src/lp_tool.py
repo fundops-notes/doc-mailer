@@ -387,6 +387,24 @@ def clip_html_fragment():
         return None
 
 
+DEFAULT_FILENAME_TPL = "{{原件名}}_{{LP名称}}"
+
+
+def render_filename(tpl, src_path, rec):
+    """按模板生成输出文件名（不含扩展名）。字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}"""
+    mapping = {
+        "{{原件名}}": Path(src_path).stem,
+        "{{LP名称}}": sanitize_filename(rec.get("name", ""), 60),
+        "{{水印名称}}": sanitize_filename(rec.get("wm", ""), 60),
+        "{{日期}}": date.today().strftime("%Y%m%d"),
+    }
+    out = tpl or DEFAULT_FILENAME_TPL
+    for k, v in mapping.items():
+        out = out.replace(k, v)
+    out = sanitize_filename(out.strip(), 90)
+    return out or "output"
+
+
 def render_template(tpl, rec):
     mapping = {
         "{{LP名称}}": rec.get("name", ""),
@@ -592,7 +610,8 @@ class App:
              "导出 8 条虚构演示数据，用于体验/测试全流程，可直接导入。"),
             ("新增", lambda: self.edit_dialog(None), "手工添加一条 LP（权限口令默认遮蔽）。"),
             ("编辑", lambda: self.edit_selected(), "编辑选中行（也可直接双击行）。"),
-            ("删除", self.delete_selected, "删除选中行的 LP 记录。"),
+            ("删除", self.delete_selected,
+             "删除选中的 LP（Ctrl/Shift 可多选，一次批量删除）。"),
             ("补齐缺失口令", self.fill_passwords,
              "为清单里打开口令/权限口令为空的 LP 批量生成随机口令（导入时一般已自动补齐）。"),
         ]:
@@ -603,7 +622,8 @@ class App:
         cols = ["name", "wm", "to", "cc", "open_pw", "owner_pw", "subject"]
         heads = ["LP名称", "水印名称", "收件人(To)", "抄送(CC)",
                  "打开口令", "权限口令(勿发)", "邮件标题(空=用模板)"]
-        self.tree = ttk.Treeview(f, columns=cols, show="headings")
+        self.tree = ttk.Treeview(f, columns=cols, show="headings",
+                                 selectmode="extended")  # 支持Ctrl/Shift多选批量删除
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=150 if c in ("to", "subject") else 110)
@@ -742,12 +762,15 @@ class App:
         self.edit_dialog(idx)
 
     def delete_selected(self):
-        idx = self.selected_index()
-        if idx is None:
+        sel = self.tree.selection()
+        if not sel:
             return
-        name = self.data["lps"][idx]["name"]
-        if messagebox.askyesno("删除", f"确认删除「{name}」？"):
-            del self.data["lps"][idx]
+        idxs = sorted((self.tree.index(i) for i in sel), reverse=True)
+        names = [self.data["lps"][i]["name"] for i in reversed(idxs)]
+        preview = "\n".join(names[:6]) + ("…" if len(names) > 6 else "")
+        if messagebox.askyesno("删除", f"确认删除选中的 {len(names)} 条？\n\n{preview}"):
+            for i in idxs:  # 从大到小删，避免索引位移
+                del self.data["lps"][i]
             self.save_data()
             self.refresh_tree()
 
@@ -1020,7 +1043,7 @@ class App:
         self._guide(f, "操作步骤：1.「添加原件PDF」（可多选，用未打水印的原件）→ 2. 需要时点「水印设置…」"
                       "调整并预览 → 3. 点「生成加密文件 + Outlook草稿」（或先「仅生成加密文件」）→ "
                       "4. 到 Outlook 草稿箱逐封复核，人工发送。\n"
-                      "每个 LP 生成一份独立文件（输出名：原件名_LP名.pdf）+ 一封草稿；下方日志逐条显示结果。")
+                      "每个 LP 生成一份独立文件（文件名模板可自定义）+ 一封草稿；下方日志逐条显示结果。")
         top = ttk.Frame(f)
         top.pack(fill="x", padx=8, pady=6)
         b_add = ttk.Button(top, text="添加原件PDF", command=self.add_pdf)
@@ -1056,6 +1079,20 @@ class App:
         ToolTip(self.wm_summary, "当前水印参数摘要，点「水印设置…」修改。")
         ttk.Label(opt, foreground="#888",
                   text="水印文字 = 每个 LP 的「水印名称」列").pack(side="left")
+
+        frow = ttk.Frame(f)
+        frow.pack(fill="x", padx=8, pady=2)
+        ttk.Label(frow, text="文件名模板：").pack(side="left")
+        self.fname_var = tk.StringVar(
+            value=self.data.get("filename_tpl") or DEFAULT_FILENAME_TPL)
+        e_fn = ttk.Entry(frow, textvariable=self.fname_var, width=46)
+        e_fn.pack(side="left", padx=4)
+        ToolTip(e_fn, "输出文件名模板，自动补 .pdf 扩展名。\n"
+                      "可用字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}\n"
+                      "例如：{{原件名}}_{{LP名称}}_{{日期}}\n"
+                      "留空恢复默认：{{原件名}}_{{LP名称}}")
+        ttk.Label(frow, foreground="#888",
+                  text="字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}").pack(side="left", padx=4)
 
         runbar = ttk.Frame(f)
         runbar.pack(fill="x", padx=8, pady=6)
@@ -1284,6 +1321,8 @@ class App:
         outdir = Path(self.outdir_var.get())
         outdir.mkdir(parents=True, exist_ok=True)
         self.data["outdir"] = str(outdir)  # 记住本次输出目录
+        fname_tpl = self.fname_var.get().strip() or DEFAULT_FILENAME_TPL
+        self.data["filename_tpl"] = fname_tpl
         self.save_data()
         cfg = dict(self.data.get("wm_settings") or {})
         lps = [dict(r) for r in self.data["lps"]]
@@ -1298,7 +1337,7 @@ class App:
                 for rec in lps:
                     outs = []
                     for src in pdfs:
-                        out = outdir / f"{Path(src).stem}_{sanitize_filename(rec['name'])}.pdf"
+                        out = outdir / (render_filename(fname_tpl, src, rec) + ".pdf")
                         try:
                             wm.process_one(Path(src), out, rec["wm"], rec["open_pw"],
                                            rec["owner_pw"], False, wm_cfg=cfg)
@@ -1308,7 +1347,8 @@ class App:
                             self.log(f"[文件失败] {rec['name']} <- {Path(src).name}: {e}")
                     if make_drafts and outs and rec.get("to"):
                         try:
-                            create_outlook_draft(rec, outs, subject, body)
+                            subj_tpl = rec.get("subject") or subject  # LP专属标题优先
+                            create_outlook_draft(rec, outs, subj_tpl, body)
                             self.log(f"[草稿OK] {rec['name']} -> Outlook 草稿箱（未发送）")
                         except Exception as e:
                             self.log(f"[草稿失败] {rec['name']}: {e}")
