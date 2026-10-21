@@ -32,7 +32,8 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_TITLE = "LP 文档分发助手"
+APP_VERSION = "1.3.0"
+APP_TITLE = f"LP 文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{LP名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
 DEFAULT_SUBJECT = "基金运营文件（{{LP名称}} 专属）"
@@ -54,16 +55,17 @@ def app_dir() -> Path:
 
 # 演示数据（均为虚构，邮箱用保留域名，可直接导入测试全流程）
 MOCK_LPS = [
-    ["苏州启衡创业投资合伙企业（有限合伙）", "", "ir@qiheng-demo.cn", "fin@qiheng-demo.cn", "", "", ""],
-    ["宁波梅山保税港区晨曦汐诺股权投资合伙企业（有限合伙）", "", "contact@chenxi-demo.cn", "", "", "Demo-Open-88", ""],
-    ["新疆乌鲁木齐市泓远红杉股权投资合伙企业（有限合伙）", "", "admin@hongyuan-demo.cn", "ir@hongyuan-demo.cn", "", "", ""],
-    ["上海临港科创一期私募投资基金合伙企业（有限合伙）", "", "lg@chuangxin-demo.cn", "", "临港科创一期2026年度文件", "", ""],
-    ["珠海横琴粤澳深谋股权投资合伙企业（有限合伙）", "", "gp@henqin-demo.cn", "fin@henqin-demo.cn", "", "", "Demo-Owner-66"],
-    ["北京中关军融创启股权投资合伙企业（有限合伙）", "", "zg@rongchuang-demo.cn", "", "", "", ""],
-    ["深圳前海深港现代服务业合作区汇金聚富投资合伙企业（有限合伙）", "演示专用水印", "huijin@qianhai-demo.cn", "", "", "", ""],
-    ["杭州西湖区云栖数字经济股权投资合伙企业（有限合伙）", "", "yunqi@xihu-demo.cn", "ir@xihu-demo.cn", "", "", ""],
+    ["苏州启衡创业投资合伙企业（有限合伙）", "", "ir@qiheng-demo.cn", "fin@qiheng-demo.cn", "", "", "", "", ""],
+    ["宁波梅山保税港区晨曦汐诺股权投资合伙企业（有限合伙）", "", "contact@chenxi-demo.cn", "", "", "", "", "Demo-Open-88", ""],
+    ["新疆乌鲁木齐市泓远红杉股权投资合伙企业（有限合伙）", "", "admin@hongyuan-demo.cn", "ir@hongyuan-demo.cn", "audit@hongyuan-demo.cn", "", "", "", ""],
+    ["上海临港科创一期私募投资基金合伙企业（有限合伙）", "", "lg@chuangxin-demo.cn", "", "", "临港科创一期2026年度文件", "", "", ""],
+    ["珠海横琴粤澳深谋股权投资合伙企业（有限合伙）", "", "gp@henqin-demo.cn", "fin@henqin-demo.cn", "", "", "", "", "Demo-Owner-66"],
+    ["北京中关军融创启股权投资合伙企业（有限合伙）", "", "zg@rongchuang-demo.cn", "", "", "", "演示专用水印", "", ""],
+    ["深圳前海深港现代服务业合作区汇金聚富投资合伙企业（有限合伙）", "", "huijin@qianhai-demo.cn", "", "", "", "", "", ""],
+    ["杭州西湖区云栖数字经济股权投资合伙企业（有限合伙）", "", "yunqi@xihu-demo.cn", "ir@xihu-demo.cn", "", "", "", "", ""],
 ]
-MOCK_HEADERS = ["LP名称", "水印名称", "收件人", "抄送", "邮件标题", "打开口令", "权限口令"]
+MOCK_HEADERS = ["LP名称", "水印名称", "收件人", "抄送", "密送", "邮件标题",
+                "附件路径", "打开口令", "权限口令"]
 
 
 DATA_FILE = app_dir() / "lp_data.json"
@@ -82,6 +84,13 @@ def sanitize_filename(s, maxlen=40):
     return s[:maxlen] if s else "unnamed"
 
 
+def split_paths(s):
+    """拆分附件路径字段：; ；, ，换行均作分隔符。"""
+    for ch in ["；", ";", "，", ",", "\n"]:
+        s = s.replace(ch, ";")
+    return [x.strip().strip('"') for x in s.split(";") if x.strip()]
+
+
 def split_mails(s):
     for ch in ["；", ";", "，", ",", " "]:
         s = s.replace(ch, ";")
@@ -93,6 +102,8 @@ HEADER_ALIASES = {
     "wm": {"水印名称", "水印"},
     "to": {"收件人", "收件邮箱", "to", "邮箱", "email"},
     "cc": {"抄送", "cc"},
+    "bcc": {"密送", "bcc"},
+    "files": {"附件路径", "附件", "额外附件", "attachments", "files"},
     "subject": {"邮件标题", "标题", "主题", "subject"},
     "open_pw": {"打开口令", "打开密码", "口令", "密码", "open pw"},
     "owner_pw": {"权限口令", "权限密码", "owner pw"},
@@ -131,7 +142,9 @@ def parse_import_rows(rows):
             "wm": cell("wm") or cell("name"),
             "to": cell("to"),
             "cc": cell("cc"),
+            "bcc": cell("bcc"),
             "subject": cell("subject"),
+            "files": cell("files"),
             "open_pw": cell("open_pw") or gen_pw(),
             "owner_pw": cell("owner_pw") or gen_pw(),
         })
@@ -426,6 +439,9 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl):
     cc = split_mails(rec.get("cc", ""))
     if cc:
         mail.CC = ";".join(cc)
+    bcc = split_mails(rec.get("bcc", ""))
+    if bcc:
+        mail.BCC = ";".join(bcc)
     mail.Subject = render_template(subject_tpl, rec)
     mail.HTMLBody = render_template(body_tpl, rec)
     for f in attachments:
@@ -612,6 +628,9 @@ class App:
             ("编辑", lambda: self.edit_selected(), "编辑选中行（也可直接双击行）。"),
             ("删除", self.delete_selected,
              "删除选中的 LP（Ctrl/Shift 可多选，一次批量删除）。"),
+            ("检查附件", self.check_attachments,
+             "检查每个 LP 的「附件路径」字段里的文件是否都存在（ready）。"
+             "路径支持多个，用 ; 分隔。"),
             ("补齐缺失口令", self.fill_passwords,
              "为清单里打开口令/权限口令为空的 LP 批量生成随机口令（导入时一般已自动补齐）。"),
         ]:
@@ -619,9 +638,9 @@ class App:
             b.pack(side="left", padx=3)
             ToolTip(b, tip)
 
-        cols = ["name", "wm", "to", "cc", "open_pw", "owner_pw", "subject"]
-        heads = ["LP名称", "水印名称", "收件人(To)", "抄送(CC)",
-                 "打开口令", "权限口令(勿发)", "邮件标题(空=用模板)"]
+        cols = ["name", "wm", "to", "cc", "bcc", "files", "open_pw", "owner_pw", "subject"]
+        heads = ["LP名称", "水印名称", "收件人(To)", "抄送(CC)", "密送(BCC)",
+                 "附件路径(额外)", "打开口令", "权限口令(勿发)", "邮件标题(空=用模板)"]
         self.tree = ttk.Treeview(f, columns=cols, show="headings",
                                  selectmode="extended")  # 支持Ctrl/Shift多选批量删除
         for c, h in zip(cols, heads):
@@ -639,7 +658,7 @@ class App:
         self.tree.delete(*self.tree.get_children())
         for rec in self.data["lps"]:
             self.tree.insert("", "end", values=[rec.get(k, "") for k in
-                                                ["name", "wm", "to", "cc",
+                                                ["name", "wm", "to", "cc", "bcc", "files",
                                                  "open_pw", "owner_pw", "subject"]])
 
     def selected_index(self):
@@ -681,7 +700,9 @@ class App:
     def export_template(self):
         self._write_xlsx("LP清单导入模板.xlsx", [MOCK_HEADERS,
                        ["示例：苏州某某投资合伙企业（有限合伙）", "（留空=同LP名称）",
-                        "a@x.com;b@x.com", "cc@x.com", "（留空=用邮件模板）",
+                        "a@x.com;b@x.com", "cc@x.com", "bcc@x.com",
+                        "（留空=用邮件模板）",
+                        "C:\\Document\\补充说明.pdf（多个用;分隔，可留空）",
                         "（留空=自动生成）", "（留空=自动生成，勿发给LP）"]],
                        "模板已导出", "表头列名即导入识别依据，可增删其他列。\n口令列留空会自动生成随机口令。")
 
@@ -702,7 +723,7 @@ class App:
         ws = wb.active
         for row in rows:
             ws.append(row)
-        for col, w in zip("ABCDEFG", [36, 22, 30, 18, 24, 16, 28]):
+        for col, w in zip("ABCDEFGHI", [36, 20, 28, 16, 16, 22, 34, 14, 24]):
             ws.column_dimensions[col].width = w
         try:
             wb.save(path)
@@ -713,14 +734,16 @@ class App:
 
     def edit_dialog(self, idx):
         rec = dict(self.data["lps"][idx]) if idx is not None else {
-            "name": "", "wm": "", "to": "", "cc": "", "subject": "",
-            "open_pw": gen_pw(), "owner_pw": gen_pw()}
+            "name": "", "wm": "", "to": "", "cc": "", "bcc": "", "files": "",
+            "subject": "", "open_pw": gen_pw(), "owner_pw": gen_pw()}
         win = tk.Toplevel(self.root)
         win.title("编辑 LP" if idx is not None else "新增 LP")
         win.grab_set()
         entries = {}
         rows = [("LP名称", "name"), ("水印名称", "wm"),
                 ("收件人To（多人用;分隔）", "to"), ("抄送CC（可空）", "cc"),
+                ("密送BCC（可空）", "bcc"),
+                ("附件路径（多个用;分隔，可空）", "files"),
                 ("邮件标题（空=用模板）", "subject"),
                 ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw")]
         for i, (label, key) in enumerate(rows):
@@ -773,6 +796,25 @@ class App:
                 del self.data["lps"][i]
             self.save_data()
             self.refresh_tree()
+
+    def check_attachments(self):
+        total, missing = 0, []
+        for rec in self.data["lps"]:
+            for path in split_paths(rec.get("files", "")):
+                total += 1
+                if not Path(path).exists():
+                    missing.append(f"{rec['name']}：{path}")
+        if not missing:
+            extra = "" if total else "\n（当前没有任何 LP 配置附件路径）"
+            messagebox.showinfo("附件检查",
+                                f"全部就绪：{total} 个附件路径均存在。" + extra)
+        else:
+            lines = "\n".join(missing[:15]) + ("…" if len(missing) > 15 else "")
+            messagebox.showwarning(
+                "附件检查",
+                f"{total - len(missing)}/{total} 个就绪，"
+                f"以下 {len(missing)} 个不存在：\n\n{lines}\n\n"
+                "缺失的附件在生成草稿时会被跳过并记入日志。")
 
     def fill_passwords(self):
         n = 0
@@ -1111,6 +1153,8 @@ class App:
         self.log_text = tk.Text(f, height=14, state="disabled",
                                 font=("Consolas", 10), background="#fafafa")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=4)
+        ttk.Label(f, text=f"版本 v{APP_VERSION}", foreground="#aaa").pack(
+            anchor="e", padx=10, pady=(0, 4))
         self.update_wm_summary()
 
     def add_pdf(self):
@@ -1305,8 +1349,8 @@ class App:
         if not self.data["lps"]:
             messagebox.showwarning("提示", "LP 清单为空，请先在①中导入")
             return
-        if not self.pdfs:
-            messagebox.showwarning("提示", "请先添加原件 PDF")
+        if not self.pdfs and not make_drafts:
+            messagebox.showwarning("提示", "请先添加原件 PDF（或改用含 Outlook 草稿的模式）")
             return
         if make_drafts:
             missing = [r["name"] for r in self.data["lps"] if not r.get("to")]
@@ -1336,6 +1380,13 @@ class App:
             try:
                 for rec in lps:
                     outs = []
+                    # LP 预制附件：不存在的跳过并记日志
+                    extra = []
+                    for path in split_paths(rec.get("files", "")):
+                        if Path(path).exists():
+                            extra.append(Path(path))
+                        else:
+                            self.log(f"[附件缺失] {rec['name']}：{path}（草稿将不含此附件）")
                     for src in pdfs:
                         out = outdir / (render_filename(fname_tpl, src, rec) + ".pdf")
                         try:
@@ -1345,10 +1396,10 @@ class App:
                             self.log(f"[文件OK] {out.name}")
                         except Exception as e:
                             self.log(f"[文件失败] {rec['name']} <- {Path(src).name}: {e}")
-                    if make_drafts and outs and rec.get("to"):
+                    if make_drafts and rec.get("to"):
                         try:
                             subj_tpl = rec.get("subject") or subject  # LP专属标题优先
-                            create_outlook_draft(rec, outs, subj_tpl, body)
+                            create_outlook_draft(rec, outs + extra, subj_tpl, body)
                             self.log(f"[草稿OK] {rec['name']} -> Outlook 草稿箱（未发送）")
                         except Exception as e:
                             self.log(f"[草稿失败] {rec['name']}: {e}")
