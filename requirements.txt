@@ -1,5 +1,5 @@
-PyMuPDF>=1.28
-pywin32>=306
-openpyxl>=3.1
-Pillow>=10.0
-# 开发打包用：pip install pyinstaller
+PyMuPDF==1.28.0
+pywin32==312
+openpyxl==3.1.5
+Pillow==12.3.0
+# 开发：pip install pyinstaller pytest
