@@ -33,7 +33,8 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
+UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
@@ -109,6 +110,38 @@ def validate_records(lps):
         if len(names) > 1:
             issues.append("打开口令重复（" + "、".join(names) + "）：同一口令可打开对方文件")
     return issues
+
+
+def _ver_tuple(v):
+    nums = re.findall(r"\d+", str(v or ""))
+    return tuple(int(x) for x in nums[:3])
+
+
+def check_latest(timeout=8):
+    """查询 GitHub 最新 Release。返回 dict 或 None（网络失败时静默）。"""
+    import urllib.request
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": "doc-mailer"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        import json as _j
+        d = _j.loads(r.read().decode("utf-8"))
+    asset = next((a for a in d.get("assets", [])
+                  if a["name"] == "LP_Tool_portable.zip"), None)
+    return {"tag": d.get("tag_name", ""), "body": (d.get("body") or "")[:400],
+            "url": d.get("html_url", ""),
+            "asset_url": asset["browser_download_url"] if asset else None,
+            "asset_size": asset.get("size") if asset else None,
+            "asset_digest": asset.get("digest") if asset else None}
+
+
+def _download_with_progress(url, dest, progress=None, timeout=300):
+    import urllib.request
+
+    def hook(n, bs, total):
+        if progress and total:
+            progress(min(n * bs * 100 // total, 100))
+
+    urllib.request.urlretrieve(url, dest, reporthook=hook)
 
 
 def pw_fingerprint(pw):
@@ -646,6 +679,8 @@ class App:
         if getattr(self, "_boot_error", None):
             self.root.after(200, lambda: messagebox.showerror("数据文件损坏", self._boot_error))
         self.root.after(150, self._poll_queue)
+        if self.data.get("auto_update", True):
+            self.root.after(2500, lambda: self.check_update(auto=True))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----- 数据 -----
@@ -1281,8 +1316,15 @@ class App:
         self.log_text = tk.Text(f, height=14, state="disabled",
                                 font=("Consolas", 10), background="#fafafa")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=4)
-        ttk.Label(f, text=f"版本 v{APP_VERSION}", foreground="#aaa").pack(
-            anchor="e", padx=10, pady=(0, 4))
+        vrow = ttk.Frame(f)
+        vrow.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(vrow, text=f"版本 v{APP_VERSION}", foreground="#aaa").pack(side="left")
+        self.auto_upd_var = tk.BooleanVar(value=bool(self.data.get("auto_update", True)))
+        ttk.Checkbutton(vrow, text="启动时检查更新（连接 GitHub）",
+                        variable=self.auto_upd_var,
+                        command=self._save_auto_upd).pack(side="left", padx=16)
+        ttk.Button(vrow, text="检查更新…", command=lambda: self.check_update(False)
+                   ).pack(side="left")
         self.update_wm_summary()
 
     def add_pdf(self):
@@ -1474,6 +1516,94 @@ class App:
 
         refresh_preview()
 
+    def _save_auto_upd(self):
+        self.data["auto_update"] = bool(self.auto_upd_var.get())
+        self.save_data()
+
+    def check_update(self, auto=False):
+        """后台线程查 GitHub 最新版；结果经消息队列回主线程弹窗。"""
+        def work():
+            try:
+                info = check_latest()
+                if info:
+                    self._q.put(("update", (info, auto)))
+            except Exception:
+                if not auto:
+                    self._q.put(("update_err",
+                                 "无法连接 GitHub（公司网络可能受限）。\n"
+                                 "可稍后手动检查，或直接访问 Releases 页面。"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update(self, info, auto):
+        remote = _ver_tuple(info["tag"])
+        local = _ver_tuple(APP_VERSION)
+        if remote <= local:
+            if not auto:
+                messagebox.showinfo("检查更新",
+                                    f"当前已是最新版本（v{APP_VERSION}）。")
+            return
+        frozen = getattr(sys, "frozen", False)
+        msg = (f"发现新版本：{info['tag']}（当前 v{APP_VERSION}）\n\n"
+               + info["body"].replace("\r", "")[:300] + "\n")
+        if frozen or not info.get("asset_url"):
+            msg += "\n点击「打开下载页」获取最新版本。"
+            if messagebox.askyesno("发现新版本", msg + "\n\n现在打开下载页？"):
+                webbrowser.open(info["url"])
+            return
+        msg += "\n\n「自动更新」将下载新版并自动替换（保留你的数据与清单），完成后自动重启。"
+        if not messagebox.askyesno("发现新版本", msg + "\n\n现在自动更新？"):
+            return
+        self._self_update(info)
+
+    def _self_update(self, info):
+        def work():
+            import zipfile, tempfile, hashlib
+            staging = app_dir() / ".update_staging"
+            zip_path = app_dir() / ".update_pkg.zip"
+            try:
+                self._q.put(("log", f"[更新] 下载 {info['tag']}（约 {info['asset_size']//1048576}MB）…"))
+                last = [None]
+
+                def _prog(pct):
+                    if pct != last[0] and pct % 20 == 0:
+                        last[0] = pct
+                        self._q.put(("log", f"[更新] 下载进度 {pct}%"))
+
+                _download_with_progress(info["asset_url"], zip_path, progress=_prog)
+                raw = zip_path.read_bytes()
+                digest = (info.get("asset_digest") or "")
+                if digest.startswith("sha256:"):
+                    got = "sha256:" + hashlib.sha256(raw).hexdigest()
+                    if got != digest:
+                        raise RuntimeError(f"下载校验失败（期望 {digest[:20]}…，实际 {got[:20]}…）")
+                    self._q.put(("log", "[更新] SHA256 校验通过"))
+                if staging.exists():
+                    import shutil as _sh
+                    _sh.rmtree(staging)
+                with zipfile.ZipFile(zip_path) as z:
+                    z.extractall(staging)
+                src_dir = next((d for d in staging.iterdir() if d.is_dir()), staging)
+                # 更新脚本：等待程序退出 → 覆盖（保留用户数据）→ 重启
+                bat = app_dir() / "执行更新.bat"
+                NLc = chr(10)
+                bat.write_text(
+                    "@echo off" + NLc +
+                    "cd /d \"%~dp0\"" + NLc +
+                    "ping -n 4 127.0.0.1 >nul" + NLc +
+                    'robocopy "' + str(src_dir.name) + '" "." /E /MOVE '
+                    "/XF lp_data.json lp_run_log.csv lp_data.json.bak >nul" + NLc +
+                    'rd /s /q ".update_staging" 2>nul' + NLc +
+                    'del ".update_pkg.zip" 2>nul' + NLc +
+                    'start "" "%~dp0启动LP工具.bat"' + NLc +
+                    "exit" + NLc, encoding="gbk", errors="replace")
+                zip_path.unlink()
+                self._q.put(("update_ready", None))
+            except Exception as e:
+                zip_path.unlink(missing_ok=True)
+                self._q.put(("update_err",
+                             f"自动更新失败：{e}\n可手动到 Releases 页下载。"))
+        threading.Thread(target=work, daemon=True).start()
+
     def _stop_batch(self):
         if getattr(self, '_cancel', None):
             self._cancel.set()
@@ -1498,6 +1628,18 @@ class App:
                     self.log_text.see("end")
                     self.log_text.configure(state="disabled")
                     self.root.after(300, lambda: messagebox.showinfo("批量结束", payload))
+                elif kind == "update":
+                    self._show_update(*payload)
+                elif kind == "update_err":
+                    messagebox.showwarning("检查更新", payload)
+                elif kind == "update_ready":
+                    if messagebox.askyesno(
+                            "更新就绪",
+                            "新版已下载并通过校验。\n\n"
+                            "现在退出并完成更新？（数据与清单保留，完成后自动重启）"):
+                        import os
+                        os.startfile(str(app_dir() / "执行更新.bat"))
+                        self.root.destroy()
                 elif kind == "done":
                     self.running = False
                     self.btn_files.state(["!disabled"])
