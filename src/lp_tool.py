@@ -1590,11 +1590,12 @@ class App:
                     "@echo off" + NLc +
                     "cd /d \"%~dp0\"" + NLc +
                     "ping -n 4 127.0.0.1 >nul" + NLc +
-                    'robocopy "' + str(src_dir.name) + '" "." /E /MOVE '
-                    "/XF lp_data.json lp_run_log.csv lp_data.json.bak >nul" + NLc +
+                    'robocopy ".update_staging' + chr(92) + str(src_dir.name) + '" "." /E /MOVE '
+                    "/XF lp_data.json lp_run_log.csv lp_data.json.bak "
+                    "lp_data.json.tmp lp_data.example.json >nul" + NLc +
                     'rd /s /q ".update_staging" 2>nul' + NLc +
                     'del ".update_pkg.zip" 2>nul' + NLc +
-                    'start "" "%~dp0启动LP工具.bat"' + NLc +
+                    'start "" "%~dp0start.bat"' + NLc +
                     "exit" + NLc, encoding="gbk", errors="replace")
                 zip_path.unlink()
                 self._q.put(("update_ready", None))
