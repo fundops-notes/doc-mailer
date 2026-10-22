@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.8.0"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -1588,6 +1588,7 @@ class App:
                 NLc = chr(10)
                 bat.write_text(
                     "@echo off" + NLc +
+                    "chcp 65001 >nul 2>&1" + NLc +
                     "cd /d \"%~dp0\"" + NLc +
                     "ping -n 4 127.0.0.1 >nul" + NLc +
                     'robocopy ".update_staging' + chr(92) + str(src_dir.name) + '" "." /E /MOVE '
@@ -1596,7 +1597,7 @@ class App:
                     'rd /s /q ".update_staging" 2>nul' + NLc +
                     'del ".update_pkg.zip" 2>nul' + NLc +
                     'start "" "%~dp0start.bat"' + NLc +
-                    "exit" + NLc, encoding="gbk", errors="replace")
+                    "exit" + NLc, encoding="ascii", errors="ignore")
                 zip_path.unlink()
                 self._q.put(("update_ready", None))
             except Exception as e:
