@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
@@ -1243,6 +1243,22 @@ class App:
                       "留空恢复默认：{{原件名}}_{{LP名称}}")
         ttk.Label(frow, foreground="#888",
                   text="字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}").pack(side="left", padx=4)
+        grow = ttk.Frame(f)
+        grow.pack(fill="x", padx=8, pady=2)
+        self.gp_mode = tk.BooleanVar(value=bool(self.data.get("gp_owner_mode")))
+        cb = ttk.Checkbutton(grow, text="GP统一权限口令", variable=self.gp_mode)
+        cb.pack(side="left")
+        ToolTip(cb, "开启后：所有文件的权限口令统一用下面这一个（即 owner 口令，打开即解除"
+                      "全部限制）；各 LP 仍用自己的打开口令（受限查看/打印）。\n"
+                      "适合 GP/内部一个口令打开任何一份文件。注意：该口令若泄露，"
+                      "全部文件的限制都可被解除——仅限内部留存，绝不进入邮件。")
+        self.gp_pw_var = tk.StringVar(value=self.data.get("gp_owner_pw") or "")
+        e_gp = ttk.Entry(grow, textvariable=self.gp_pw_var, width=22, show="*")
+        e_gp.pack(side="left", padx=6)
+        ToolTip(e_gp, "统一权限口令（内部/GP用）。不能与任何 LP 的打开口令相同，"
+                      "否则那条 LP 将获得全部权限。")
+        ttk.Label(grow, foreground="#888",
+                  text="开启=权限口令统一（GP一个口令开全部文件）；留空自动生成").pack(side="left", padx=4)
 
         runbar = ttk.Frame(f)
         runbar.pack(fill="x", padx=8, pady=6)
@@ -1510,8 +1526,28 @@ class App:
                                        + ("…" if len(missing) > 10 else ""))
         lps = [dict(r) for r in self.data["lps"]]
 
+        # GP统一权限口令模式：所有文件 owner 口令一致，LP 打开口令不变
+        gp_mode = bool(self.gp_mode.get())
+        gp_pw = self.gp_pw_var.get().strip()
+        if gp_mode and not gp_pw:
+            gp_pw = gen_pw()
+            self.gp_pw_var.set(gp_pw)
+        self.data["gp_owner_mode"] = gp_mode
+        self.data["gp_owner_pw"] = gp_pw if gp_mode else ""
+        if gp_mode:
+            clash = [r["name"] for r in lps if r.get("open_pw") == gp_pw]
+            if clash:
+                messagebox.showerror(
+                    "统一口令冲突",
+                    "GP统一权限口令与以下收件人的打开口令相同（对方将获得全部权限），已取消："
+                    + chr(10) * 2 + "、".join(clash[:8]))
+                return
+
         # P0-3/P1-2/P1-10：统一校验，发现即阻止整批
-        issues = validate_records(lps)
+        if gp_mode:
+            issues = [i for i in validate_records(lps) if "权限口令" not in i]
+        else:
+            issues = validate_records(lps)
         if issues:
             messagebox.showerror(
                 "清单校验未通过（已取消本次任务）",
@@ -1575,8 +1611,9 @@ class App:
                     for src in pdfs:
                         out = unique_out(render_filename(fname_tpl, src, rec))
                         try:
+                            owner_use = gp_pw if gp_mode else rec["owner_pw"]
                             info = wm.process_one(Path(src), out, rec["wm"],
-                                                  rec["open_pw"], rec["owner_pw"],
+                                                  rec["open_pw"], owner_use,
                                                   False, wm_cfg=cfg)
                             outs.append(out)
                             for w in info.get("warnings", []):
