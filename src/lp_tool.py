@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.2"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -1584,7 +1584,7 @@ class App:
                     z.extractall(staging)
                 src_dir = next((d for d in staging.iterdir() if d.is_dir()), staging)
                 # 更新脚本：等待程序退出 → 覆盖（保留用户数据）→ 重启
-                bat = app_dir() / "执行更新.bat"
+                bat = app_dir() / "run_update.bat"
                 NLc = chr(10)
                 bat.write_text(
                     "@echo off" + NLc +
@@ -1639,7 +1639,7 @@ class App:
                             "新版已下载并通过校验。\n\n"
                             "现在退出并完成更新？（数据与清单保留，完成后自动重启）"):
                         import os
-                        os.startfile(str(app_dir() / "执行更新.bat"))
+                        os.startfile(str(app_dir() / "run_update.bat"))
                         self.root.destroy()
                 elif kind == "done":
                     self.running = False
