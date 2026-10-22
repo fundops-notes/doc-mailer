@@ -8,8 +8,8 @@
       "bcc": "",
       "subject": "",
       "files": "",
-      "open_pw": "fcKKza7e6G",
-      "owner_pw": "kptPNfXDFC"
+      "open_pw": "",
+      "owner_pw": ""
     },
     {
       "name": "宁波晨曦汐诺供应链股份有限公司",
@@ -20,7 +20,7 @@
       "subject": "",
       "files": "",
       "open_pw": "Demo-Open-88",
-      "owner_pw": "eqea9twvw9"
+      "owner_pw": ""
     },
     {
       "name": "新疆乌鲁木齐市泓远红杉智能科技有限公司",
@@ -30,8 +30,8 @@
       "bcc": "audit@hongyuan-demo.cn",
       "subject": "",
       "files": "",
-      "open_pw": "Q9gF8cfRDp",
-      "owner_pw": "PNeUMv9pk5"
+      "open_pw": "",
+      "owner_pw": ""
     },
     {
       "name": "上海临港科创一期产业投资有限公司",
@@ -41,8 +41,8 @@
       "bcc": "",
       "subject": "临港科创2026年度交付文件",
       "files": "",
-      "open_pw": "qPe8f2f3Da",
-      "owner_pw": "v7EprY8ScC"
+      "open_pw": "",
+      "owner_pw": ""
     },
     {
       "name": "珠海横琴粤澳深谋咨询服务有限公司",
@@ -52,19 +52,19 @@
       "bcc": "",
       "subject": "",
       "files": "",
-      "open_pw": "W4a8M6g8K6",
+      "open_pw": "",
       "owner_pw": "Demo-Owner-66"
     },
     {
       "name": "北京中关军融创启信息技术有限公司",
-      "wm": "北京中关军融创启信息技术有限公司",
+      "wm": "演示专用水印",
       "to": "zg@rongchuang-demo.cn",
       "cc": "",
       "bcc": "",
       "subject": "",
-      "files": "演示专用水印",
-      "open_pw": "NStSrsPrCp",
-      "owner_pw": "XPUyj7S6NZ"
+      "files": "",
+      "open_pw": "",
+      "owner_pw": ""
     },
     {
       "name": "深圳前海深港现代服务业合作区汇金聚富实业有限公司",
@@ -74,8 +74,8 @@
       "bcc": "",
       "subject": "",
       "files": "",
-      "open_pw": "WrrcFkz7Ge",
-      "owner_pw": "hYgquwWYFC"
+      "open_pw": "",
+      "owner_pw": ""
     },
     {
       "name": "杭州西湖区云栖数字经济研究院",
@@ -85,8 +85,8 @@
       "bcc": "",
       "subject": "",
       "files": "",
-      "open_pw": "a4HFYsSVqT",
-      "owner_pw": "hJ6EQDVqZ6"
+      "open_pw": "",
+      "owner_pw": ""
     }
   ],
   "subject": "机密文件（{{收件人名称}} 专属）",
