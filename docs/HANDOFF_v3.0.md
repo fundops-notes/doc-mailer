@@ -195,7 +195,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 - SMTP 直发——**不建议**（跳过人工复核，与"只建草稿"的产品承诺冲突）
 - DPAPI 加密 `lp_data.json`（当前明文，仅靠目录管控 + 界面红字提示）
 - 单实例保护 / DPI 感知 / 界面字体自适应 / emoji 索引偏移 / HTML `<li>/<a>` 保真
-- 执行历史查看界面（P4）
+- 执行历史查看界面（P4）→ ✅ **已做（v3.2.0，见 §16）**
 
 ---
 
@@ -741,3 +741,68 @@ P0–P3 已铺好数据底座（`lp_data/runs/` 有 Run 记录），但**一直�
 - 收件人库与执行历史**只在事件库内**，没有独立入口（尊重用户已否掉的方案）。
 - 执行历史**只读**，没有清理入口；`lp_data/runs/` 会随时间变大（当前无归档策略）。
 - 下一轮若发版：按 §7 走 → 重出 exe（签名）→ 两个 zip → commit + tag `v3.2.0` → CI → 上传资产 → 写 Release 说明。
+
+---
+
+## 17. 网络环境坑：github.com 被 IP 级屏蔽（2026-10-24 实测）
+
+### 17.1 症状
+
+`git push` / `git tag` 报：
+
+```
+fatal: unable to access 'https://github.com/fundops-notes/doc-mailer.git/':
+Failed to connect to github.com:443 after 21097 ms: Could not connect to server
+```
+
+**但 API 是通的** —— `api.github.com`、`codeload.github.com`、`uploads.github.com` 全部可连，
+只有 `github.com` 连不上。
+
+### 17.2 根因（不是 DNS 污染，也不是代理没开）
+
+| 域名 | 解析结果 | TCP 443 |
+|---|---|---|
+| `github.com` | 20.205.243.**166** | **超时** |
+| `api.github.com` | 20.205.243.**168** | 通 |
+
+同一 /24，只差最后一位 IP —— **IP 级封锁**，不是域名级，也不是 DNS 问题
+（换 FlClash 的 DNS 1053 解析，结果一样）。
+
+### 17.3 绕行办法（FlClash 核心 + 控制器 API）
+
+本机 FlClash 核心在跑，但 `mixed-port` 被置 **0**（只做 DNS/规则，没开代理口），
+系统代理注册表 `ProxyEnable=0`（`ProxyServer=127.0.0.1:7890`）。
+
+**临时开一个本地代理口**（用 Clash 控制器 API，secret 在
+`%APPDATA%\com.follow\clash\config.yaml` 的 `secret:` 字段）：
+
+```powershell
+$sec = (Select-String "$env:APPDATA\com.follow\clash\config.yaml" -Pattern '^secret:\s*(.*)$').Matches[0].Groups[1].Value.Trim().Trim('"')
+$hdr = @{ Authorization = "Bearer $sec"; 'Content-Type' = 'application/json' }
+Invoke-RestMethod 'http://127.0.0.1:9090/configs' -Method Patch -Headers $hdr -Body '{"mixed-port":7890}'
+```
+
+然后带代理推：
+
+```powershell
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push origin main
+```
+
+**推完立刻恢复**（别留着一个用户没打算开的代理口）：
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:9090/configs' -Method Patch -Headers $hdr -Body '{"mixed-port":0}'
+```
+
+### 17.4 影响面
+
+- `git push` / `git tag` / `git push --tags` → 走 `github.com`，**需要代理**
+- `release_tool.py` 走 `api.github.com` + `uploads.github.com` → **不需要代理**（直连可用）
+- GitHub Actions CI → 跑在 GitHub 自己的机器上，**不受影响**
+- 其它 Release 操作（建/改/删 Release、删资产）→ `api.github.com`，不需要代理
+
+### 17.5 顺带记录：工具脚本不再写死版本号
+
+`pack_portable.py` 与 `release_tool.py` 的版本号都改成从 `lp_tool.py` 的 `APP_VERSION` 读
+（**写死过一次就漏发过一次** —— v3.1.1 那次就差点打包成旧版本）。
+
