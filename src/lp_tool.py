@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -739,8 +739,7 @@ class App:
             ("1\n收件人管理", "导入维护清单", "lp"),
             ("2\n邮件模板", "所见即所得", "tpl"),
             ("3\nWord模板", "批量生成通知", "word"),
-            ("4\n生成文件", "水印加密PDF", "run"),
-            ("5\n草稿发送", "Outlook草稿", "draft"),
+            ("4\n生成/草稿", "水印加密+Outlook", "run"),
         ]
         for i, (title, desc, page) in enumerate(steps):
             col = ttk.Frame(btns)
@@ -766,6 +765,22 @@ class App:
 
     def _build_word_page(self, parent):
         """Word 模板批量生成：字段映射 + 数据表 + 生成 PDF/Word"""
+
+        # --- 顶部操作说明 ---
+        help_frame = ttk.LabelFrame(parent, text=" 操作说明 ")
+        help_frame.pack(fill="x", padx=6, pady=(4, 2))
+        help_text = (
+            "1. 准备 Word 模板（.docx），在需要替换的位置写占位符："
+            "{{LP_Name}} 或 ?LP_Name?（两种格式都支持）\n"
+            "2. 准备数据表（Excel 第一行=列名，如：LP_Name | Call_Amount | Unfunded）"
+            "→ 点「导入Excel」\n"
+            "3. 点「检测占位符」自动从模板提取 → 在映射表指定每个占位符对应哪列数据\n"
+            "4. 选择输出格式（PDF 或 Word）和输出目录 → 点「批量生成」"
+        )
+        ttk.Label(help_frame, text=help_text, justify="left", font=("", 9),
+                  foreground="#444", padding=(8, 4)).pack(anchor="w")
+        ttk.Button(help_frame, text="下载示例模板+数据表",
+                   command=self._wt_download_examples).pack(anchor="w", padx=8, pady=(2, 6))
         # --- 上方：模板与输出设置 ---
         top = ttk.LabelFrame(parent, text=" 模板与输出 ")
         top.pack(fill="x", padx=6, pady=4)
@@ -854,6 +869,61 @@ class App:
         # 恢复已有映射
         for m in self.data.get("wt_mappings", []):
             self._wt_map_tree.insert("", "end", values=m)
+
+    def _wt_download_examples(self):
+        """生成并保存示例 Word 模板 + Excel 数据表"""
+        outdir = filedialog.askdirectory(title="选择保存示例的目录")
+        if not outdir:
+            return
+        outdir = Path(outdir)
+        # 1. 生成示例 Word 模板
+        try:
+            import win32com.client
+            word = win32com.Dispatch("Word.Application")
+            word.Visible = False
+            doc = word.Documents.Add()
+            doc.Content.Text = (
+                "Capital Call Notice\n\n"
+                "Dear {{LP_Name}},\n\n"
+                "This is to notify you of a capital call for your investment.\n\n"
+                "Call Amount: USD {{Call_Amount}}\n"
+                "Unfunded Commitment: USD {{Unfunded}}\n"
+                "Due Date: {{Due_Date}}\n\n"
+                "Please remit the above amount to:\n"
+                "Bank: {{Bank_Name}}\n"
+                "Account: {{Account_No}}\n\n"
+                "Sincerely,\nFund Manager")
+            tpl_path = outdir / "示例通知模板.docx"
+            doc.SaveAs2(str(tpl_path.resolve()), FileFormat=16)
+            doc.Close(SaveChanges=0)
+            word.Quit()
+        except Exception as e:
+            messagebox.showwarning("示例模板", f"Word 模板生成失败（需安装 Word）：{e}")
+            tpl_path = None
+
+        # 2. 生成示例 Excel 数据表
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["LP_Name", "Call_Amount", "Unfunded", "Due_Date",
+                    "Bank_Name", "Account_No"])
+        ws.append(["Max Hill Worldwide Limited", "200,000", "800,000",
+                    "2026-11-15", "HSBC Hong Kong", "123-456789-001"])
+        ws.append(["S.F. LCVC (BVI) Limited", "2,000,000", "8,000,000",
+                    "2026-11-15", "HSBC Hong Kong", "123-456789-002"])
+        ws.append(["HHGL Fund, L.P.", "400,000", "1,600,000",
+                    "2026-11-15", "Citibank Singapore", "876-54321-003"])
+        for col, w in zip("ABCDEF", [30, 14, 14, 12, 20, 18]):
+            ws.column_dimensions[col].width = w
+        data_path = outdir / "示例数据表.xlsx"
+        wb.save(data_path)
+
+        msg = f"示例文件已保存到：{outdir}\n"
+        if tpl_path and tpl_path.exists():
+            msg += f"  • {tpl_path.name}（Word 模板，含 6 个占位符）\n"
+        msg += f"  • {data_path.name}（Excel 数据表，3 行示例数据）\n\n"
+        msg += "使用方法：\n1. 打开 Word 模板看占位符写法\n2. 导入 Excel 数据表\n3. 检测占位符并映射\n4. 批量生成"
+        messagebox.showinfo("示例已生成", msg)
 
     def _wt_pick(self):
         path = filedialog.askopenfilename(
@@ -1077,7 +1147,7 @@ class App:
                        command=lambda: self._show_page("home")).pack(side="left")
             titles = {"lp": "收件人管理", "tpl": "邮件模板",
                       "word": "Word 模板批量生成",
-                      "run": "生成加密文件", "draft": "草稿与发送"}
+                      "run": "生成文件 / Outlook 草稿"}
             ttk.Label(nav, text=titles.get(name, name),
                       font=("", 11, "bold")).pack(side="left", padx=12)
 
@@ -1094,8 +1164,7 @@ class App:
             elif name == "run":
                 self.tab_run = content
                 self.build_tab_run()
-            elif name == "draft":
-                self._build_draft_page(content)
+
         self._pages[name].pack(fill="both", expand=True)
 
     def _guide(self, parent, text):
