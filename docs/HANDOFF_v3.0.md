@@ -607,3 +607,28 @@ Release id=421973099，资产是 CI 打的**未签名** win64.zip）。
   便携版 runtime 本来就没装 numpy（一直跑得好好的）。
 - ⚠️ **exe 字节码里搜不到版本号字符串**是正常的（PYZ 是 zlib 压缩的）；
   要验证包里版本号得用 `PyInstaller.archive.readers` 取出模块字节码看常量。
+- ⚠️ **发布 Release 资产必须发到 `uploads.github.com`，发 `api.github.com` 一律 404**：
+  ```
+  POST https://uploads.github.com/repos/{owner}/{repo}/releases/{id}/assets?name=...
+  ```
+  其它 release 操作（建/改/删 Release、删资产、读资产）发 `api.github.com` 都正常。
+  症状极具迷惑性：同一枚 token 能建 Release、能改说明、能删资产，唯独「新增资产」一律
+  `404 {"message":"Not Found"}`；不带 `name` 也是 404（正常应是 422），说明**端点根本没被授权**，
+  不是参数问题。排查顺序：换 host → 换 header 形态 → 换仓库 → 换 token → 试草稿 Release。
+- ⚠️ **CI 会自己传一个未签名的 `doc-mailer_win64.zip`**：CI 用 `GITHUB_TOKEN`（权限足），
+  本地这枚 GCM token 也传得动资产（只要走对 host）。本轮用**本地已签名** exe 自建的 win64.zip
+  替换了 CI 那份（先 DELETE 同名资产再上传）。便携包只能人工传 —— CI 里没有绿色版的
+  121MB runtime，造不出来。
+
+### 15.6 v3.1.1 发版结果
+
+- commit `63d5565`（v3.1.1）已 push main；tag `v3.1.1` → `63d5565` 已推远端。
+- CI run `39977597018` **success**（Run tests / Build exe / Package / Upload to Release 全绿）。
+- Release `v3.1.1`：id=**422000210**，已发布（非草稿、非预发布）。
+  - `doc-mailer_v3.1.1_portable.zip`（46,384,250 字节）
+  - `doc-mailer_win64.zip`（46,829,079 字节，**本地已签名** exe 打包）
+  - 匿名 HEAD 下载地址 → 302（= 公开可下）。
+- Release `v3.1.0`（id=421973099）**原样保留**（资产仍是 CI 的未签名 win64.zip），
+  但说明正文已改成开头就提示「请升级到 v3.1.1」。
+- 产物均已读回校验：便携 zip 内 `APP_VERSION = "3.1.1"`、无 `lp_data/`、无 `__pycache__/`；
+  win64.zip 内 exe 签名 Valid、PYZ 里版本常量 3.1.1、**没有** pandas/pyarrow/numpy。
