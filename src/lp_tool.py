@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "2.0.0"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -668,29 +668,11 @@ class App:
         self._after_id = None
         self._preview_img = None
 
-        # 单页布局：上方收件人表格，下方设置/生成/日志
-        main = ttk.Frame(root)
-        main.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # 上半区：收件人管理（固定占约40%高度）
-        lp_frame = ttk.LabelFrame(main, text=" 收件人清单 ")
-        lp_frame.pack(fill="both", expand=True, pady=(0, 3))
-        self.tab_lp = lp_frame
-        self.build_tab_lp()
-
-        # 下半区：左右分栏（左=邮件模板，右=生成设置+日志）
-        bottom = ttk.PanedWindow(main, orient="horizontal")
-        bottom.pack(fill="both", expand=True, pady=(3, 0))
-
-        tpl_frame = ttk.LabelFrame(bottom, text=" 邮件模板 ")
-        self.tab_tpl = tpl_frame
-        self.build_tab_tpl()
-        bottom.add(tpl_frame, weight=1)
-
-        run_frame = ttk.LabelFrame(bottom, text=" 生成 / Outlook 草稿 ")
-        self.tab_run = run_frame
-        self.build_tab_run()
-        bottom.add(run_frame, weight=1)
+        # 首页导航 + 页面切换
+        self._pages = {}
+        self._container = ttk.Frame(root)
+        self._container.pack(fill="both", expand=True)
+        self._build_homepage()
         if getattr(self, "_boot_error", None):
             self.root.after(200, lambda: messagebox.showerror("数据文件损坏", self._boot_error))
         self.root.after(150, self._poll_queue)
@@ -738,6 +720,97 @@ class App:
         except Exception as e:
             messagebox.showerror("保存失败",
                                  f"无法写入 {DATA_FILE}\n{e}")
+
+    def _build_homepage(self):
+        """首页：流程图导航"""
+        home = ttk.Frame(self._container)
+        self._pages["home"] = home
+
+        # 标题
+        ttk.Label(home, text="文档分发助手", font=("Microsoft YaHei", 22, "bold"),
+                  foreground="#1a3a5c").pack(pady=(40, 5))
+        ttk.Label(home, text=f"v{APP_VERSION} — 批量加密分发 · 逐人水印 · Outlook 草稿",
+                  font=("Microsoft YaHei", 11), foreground="#666").pack(pady=(0, 30))
+
+        # 流程节点按钮
+        flow = ttk.Frame(home)
+        flow.pack(pady=10)
+
+        steps = [
+            ("📋", "收件人管理", "导入/维护清单\n口令 · 附件 · 合并组", "lp"),
+            ("✉️", "邮件模板", "所见即所得编辑\n字段替换 · 富文本", "tpl"),
+            ("🔐", "生成文件", "水印加密 · Word模板\n批量生成 PDF", "run"),
+            ("📤", "草稿与发送", "检查附件 · 生成草稿\n人工复核后发送", "run"),
+        ]
+
+        for i, (icon, title, desc, page) in enumerate(steps):
+            card = tk.Frame(flow, bg="#f0f4f8", bd=1, relief="raised", padx=2, pady=2)
+            card.grid(row=0, column=i, padx=8, pady=5, sticky="nsew")
+
+            btn = tk.Label(card, text=f"{icon}", font=("Segoe UI Emoji", 28),
+                           bg="#f0f4f8", cursor="hand2")
+            btn.pack(pady=(8, 2))
+            ttk.Label(card, text=title, font=("Microsoft YaHei", 12, "bold"),
+                      background="#f0f4f8").pack()
+            ttk.Label(card, text=desc, font=("Microsoft YaHei", 9),
+                      foreground="#555", background="#f0f4f8",
+                      justify="center").pack(pady=(2, 8))
+
+            # 点击进入页面
+            for w in (card, btn):
+                w.bind("<Button-1>", lambda e, pg=page: self._show_page(pg))
+            # hover 效果
+            card.bind("<Enter>", lambda e, c=card: c.configure(bg="#dce8f5"))
+            card.bind("<Leave>", lambda e, c=card: c.configure(bg="#f0f4f8"))
+
+            # 箭头（最后一个后面不加）
+            if i < len(steps) - 1:
+                ttk.Label(flow, text="→", font=("", 18)).grid(row=0, column=i * 2 + 1,
+                                                               padx=2, sticky="s", pady=(0, 40))
+
+        # 底部快捷信息
+        info = ttk.Frame(home)
+        info.pack(side="bottom", fill="x", padx=20, pady=10)
+        n_lps = len(self.data.get("lps", []))
+        ttk.Label(info, text=f"当前清单：{n_lps} 位收件人", foreground="#666").pack(side="left")
+        ttk.Label(info, text="版本 " + APP_VERSION, foreground="#aaa").pack(side="right")
+        if n_lps > 0:
+            ttk.Button(info, text="继续上次操作 → 生成",
+                       command=lambda: self._show_page("run")).pack(side="right", padx=10)
+
+        home.pack(fill="both", expand=True)
+
+    def _show_page(self, name):
+        """切换到指定功能页面"""
+        for p in self._pages.values():
+            p.pack_forget()
+        if name not in self._pages:
+            frame = ttk.Frame(self._container)
+            self._pages[name] = frame
+
+            # 返回按钮行
+            nav = ttk.Frame(frame)
+            nav.pack(fill="x", padx=4, pady=2)
+            ttk.Button(nav, text="← 首页", width=8,
+                       command=lambda: self._show_page("home")).pack(side="left")
+            titles = {"lp": "收件人管理", "tpl": "邮件模板", "run": "生成 / Outlook 草稿"}
+            ttk.Label(nav, text=titles.get(name, name),
+                      font=("Microsoft YaHei", 12, "bold")).pack(side="left", padx=12)
+
+            # 功能内容
+            content = ttk.Frame(frame)
+            content.pack(fill="both", expand=True)
+            if name == "lp":
+                self.tab_lp = content
+                self.build_tab_lp()
+            elif name == "tpl":
+                self.tab_tpl = content
+                self.build_tab_tpl()
+            elif name == "run":
+                self.tab_run = content
+                self.build_tab_run()
+
+        self._pages[name].pack(fill="both", expand=True)
 
     def _guide(self, parent, text):
         """页顶部的流程指引条。"""
@@ -794,6 +867,13 @@ class App:
 
     def refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
+        # 同步首页计数
+        if "home" in self._pages:
+            for w in self._pages["home"].winfo_children():
+                if isinstance(w, ttk.Frame):
+                    for c in w.winfo_children():
+                        if isinstance(c, ttk.Label) and "位收件人" in str(c.cget("text")):
+                            c.configure(text=f"当前清单：{len(self.data[chr(39)+chr(108)+chr(112)+chr(115)+chr(39)])} 位收件人")
         for rec in self.data["lps"]:
             self.tree.insert("", "end", values=[
                 rec.get("name", ""), rec.get("wm", ""), rec.get("to", ""),
