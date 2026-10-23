@@ -1,5 +1,8 @@
 # 运行时数据（含真实口令，绝不入库）
+# v3 起数据是目录形式：settings.json 里存着 GP 统一权限口令 gp_owner_pw，
+# events/ 里存着每位收件人的打开口令与权限口令 —— 目录形式同样绝不入库
 lp_data.json
+lp_data/
 out_wm/
 
 # Python

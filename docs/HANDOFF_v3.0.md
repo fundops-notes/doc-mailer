@@ -1,14 +1,36 @@
-# HANDOFF：文档分发助手 v3.0 重构
+# HANDOFF：文档分发助手 v3.1（v3.0 重构 → v3.1 流水线重构）
 
 > 交接文档。给接手实现的 agent / 同事。
-> 最后更新：2026-10-23（v2.2.0 发布后，v3.0 设计完成、尚未开工）
+> **文件名沿用 `HANDOFF_v3.0.md`（历史沿革，改名会打断各处引用），内容已覆盖到 v3.1。**
+> 最后更新：2026-10-23 夜（**v3.1 流水线重构已实施完毕并验证通过**，见 §14。发版未执行）
+>
+> **当前待发布版本：`3.1.0`**（`APP_VERSION = "3.1.0"`，`lp_tool.py` 与 `lp_v3.py` 两处一致）。
+> 已发布的线上版本仍是 **v2.2.0**；3.0.0 与 3.1.0 **都从未发布过**（仓库 tag 最高为 v2.2.0），
+> 所以对外的第一个 3.x 版本直接叫 3.1.0，与设计稿、界面、交接文档口径一致。
 
 ---
 
 ## 0. 一句话现状
 
-桌面工具"文档分发助手"当前发布版本 **v2.2.0**（可用、功能正常）。
-**v3.0 的重构设计已完成并评审中，代码一行未动。** 接手者的任务是按设计稿实现 v3.0。
+桌面工具"文档分发助手"当前**已发布**版本 **v2.2.0**（可用、功能正常）。
+**v3.1 流水线重构已实现完毕并通过全量验证**（132 条 pytest 全绿 + 界面截图验收），
+代码在 `lp_tool.py` + **新增 `lp_v3.py`** + `watermark_encrypt.py`。
+**尚未打包发版**（zip / 签名 / git tag / Release 上传均未执行，等用户明确指示）。
+接手者的下一步 = 按 §7 发版流程发布 **v3.1.0**；P4（收件人库界面、执行历史查看界面）可延后。
+
+---
+
+## 0.1 源码坐标（v3.1 后已变）
+
+| 项 | v2.2.0 | v3.1（当前） |
+|---|---|---|
+| 主程序 | `lp_tool.py` 2450 行 | `lp_tool.py`（GUI，`APP_VERSION = "3.1.0"`） |
+| 核心模块 | `watermark_encrypt.py` 427 行 | `watermark_encrypt.py` + **新增 `lp_v3.py`**（纯逻辑核心，不依赖 tkinter） |
+| 数据存储 | 单文件 `lp_data.json` | 目录 `lp_data/{settings.json, events/, scenarios/, runs/}` |
+| 回归测试 | `tests/test_core.py` 9 条 | `tests/` **132 条**（`test_core` + `test_v3_data` + `test_v3_pipeline` + `test_v3_engine` + `test_v3_gui` + `test_v3_import_export`） |
+
+> ⚠️ `lp_v3.py` 是**新增的第三个源文件**。PyInstaller 跟随 import 会自动带上（已验证进包）；
+> 便携包按目录整体打包，`app/` 下三个 .py 必须齐。
 
 ---
 
@@ -103,7 +125,7 @@ v3.0 引入 **场景 Scenario**（可复用模板，"怎么做"）+ **发送事�
   ```python
   with zipfile.ZipFile(out) as z:
       src = z.read('app/lp_tool.py').decode('utf-8')
-      assert 'APP_VERSION = "3.0.0"' in src
+      assert 'APP_VERSION = "3.1.0"' in src
   ```
 
 **功能类**：
@@ -175,9 +197,331 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 
 ## 10. 接手检查清单
 
-- [ ] 读 `docs/设计稿_v3.0_功能设计.md` 全文
-- [ ] 打开界面原型 HTML 点一遍五个页面
-- [ ] 跑 `pytest lp-doc-mailer/tests/test_core.py` 确认基线绿
-- [ ] 跑一次现有程序（`python lp_tool.py`）确认 v2.2.0 正常
-- [ ] 确认 §8 的 5 个决策点已与用户对齐
-- [ ] 开工前先备份：`cp lp_tool.py lp_tool.py.bak`
+- [x] 读 `docs/设计稿_v3.0_功能设计.md` 全文
+- [x] 打开界面原型 HTML 点一遍五个页面
+- [x] 跑 `pytest lp-doc-mailer/tests/test_core.py` 确认基线绿
+- [x] 跑一次现有程序（`python lp_tool.py`）确认 v2.2.0 正常
+- [x] 确认 §8 的 5 个决策点已与用户对齐
+- [x] 开工前先备份：`cp lp_tool.py lp_tool.py.bak`
+
+---
+
+## 11. 实现记录（v3.0.0，P0–P3，2026-10-23）
+
+### 11.1 已交付
+
+| 期 | 范围 | 落地位置 |
+|---|---|---|
+| **P0** | 目录化存储、数据模型与归一化、原子写 + `.bak` 轮转、损坏文件改名隔离（`_quarantine`）、v2→v3 迁移（`migrate_v2_to_v3`，原文件改名 `.bak` **不删除**）、首次启动示例数据播种（`seed_demo`） | `lp_v3.py`：`Store` / `normalize_*` / `v2_to_v3_payload` / `needs_migration` / `seed_demo` |
+| **P1** | 顶栏 + 左侧固定导航 + 右侧内容区；首页场景卡片 + 发送事件表；场景模板页含「同步到事件…」；事件工作台左侧 5 步常驻导航 + 底部操作条 | `lp_tool.py`：`App` / `_build_shell` / `show_screen` / `open_event` / `_wb_show_step` |
+| **P2** | 六种步骤 `word_template`/`word_to_pdf`/`pdf_watermark`/`pdf_encrypt`/`pdf_source`/`static_file`；映射规则 `per_lp`/`per_group`/`all`/`from_sheet`；占位符检测（读 docx XML，不依赖 Word）；字段映射 UI | `lp_v3.py`：`execute_step`/`run_pipeline`/`build_units`/`step_placeholders`/`auto_map_placeholder`；`watermark_encrypt.py`：`watermark_pdf`/`encrypt_pdf`/`detect_placeholders`/`WordBatch` |
+| **P3** | `preflight` → 流水线 → `assemble_attachments` → `draft_units` → `create_outlook_draft`（**只 `mail.Save()`**）→ 写 Run 记录；`failed_recipients` + 只重跑失败项；`preview_plan` 清单预览 | `lp_v3.py`：`run_event`/`preflight`/`preview_plan`/`failed_recipients` |
+
+### 11.2 关键决策（已与用户对齐，§8 五点）
+
+1. **场景复制式**：事件各存完整配置，改场景不影响已建事件；场景页提供显式「同步到事件…」（收件人按名称合并，保留已有口令与自定义字段，只补空缺）。
+2. **保留 `from_sheet`**（保住 v2 外部数据表能力）。
+3. **自定义字段「模板 + 临时加列」并存**。
+4. **不并行**，一次跑一个事件。
+5. **`lp_data.json.bak` 永不自动删除**。
+
+### 11.3 额外决策
+
+- **附件默认只附最终产物**（`attach_mode="final"`）：中间产物（如未加密 .docx）进邮件包会绕过加密目的。
+  设计稿「各步骤产物」的字面理解留了 `attach_mode="all"` 开关，但**默认关闭**。
+- **权限口令隔离双保险**：架构上不映射（`FORBIDDEN_FIELD_KEYS`）+ 渲染时 `scrub_owner_password` 兜底抹除。
+- **合并组口令不同** → 预检 warning，正文取组内第一人（沿用 v2 与设计稿 per_group 语义）。
+
+### 11.4 验证结果（全部实测，非推断）
+
+| 项 | 结果 |
+|---|---|
+| pytest | `python -m pytest lp-doc-mailer/tests -q` → **81 passed，EXITCODE=0** |
+| 真实 Outlook | `verify_outlook_draft.py`：真实建 item、设字段、加附件，**正文/标题均无权限口令**；丢弃不保存，草稿箱无残留 |
+| 打包 | PyInstaller onefile 构建成功（`dist/LP_Tool.exe` 115345146 字节）；`lp_v3` 已进包（`Analysis-00.toc` + `PYZ-00.toc` 均命中）；`verify_exe_boot.py` 实启动 18s 存活、无 ImportError；exe 同级目录正确生成 `lp_data/` 并播种出 8 位收件人的示例事件 |
+| 视觉 | `v3_home.png` + `v3_wb_recipients/pipeline/attachments/mail/run.png`（首页 + 工作台 5 步，与原型一致） |
+| 便携包 | 用自带 runtime 导入成功，`APP_VERSION=3.0.0` |
+| 同步 | `sync_release.py`（复制 + 校验一步到位）通过，`APP_VERSION：3.0.0` |
+
+### 11.5 过程中发现并修复的真实缺陷（v2 也存在）
+
+1. **`Find.Execute(Replace=2)` 命名参数在 pywin32 动态调度下被静默忽略** → 占位符一个都没替换。改用位置参数。
+2. **`mail.Close(SaveChanges=0)` 同类问题** → 一律改位置参数 `Close(0)`。
+3. **合并组 + 「每人一份」时附件包只收了组内第一人的文件** → 修 `_outputs_of`/`preview_plan`，已加回归测试。
+4. **tkinter grid/pack 同父容器冲突** → 拆子容器。
+5. **启动未调用 `show_screen("home")`** → 右侧空白。
+6. **自动更新 `robocopy` 未排除 `lp_data`** → 可能覆盖用户数据；改为一条 robocopy 同时带 `/XF` 与 `/XD lp_data`。
+7. **首次启动未播种示例数据** → 新增 `seed_demo`（内置 `MOCK_LPS` 兜底）。
+8. **`WordBatch.close()` 调 `Quit()` 后释放 COM 引用会触发 0x800706be 致命异常（会杀进程）** → 改为只用 `DispatchEx` 私有实例、只释放引用不 `Quit`。
+
+### 11.6 已知折中与遗留
+
+- **Word COM 收尾**：`WordBatch` 不调用 `Quit()`，残留的隐藏 `WINWORD.EXE` 会存活到进程结束（换取不触发 0x800706be 杀进程）。
+  普通 `Dispatch` 会挂到用户已开的 Word 上并可能误关用户 Word，已改 `DispatchEx`。
+- **`from_sheet` 的 v2 遗留数据表路径在 v2 未落盘**，迁移后需用户重新选择 Excel（迁移提示已写明）。
+- **临时脚本残留**：项目根 `shot_v3.py` / `shot_v3_wb.py` / `fix_bom.py`（截图与 BOM 清理用）。
+  本次会话的回收站只允许工作区内路径，`.zcode` 目录下不可删，故保留。无功能影响，可随手删除。
+- **保留的工具脚本**：`sync_release.py`（同步+校验）、`verify_outlook_draft.py`（真实 Outlook 验证，不留草稿）、`verify_exe_boot.py`（exe 启动验证）。
+
+### 11.7 下一步（发版前必做）
+
+发版流程照 §7，**不要自创**。发版前注意：
+
+- `lp-doc-mailer/.gitignore` 已忽略 `build/`、`dist/`、`*.spec`、`lp_data.json`、`out_wm/`；`src/lp_v3.py` 与 `tests/` 下 6 个新文件**需要 `git add`**（当前为未跟踪状态）。
+- 打包 zip 后**必须**读 zip 内 `app/lp_tool.py` 断言 `APP_VERSION = "3.1.0"` 与关键函数存在再上传。
+- 绿色版目录里打包前记得清 `__pycache__/`。
+- 下载包命名必须是 `doc-mailer_v3.1.0_portable.zip`（自动更新按此前缀匹配）。
+- git tag `v3.1.0` 会触发 CI 自动构建。
+- **P4（收件人库界面、执行历史查看界面）尚未做**，发版说明里要写清。
+
+---
+
+## 12. 用户反馈轮（2026-10-23 晚，尚未发版）
+
+用户试用了 P0–P3 的界面，提出 4 条反馈。本轮已全部实现并验证。
+
+### 12.1 反馈与处理
+
+| # | 用户反馈 | 处理 |
+|---|---|---|
+| 1 | 首页点「打开工作台」没反应（第一次能开，关掉后再点就不出来） | **已修**。根因：`open_event()` 重建工作台后没有重新 `pack`，而 `show_screen()` 会把其它页 `pack_forget` → 第二次点击是空操作。修法：重建后强制 `self.show_screen("event")`。已加回归测试 `test_open_event_reopens_after_leaving_workbench`。 |
+| 2 | 「场景与事件」「场景模板」「收件人库」三个入口看不懂区别，只要事件库；每个事件要有发送模式、收件人列表、要调用的功能；要看得到自由组合的流程图 | **已实现**。导航收敛为 **事件库 / 设置 / 帮助**；「场景模板」收进事件库的第二个标签页（不再是独立导航项）；「收件人库」这个空壳页删除（收件人本就属于事件）。事件表新增**发送模式**列；右侧新增**可视化流程图**（收件人 → 流水线步骤 → 最终产物 → Outlook 草稿，步骤可自由增删排序，流程图自动跟着变）。 |
+| 3 | 所有 Excel 导入处都要有模板下载；导入要做数据校验、可视化导入结果 | **已实现**。收件人清单与外部数据表两处导入都加了「下载模板」（含**填写说明页**）。导入改为三步：选文件 → **逐行校验**（错误/警告分级）→ **可视化导入结果弹窗**（逐行列出状态与问题，可「导入无错误的行」「全部导入」「导出问题明细」）。 |
+| 4 | 导入的数据、事件设置要能导出备份 | **已实现**。事件库工具条：导出收件人 Excel、导出全部收件人 Excel、导出事件 JSON、导入事件备份、备份全部（settings+events+scenarios+runs 的 JSON）。 |
+
+### 12.2 新增核心能力（`lp_v3.py`，纯逻辑、可测）
+
+- **发送模式** `options.send_mode`：`per_lp`（每人一份）/ `per_group`（按组合并）/ `all`（全部合并）。
+  `send_mode_of()` 认 `send_mode`，没有就退回旧的 `options.merge_groups` 布尔（v2 迁移数据仍正确）。
+  `draft_units()` 按模式决定草稿单元数。`normalize_options()` 保证 `send_mode` 与 `merge_groups` 始终一致。
+- **`flow_nodes(event)`** → 流程图节点序列（纯数据，GUI 只负责画）。
+- **`validate_recipient_rows(rows, existing_names)`** → 导入校验结果（fatal / 每行 errors+warnings / 未识别列 / 重复名）。
+  校验项：表头缺名称列、空文件、名称为空、文件内重名、与已有同名、邮箱为空、邮箱格式错（To/CC/BCC）、
+  **打开口令 == 权限口令（铁律，直接判错）**、打开口令过短、附件文件不存在、合并组提示。
+- **`recipients_to_rows(recipients, include_passwords)`** → 收件人导出为二维列表（自定义字段列并到末尾）。
+- **`event_export_payload()` / `event_import_payload()`** → 单事件备份与还原。
+- **`backup_payload(store)`** → 整库备份。
+
+### 12.3 本轮顺带修掉的真实布局缺陷
+
+- **收件人表 / 附件表被挤到右下角一小块**：`ttk.Treeview` 建在了 `parent` 里却 `pack` 进 `frame`，
+  于是被排到 frame 下面、只拿到请求高度。修法：Treeview 直接建在 `frame` 里。附件步骤同样有这问题，已一并修。
+- **`tk.PanedWindow.add(child, weight=…)`** 在本机 Tk 上报 `unknown option "-weight"` → 改为 `add` + `paneconfigure`（失败也不影响使用）。
+- 事件表「最近执行」的成功数一直统计 `item["status"]`，但 Run 记录里根本没有 `status` 字段（是 `draft`）→ 永远显示 0/N，已改。
+
+### 12.4 本轮验证
+
+- `python -m pytest lp-doc-mailer/tests -q` → **112 passed，EXITCODE=0**（新增 `tests/test_v3_import_export.py` 25 条）。
+- `verify_v4_features.py`：**30 项端到端检查全过，0 失败**（真实写 xlsx/json 文件，覆盖导出收件人、
+  下载模板、导入三步流程、导出/导入事件备份、整库备份、导出全部收件人，并复核权限口令不进映射与正文）。
+- 视觉：`v4_library.png`（事件库 + 流程图）、`v4_recipients.png`（收件人步骤 + 发送模式）、`v4_import_result.png`（导入结果弹窗）。
+
+### 12.5 本轮保留/新增的工具脚本
+
+- `verify_v4_features.py` —— 新增/导出/备份的端到端验证（可重跑）。
+- `shot_v4.py` —— 截图脚本（同 `shot_v3.py` 那批）。
+- ⚠️ 同上一轮：**临时脚本删除受本会话安全策略限制**（可恢复删除只允许工作区内路径，
+  `.zcode` 目录下的文件删不掉），故 `shot_v4.py` 等仍留在项目根，无功能影响。
+
+---
+
+## 13. 概念澄清轮（2026-10-23 晚，同属 3.0.0，仍未发版）
+
+用户对界面上的两个概念提出疑问，排查后确认了两处**真实设计缺陷**，已一并修掉。
+
+### 13.1 「源 PDF」vs「静态文件」——代码上本来就是同一件事
+
+核实结果：`execute_step()` 里两者是**同一个分支**（`if stype in ("pdf_source", "static_file")`），
+行为完全一致——把磁盘上的文件复制到输出目录，文件名按收件人/组名生成。差别只有文案和「预期用法」：
+
+| 步骤 | 实际行为 | 预期用法 |
+|---|---|---|
+| **源 PDF** | 从磁盘选一个 PDF → 复制成每人一份 | 后面接「加水印」「加密」，把外部 PDF 处理成每人一份的加密件 |
+| **静态文件** | 从磁盘选一个任意文件（Word/Excel/图片）→ 原样复制成每人一份 | 通常放最后一步，直接当附件 |
+
+> ⚠️ 用户原本以为「源 PDF = 从上一步拿 PDF」——**不是**。它是从磁盘选外部原件。
+> 「从上一步拿」是 `word_to_pdf` / `pdf_watermark` / `pdf_encrypt` 这三个步骤的语义。
+
+已做的处理：
+- 「添加步骤」弹窗里把两者说明写清楚，并加了一段提示：两者代码上同一件事，
+  区别只在用法；**要往邮件里塞文件但不想走流水线，用「附件」那一步更省事**。
+- 步骤参数里的标签：`源 PDF：` / `源文件：`。
+
+### 13.2 修掉的真缺陷：`final` 模式会把加密件挤出附件包
+
+**旧逻辑**：`attach_mode="final"` 只取流水线**最后一步**的产物。
+若流水线是 `源 PDF → 加密 → 静态文件`，最终附件里只剩静态文件的副本，
+**加密后的 PDF 根本没进邮件**（等于加密白做了，而且发出的是未加密原件）。
+
+**新规则**：`final = 最后一步的产物 ∪ 所有加密步骤的产物`。
+回归测试 `test_final_attach_mode_keeps_encrypted_pdf_when_static_file_is_last`。
+
+### 13.3 把「输出粒度」和「数据来源」拆成两个下拉
+
+**旧问题**：步骤参数里一个下拉塞了 4 个值，其中 `from_sheet`（按 Excel 行匹配）
+**根本不是粒度，是数据来源**——它的产出单位仍然是「每人一份」（已核实：3 位收件人 → 3 个产出单元）。
+用户看到的「每人1份 / 每合并组一份 / 全员公用一份 / 按excel匹配」因此无法理解。
+
+**新结构**（`lp_v3.py`）：
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `mapping["mode"]`（输出粒度） | `per_lp` / `per_group` / `all` | **这一步产出几份文件** |
+| `mapping["source"]`（数据来源） | `recipient` / `sheet` | **这一步的占位符字段从哪来** |
+
+- 选「从外部 Excel 数据表取」→ 输出粒度自动锁定「每人一份」（数据表是按人 join 的），并显示数据表配置区。
+- **旧数据兼容**：`mapping["mode"] == "from_sheet"` 在 `normalize_step()` 里自动拆成
+  `mode="per_lp" + source="sheet"`，老文件读取后无需手工迁移。
+- `execute_step()` 现在只在 `source == "sheet"` 时才去查外部数据表行。
+- 界面文案：`OUTPUT_MODE_LABELS` / `OUTPUT_MODE_DESC` / `DATA_SOURCE_LABELS` / `DATA_SOURCE_DESC`，
+  步骤卡与流程图节点同步显示（外部数据表来源显示为「每人一份 · 外部数据表」）。
+
+### 13.4 顺带修的
+
+- `sync_release.py` 之前把「绿色版存在 `lp_data/`」当**同步失败**（exit 1）——
+  但用户从绿色版测试时必然会生成 `lp_data/`，于是同步脚本永远红。
+  改为：平时只**提醒**，`--pack`（真正打包前）才**拦截**；`__pycache__/` 同理。
+
+### 13.5 两处「模式」的对照（回答用户提问）
+
+| | 事件信息里的**发送模式** | 步骤参数里的**输出粒度** |
+|---|---|---|
+| 作用对象 | 整个事件 | 单个步骤 |
+| 决定什么 | **几封邮件** | **这一步产出几份文件** |
+| 取值 | 每人一份 / 按组合并 / 全部合并 | 每人一份 / 每组合并一份 / 全员共用一份 |
+
+例：3 位收件人（甲乙同组 G1、丙单独）
+- 发送模式=每人一份 → 3 封草稿；发送模式=按组合并 → 2 封；全部合并 → 1 封
+- 某个步骤粒度=每人一份 → 3 个文件；每组合并一份 → 2 个；全员共用一份 → 1 个
+
+### 13.6 本轮验证
+
+- `python -m pytest lp-doc-mailer/tests -q` → **115 passed，EXITCODE=0**（新增 3 条：
+  粒度往返、数据来源切换与锁定、老 from_sheet 数据迁移；另加 final 模式加密件回归 1 条）。
+- `verify_concepts.py` → 概念与修复复核通过。
+- 视觉：`v4_pipeline.png`（步骤参数区两个下拉 + 说明文字）。
+
+
+---
+
+## 14. v3.1 流水线重构实施记录（2026-10-23 晚，Q1–Q5 用户已确认）
+
+> 设计稿：`docs/设计稿_v3.1_流水线重构.md`。用户逐条回答 Q1–Q5 后指示「不用考虑旧配置，
+> 我们就是全新开发。开始实施」。本节记录**已落地**的实现与验证结果。
+
+### 14.1 核心模型：六种步骤 → 两种产出条目
+
+| 旧（v3.0） | 新（v3.1） |
+|---|---|
+| `word_template` / `word_to_pdf` / `pdf_watermark` / `pdf_encrypt` | `kind="generate"`（生成文档）+ 条目上的勾选项 `to_pdf` / `watermark` / `encrypt` |
+| `pdf_source` / `static_file` | `kind="attach"`（附加文件），`params.files` 是路径列表 |
+| `mapping.mode`（输出粒度） | `granularity`（条目级：per_lp / per_group / all） |
+| `mapping.source`（数据来源） | **概念消解**：来源下沉到字段级，`mapping = {占位符: 来源键}` |
+| `mapping.sheet` | 条目级 `sheet = {path, key_col, match_col}` |
+
+新条目结构：
+
+```python
+{"id": "it-xxx", "kind": "generate" | "attach", "name": "季度对账单",
+ "enabled": True,
+ "params": {"template_path": "", "files": [], "to_pdf": False,
+            "watermark": False, "encrypt": False, "permissions": ["print"]},
+ "granularity": "per_lp" | "per_group" | "all",
+ "mapping": {"{{Call_Amount}}": "fields.Call_Amount"},
+ "sheet": {"path": "", "key_col": "", "match_col": "name"}}
+```
+
+核心层新接口：`normalize_item` / `new_item` / `item_uses_sheet` / `execute_item` /
+`run_items` / `field_source_options` / `item_placeholders` / `item_output_name` /
+`_item_units_for` / `_item_output_key` / `_item_preview_files` / `default_word_batch`。
+**删除**：`attach_mode` / `upstream_lookup_key` / `step_label` / `STEP_TYPES` / `STEP_LABELS` /
+`MAPPING_MODE_LABELS` / `OUTPUT_MODE_LABELS` / `DATA_SOURCE_LABELS`。
+
+处理顺序固定为 **转 PDF → 加水印 → 加密**，用户不用排。
+
+### 14.2 界面改造（工作台从 5 步变 6 步）
+
+| 步骤 | 变化 |
+|---|---|
+| (1) 收件人 | 不变；「发送模式」加括号说明「决定几封邮件」 |
+| (2) 文档流水线 | **步骤卡 → 条目表格**（# / 条目名称 / 类型 / 来源·模板 / 处理 / 产出粒度 / 启用）；单击行下方参数区切换；按住行上下拖动改顺序（带插入线）；Ctrl/Shift 多选 → 「删除选中」批量删；双击条目名改名；点「启用」列切换启用。**每行右侧的 ↑↓/参数/删除 四个按钮已删** |
+| (3) 附件 | 降级为快捷入口（文案改为「附件（快捷挂载）」） |
+| (4) 邮件模板 | 不变 |
+| (5) **总览（新增）** | 顶部四项统计（收件人/发送模式/条目数/待生成草稿）+ 预检结论；左表逐人列出最终附件包与打开口令；右侧邮件预览（主题 + 正文渲染图）+ 完整附件清单 |
+| (6) 预览与生成 | 原第 5 步，索引由 4 改为 5（已抽常量 `WB_STEP_RUN` 等，避免写死数字） |
+
+- 条目参数区：名称/改名、类型、Word 模板（选择…/检测占位符）或文件列表（添加文件…/从 Excel 导入路径…/保存）、
+  处理勾选、**权限位**（允许打印/允许编辑/允许复制内容）、产出粒度下拉。
+- 字段映射表三列：Word 占位符 / 填什么（数据来源）/ **预览值（以第一位收件人为例）**；
+  双击改来源；来源候选 = 内置 + 收件人字段 + 事件常量 + 外部数据表列（只有真选了 sheet. 来源才出现外部表配置区）。
+
+### 14.3 权限位可配置（Q1）
+
+`watermark_encrypt.encrypt_pdf(..., permissions=None)` 新增 `permissions` 参数，
+`permission_mask()` 把 `print/edit/copy` 映射到 PyMuPDF 权限位。**默认仍是「仅打印」**（铁律默认不变），
+用户主动勾才放开。全部取消 = 收件人只能打开查看（`normalize_item` 保留空列表，
+区别于「没配过 permissions 键」→ 默认 `["print"]`）。
+
+### 14.4 实施中发现并修掉的真缺陷
+
+1. **`tk.StringVar` 被 GC 后 Entry 变空**（新参数区实测截图发现：名称框是空的，而 LabelFrame 标题正确）。
+   根因：`tk.StringVar.__del__` 会把 Tcl 变量一起删掉；控件还活着，值没了。
+   修法：新增 `_wb_keep_var()` 把参数区所有 tk 变量吊在 `self._wb_keep` 上，
+   重建参数区时统一清空。**已加回归测试**（GC 前后 Entry 值不变）。
+2. **两个「生成文档」条目用同一个 Word 模板时产物同名**（附件包里撞名）。
+   修法：`item_output_name(..., orig_name=...)`；生成条目的「原件名」改用**条目名**
+   （`季度对账单_甲公司.pdf` 而非 `对账单模板_甲公司.pdf`），预览清单同步。**已加回归测试**。
+3. **执行完成后跳错页**：`_poll_queue` 里 `run_done` 分支写死 `_wb_show_step(4)`，
+   v3.1 加了总览页后 4 变成「总览」。改为 `WB_STEP_RUN` 常量（并把 6 个步骤索引全抽成常量）。
+4. **`run_items` 空流水线的错误不是元组**：`[("流水线为空…")]` 其实是字符串列表，
+   调用方按 `(unit_key, item_id, msg)` 取 `errs[0][2]` 会拿到第 3 个字符。改为真元组。
+5. **`granularity="all"` 时加密拿不到口令**：`build_units` 的 all 单元 `rep=None`，
+   `_passwords_for` 取到空口令 → 报「收件人没有打开口令」。修法：all 单元回退取第一位收件人。
+6. **Word 进程泄漏（机器级问题）**：`run_event` 每次都新建 `WordBatch`，而 `close()` 只释放
+   COM 引用、不调 Quit（Quit 会触发 0x800706be 致命异常杀进程），于是**每次生成残留一个
+   WINWORD.EXE（约 170MB）**。实测本机堆积到 **71 个**，空闲内存从 7.6GB 掉到 4.1GB，
+   机器被拖垮（截图脚本直接卡死）。修法：`lp_v3.default_word_batch()` 按线程缓存共享实例 +
+   GUI 改成**常驻工作线程**（`_submit_job` / `_worker_loop`），一个进程最多留 1 个 Word 进程。
+   实测：pytest 一轮后残留从 15+ 降到 **1**。
+7. **`ITEM_KIND_DESC` 漏导入**导致参数区渲染 NameError（测试抓到）。
+8. `run_items` 里 `outputs` 的注释仍写 `step_id`，已改为条目语义。
+
+### 14.5 本轮验证
+
+- `python -m pytest lp-doc-mailer/tests -q` → **132 passed，EXITCODE=0**（v3.0 时 115；
+  新增 17 条覆盖条目模型、字段级来源、权限位可配、粒度、Word 复用、GC 变量保活、撞名修复等）。
+- `sync_release.py` → 同步 + 校验通过（`APP_VERSION` = **3.1.0**，三处源码一致）。
+  **版本号决定**：用户明确指出「不是 3.1.0 吗」——本轮就是 v3.1，设计稿/界面/交接文档
+  口径都叫 v3.1，且 3.0.0 与 3.1.0 **都从未发布过**（仓库 tag 最高 v2.2.0），
+  所以对外的第一个 3.x 版本直接叫 **3.1.0**，不用再跳一个小版本。
+- 视觉验收：`v31_library.png` / `v31_pipeline.png` / `v31_overview.png`
+  （截图用 Win32 `PrintWindow(PW_RENDERFULLCONTENT)` 抓窗口，不依赖桌面可见——
+  本机当前整屏 `ImageGrab` 抓出来是纯黑，会话不可见时整屏截图不可用）。
+
+### 14.6 已知折中与遗留
+
+- **未做旧配置迁移器**（用户明确「不用考虑旧配置，全新开发」）。`normalize_item` 遇到未知
+  `kind` 一律当 `generate`；v2→v3 迁移只产出一个「生成文档」条目（带 to_pdf）。
+- 附件页（步骤 3）与流水线的「附加文件」条目功能有重叠，已按设计稿把前者降级为快捷入口，
+  文案里写清区别（收件人表里的「附件路径」= 每人不同；流水线「附加文件」= 一份文件发多人，
+  除非粒度设成「每人一份」只是文件名带名字）。
+- 总览页表格列宽有限，长附件名会被截断 → 右侧已加「完整附件清单」文本框兜底。
+- **Word 进程仍会残留 1 个/进程（未彻底解决）**：本轮把「每次生成残留 1 个」压到
+  「每个 App/脚本进程残留 1 个」，但进程退出后那个 WINWORD.EXE 仍不会自己退出
+  （`WordBatch.close()` 只释放 COM 引用、不调 Quit——调 Quit 再释放引用会触发
+  0x800706be 致命异常直接杀进程，这条路已验证是雷）。
+  残留是无头实例（MainWindowTitle 为空、不可见、不含用户文档）。
+  清理办法（只杀无头的，别杀用户自己开着的 Word）：
+  ```powershell
+  Get-Process WINWORD -EA 0 | ? { [string]::IsNullOrEmpty($_.MainWindowTitle) } | Stop-Process -Force
+  ```
+  实测本轮堆积到 71 个时机器被拖垮（空闲内存 7.6GB → 4.1GB，截图脚本直接卡死）；
+  清理后回到 7.4GB。要彻底解决需要另找 Word 退出路径（风险高，建议单独一轮处理）。
+- `.zcode` 目录下的临时脚本（`shot_v4.py` / `verify_v4_features.py` / `verify_concepts.py` /
+  `_rename_step*.py` 等）因本会话回收站仅限工作区内路径而无法删除，可随手删。
+  （v3.1 的 `shot_v31.py` + `win_grab.py` 是有意保留的：可复现界面验收。）
+- **P4（收件人库界面、执行历史查看界面）仍未做**，发版说明要写清。
+- 打包 zip / 签名 / git tag / Release 上传 **一律未执行**（会写远端，需用户明确指示）。
+- 仓库状态（`lp-doc-mailer/`，branch=main，remote=github.com/fundops-notes/doc-mailer）：
+  `src/lp_tool.py` / `src/watermark_encrypt.py` / `tests/test_core.py` 已修改未提交；
+  `src/lp_v3.py` 与 `tests/` 下 6 个新文件仍未跟踪，发版前需要 `git add`。

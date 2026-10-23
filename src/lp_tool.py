@@ -1,41 +1,69 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文档分发助手（GUI exe）
+文档分发助手 v3.1（GUI exe）
 
-功能：
-1) 收件人信息管理：名称、水印名称、收件人(To+CC)、邮件标题、打开口令、权限口令；
-   支持从 Excel(xlsx)/CSV 批量导入，可导出导入模板
-2) 邮件模板：标题 + HTML 正文，支持 {{字段}} 占位符批量区分
-   可用字段：{{LP名称}} {{水印名称}} {{打开口令}} {{日期}}
-   出于安全设计，{{权限口令}} 不是可用字段——权限口令永远不会出现在邮件里
-3) 批量处理：每个收件人独立水印 + 独立打开口令 + 独立权限口令（AES-256 加密）
-4) Outlook 草稿：逐收件人生成草稿并插入附件，只 Save 不 Send，
-   最终发送必须人工在 Outlook 里复核后手动发出
+v3.1 相对 v3.0 的结构变化：
+  · 流水线从「六种步骤」重构为「两种产出条目」：
+      ① 生成文档（Word 模板 → 可选转 PDF / 加水印 / 加密）
+      ② 附加文件（磁盘上已有的文件 → 可选加水印 / 加密）
+    处理顺序固定（转 PDF → 加水印 → 加密），用户不用排；每条产出几份文件由条目自己的
+    「产出粒度」决定。
+  · 「数据来源」概念消解：来源下沉到字段级 —— 每个占位符单独选来源，并给预览值。
+  · 工作台新增第 5 步「总览」：生成前逐人核对最终附件包与邮件样子。
 
-数据文件：与本程序同目录的 lp_data.json（含全部口令，属敏感文件，请妥善保管）
+v3.0 相对 v2.x 的结构变化：
+  · 顶层从「标签页」改为「左侧固定导航 + 右侧内容区」
+  · 引入 场景 Scenario（怎么做）/ 发送事件 Event（这次做给谁）两层结构
+  · 数据从单文件 lp_data.json 改为目录 lp_data/（settings / events / scenarios / runs）
+
+安全设计（不可动摇）：
+  · 权限口令绝不进入邮件正文/标题/任何草稿字段
+  · 打开口令 ≠ 权限口令
+  · 只建草稿绝不发送（全库唯一 Outlook 写操作是 mail.Save()）
+  · AES-256 加密，权限位仅打印
+  · 草稿只写入 Outlook 草稿箱，发送前必须人工复核
+
+数据文件：程序同目录的 lp_data/（含全部口令，属敏感文件，请妥善保管）
 """
 
+import html as _htmlmod
 import json
 import os
-import secrets
+import queue as _queue
 import re
-import string
 import sys
 import threading
 import webbrowser
-from datetime import date
+from datetime import date, datetime
+from html.parser import HTMLParser as _HTMLParser
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "2.2.0"
+import lp_v3
+from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
+                   HEADER_ALIASES, ITEM_KIND_DESC, ITEM_KIND_LABELS, ITEM_KINDS,
+                   MOCK_HEADERS, MOCK_LPS, PERMISSIONS, PERMISSION_LABELS,
+                   Store, clone_event, gen_pw, migrate_v2_to_v3, needs_migration,
+                   new_event, new_item, new_scenario, normalize_attachment,
+                   normalize_event, normalize_item, normalize_recipient,
+                   parse_import_rows, parse_import_rows_v3, pw_fingerprint,
+                   read_spreadsheet, sanitize_filename, split_mails, split_paths,
+                   sync_scenario_to_event)
+
+APP_VERSION = "3.1.0"
+# lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.1.0"' 字面量，别改成 import。
+assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
+
+# 邮件模板里永远可用的内置字段（**没有权限口令**，这是架构保证不是靠自觉）
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
 DEFAULT_SUBJECT = "机密文件（{{收件人名称}} 专属）"
@@ -48,6 +76,9 @@ DEFAULT_BODY = """<div style="font-family:微软雅黑,Segoe UI,Arial;font-size:
 <p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>
 </div>"""
 
+# 演示数据（均为虚构，邮箱用保留域名，可直接导入测试全流程）
+# 已迁到 lp_v3.py（MOCK_LPS / MOCK_HEADERS），这里保留名字以兼容旧引用。
+
 
 def app_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -55,41 +86,7 @@ def app_dir() -> Path:
     return Path(__file__).parent
 
 
-# 演示数据（均为虚构，邮箱用保留域名，可直接导入测试全流程）
-MOCK_LPS = [
-    ["苏州启衡科技有限公司", "", "ir@qiheng-demo.cn", "fin@qiheng-demo.cn", "", "", "", "", ""],
-    ["宁波晨曦汐诺供应链股份有限公司", "", "contact@chenxi-demo.cn", "", "", "", "", "Demo-Open-88", ""],
-    ["新疆乌鲁木齐市泓远红杉智能科技有限公司", "", "admin@hongyuan-demo.cn", "ir@hongyuan-demo.cn", "audit@hongyuan-demo.cn", "", "", "", ""],
-    ["上海临港科创一期产业投资有限公司", "", "lg@chuangxin-demo.cn", "", "", "临港科创2026年度交付文件", "", "", ""],
-    ["珠海横琴粤澳深谋咨询服务有限公司", "", "gp@henqin-demo.cn", "fin@henqin-demo.cn", "", "", "", "", "Demo-Owner-66"],
-    ["北京中关军融创启信息技术有限公司", "演示专用水印", "zg@rongchuang-demo.cn", "", "", "", "", "", ""],
-    ["深圳前海深港现代服务业合作区汇金聚富实业有限公司", "", "huijin@qianhai-demo.cn", "", "", "", "", "", ""],
-    ["杭州西湖区云栖数字经济研究院", "", "yunqi@xihu-demo.cn", "ir@xihu-demo.cn", "", "", "", "", ""],
-]
-MOCK_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密送", "邮件标题",
-                "附件路径", "打开口令", "权限口令"]
-
-
-DATA_FILE = app_dir() / "lp_data.json"
-
-# ---------- 纯逻辑函数（便于脱离 GUI 测试） ----------
-
-PW_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
-
-
-def gen_pw(n=12):
-    # 密码学安全随机（random 的梅森旋转可被预测）
-    return "".join(secrets.choice(PW_CHARS) for _ in range(n))
-
-
-def sanitize_filename(s, maxlen=40):
-    # 非法字符 < > : " / \ | ? * 用 chr 构造避免字面量转义问题
-    for c in map(chr, (60, 62, 58, 34, 47, 92, 124, 63, 42)):
-        s = s.replace(c, "_")
-    s = "".join(ch for ch in s if ord(ch) >= 32)  # 去控制字符
-    s = s.strip().rstrip(chr(46)).strip()          # 结尾的点/空格
-    return s[:maxlen] if s else "unnamed"
-
+# ---------- v2 兼容纯逻辑（迁移、导入与回归测试仍依赖） ----------
 
 def validate_records(lps):
     """批量前统一校验：口令非空/不同、水印非空、跨记录口令不复用。"""
@@ -112,142 +109,36 @@ def validate_records(lps):
     return issues
 
 
-def _ver_tuple(v):
-    nums = re.findall(r"\d+", str(v or ""))
-    return tuple(int(x) for x in nums[:3])
+def render_filename(tpl, src_path, rec):
+    """按模板生成输出文件名（不含扩展名）。字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}"""
+    mapping = {
+        "{{原件名}}": Path(src_path).stem,
+        "{{LP名称}}": sanitize_filename(rec.get("name", ""), 60),   # 兼容旧模板
+        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), 60),
+        "{{水印名称}}": sanitize_filename(rec.get("wm", ""), 60),
+        "{{日期}}": date.today().strftime("%Y%m%d"),
+    }
+    out = tpl or DEFAULT_FILENAME_TPL
+    for k, v in mapping.items():
+        out = out.replace(k, v)
+    out = sanitize_filename(out.strip(), 90)
+    return out or "output"
 
 
-def check_latest(timeout=8):
-    """查询 GitHub 最新 Release。返回 dict 或 None（网络失败时静默）。"""
-    import urllib.request
-    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
-    req = urllib.request.Request(url, headers={"User-Agent": "doc-mailer"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        import json as _j
-        d = _j.loads(r.read().decode("utf-8"))
-    asset = next((a for a in d.get("assets", [])
-                  if a["name"].startswith("doc-mailer_") and a["name"].endswith("_portable.zip")), None)
-    return {"tag": d.get("tag_name", ""), "body": (d.get("body") or "")[:400],
-            "url": d.get("html_url", ""),
-            "asset_url": asset["browser_download_url"] if asset else None,
-            "asset_size": asset.get("size") if asset else None,
-            "asset_digest": asset.get("digest") if asset else None}
-
-
-def _download_with_progress(url, dest, progress=None, timeout=300):
-    import urllib.request
-
-    def hook(n, bs, total):
-        if progress and total:
-            progress(min(n * bs * 100 // total, 100))
-
-    urllib.request.urlretrieve(url, dest, reporthook=hook)
-
-
-def pw_fingerprint(pw):
-    import hashlib
-    return hashlib.sha256((pw or "").encode("utf-8")).hexdigest()[:8]
-
-
-
-def split_paths(s):
-    """拆分附件路径：仅按 ; ；和换行（逗号常出现在中文文件名里，不作为分隔符）。"""
-    for ch in ["；", ";", "\n", "\r"]:
-        s = s.replace(ch, ";")
-    return [x.strip().strip('"') for x in s.split(";") if x.strip()]
-
-
-def split_mails(s):
-    for ch in ["；", ";", "，", ",", "\n", "\r", "\t"]:
-        s = s.replace(ch, ";")
-    if "<" not in s:  # 无显示名格式时才把空格当分隔符
-        s = s.replace(" ", ";")
-    return [x for x in s.split(";") if x]
-
-
-HEADER_ALIASES = {
-    "name": {"lp名称", "收件人名称", "名称", "主体名称", "客户名称", "lp name", "name"},
-    "wm": {"水印名称", "水印"},
-    "to": {"收件人", "收件邮箱", "to", "邮箱", "email"},
-    "cc": {"抄送", "cc"},
-    "bcc": {"密送", "bcc"},
-    "files": {"附件路径", "附件", "额外附件", "attachments", "files"},
-    "subject": {"邮件标题", "标题", "主题", "subject"},
-    "open_pw": {"打开口令", "打开密码", "open pw"},   # 不收"密码/口令"这种歧义列名
-    "owner_pw": {"权限口令", "权限密码", "owner pw"},
-    "merge_group": {"合并组", "merge group", "merge_group"},
-    "from_addr": {"发件人", "代发地址", "from", "sent on behalf of"},
-}
-
-
-def parse_import_rows(rows):
-    """rows: 二维列表，第一行为表头。返回 (收件人记录列表, 未识别的列名列表)。"""
-    if not rows:
-        return [], []
-    header = ["" if h is None else str(h).strip().lower() for h in rows[0]]
-    col_map = {}
-    unknown = []
-    for idx, h in enumerate(header):
-        hit = None
-        for key, aliases in HEADER_ALIASES.items():
-            if h in aliases:
-                hit = key
-                break
-        if hit:
-            col_map[hit] = idx
-        elif h:
-            unknown.append(str(rows[0][idx]))
-    lps = []
-    for row in rows[1:]:
-        def cell(key):
-            i = col_map.get(key)
-            if i is None or i >= len(row):
-                return ""
-            v = row[i]
-            return "" if v is None else str(v).strip()
-        if not cell("name") or cell("name").startswith("示例："):
-            continue  # 跳过空行与导入模板里的示例占位行
-        # 口令留空时保留空串：导入合并时不清掉已有口令，批量前校验兜底
-        lps.append({
-            "name": cell("name"),
-            "wm": cell("wm") or cell("name"),
-            "to": cell("to"),
-            "cc": cell("cc"),
-            "bcc": cell("bcc"),
-            "subject": cell("subject"),
-            "files": cell("files"),
-            "open_pw": cell("open_pw"),
-            "owner_pw": cell("owner_pw"),
-            "merge_group": cell("merge_group"),
-            "from_addr": cell("from_addr"),
-        })
-    return lps, unknown
-
-
-def read_spreadsheet(path):
-    p = Path(path)
-    if p.suffix.lower() == ".csv":
-        import csv
-        try:
-            with open(p, newline="", encoding="utf-8-sig") as f:
-                rows = [row for row in csv.reader(f)]
-        except UnicodeDecodeError:  # 中文 Excel 默认导出 GBK
-            with open(p, newline="", encoding="gbk", errors="replace") as f:
-                rows = [row for row in csv.reader(f)]
-        if rows and len(rows[0]) == 1 and ";" in rows[0][0]:  # 分号分隔
-            rows = [[c.strip() for c in r[0].split(";")] for r in rows if r]
-        return rows
-    else:
-        import openpyxl
-        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
-        ws = wb.active
-        rows = []
-        for row in ws.iter_rows(values_only=True):
-            rows.append(list(row))
-            if len(rows) > 5000:
-                break
-        wb.close()
-        return rows
+def render_template(tpl, rec, escape=True):
+    """v2 邮件正文渲染：只映射 4 个字段，**永远不含权限口令**。"""
+    mapping = {
+        "{{LP名称}}": rec.get("name", ""),      # 兼容旧模板
+        "{{收件人名称}}": rec.get("name", ""),
+        "{{水印名称}}": rec.get("wm", ""),
+        "{{打开口令}}": rec.get("open_pw", ""),
+        "{{日期}}": date.today().strftime("%Y年%m月%d日"),
+    }
+    for k, v in mapping.items():
+        if escape:
+            v = _htmlmod.escape(v, quote=True)  # 口令/名称中的 <>& 不破坏邮件HTML
+        tpl = tpl.replace(k, v)
+    return tpl
 
 
 def _normalize_word_html(html):
@@ -259,9 +150,6 @@ def _normalize_word_html(html):
 
 
 # ---------- 内置富文本编辑器：HTML ↔ tk Text 双向转换 ----------
-
-import html as _htmlmod
-from html.parser import HTMLParser as _HTMLParser
 
 _TAG_STYLE = {}  # tk 标签名 -> 样式 dict（导出时反查）
 
@@ -379,6 +267,7 @@ def html_to_runs(html_str):
         pos += len(frag)
     return text, runs
 
+
 def load_html(tw, html_str):
     text, runs = html_to_runs(html_str)
     lead = len(text) - len(text.lstrip("\n"))  # 去掉段首累积出的空行
@@ -467,15 +356,14 @@ def clip_html_fragment():
             if isinstance(raw, str):
                 raw = raw.encode("utf-8", errors="replace")
             head = raw[:512].decode("ascii", errors="ignore")
-            import re as _re
-            ms = _re.search(r"StartFragment:(\d+)", head)
-            me = _re.search(r"EndFragment:(\d+)", head)
+            ms = re.search(r"StartFragment:(\d+)", head)
+            me = re.search(r"EndFragment:(\d+)", head)
             if ms and me:
                 s, e = int(ms.group(1)), int(me.group(1))
                 frag = raw[s:e].decode("utf-8", errors="replace")
             else:
                 frag = raw.decode("utf-8", errors="replace")
-            m = _re.search(r"<body[^>]*>(.*)</body>", frag, _re.S | _re.I)
+            m = re.search(r"<body[^>]*>(.*)</body>", frag, re.S | re.I)
             return (m.group(1) if m else frag).strip() or None
         finally:
             win32clipboard.CloseClipboard()
@@ -483,94 +371,8 @@ def clip_html_fragment():
         return None
 
 
-DEFAULT_FILENAME_TPL = "{{原件名}}_{{LP名称}}"
-
-
-def render_filename(tpl, src_path, rec):
-    """按模板生成输出文件名（不含扩展名）。字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}"""
-    mapping = {
-        "{{原件名}}": Path(src_path).stem,
-        "{{LP名称}}": sanitize_filename(rec.get("name", ""), 60),   # 兼容旧模板
-        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), 60),
-        "{{水印名称}}": sanitize_filename(rec.get("wm", ""), 60),
-        "{{日期}}": date.today().strftime("%Y%m%d"),
-    }
-    out = tpl or DEFAULT_FILENAME_TPL
-    for k, v in mapping.items():
-        out = out.replace(k, v)
-    out = sanitize_filename(out.strip(), 90)
-    return out or "output"
-
-
-def render_template(tpl, rec, escape=True):
-    import html as _h
-    mapping = {
-        "{{LP名称}}": rec.get("name", ""),      # 兼容旧模板
-        "{{收件人名称}}": rec.get("name", ""),
-        "{{水印名称}}": rec.get("wm", ""),
-        "{{打开口令}}": rec.get("open_pw", ""),
-        "{{日期}}": date.today().strftime("%Y年%m月%d日"),
-    }
-    for k, v in mapping.items():
-        if escape:
-            v = _h.escape(v, quote=True)  # 口令/名称中的 <>& 不破坏邮件HTML
-        tpl = tpl.replace(k, v)
-    return tpl
-
-
-def create_outlook_draft(rec, attachments, subject_tpl, body_tpl):
-    """在 Outlook 草稿箱创建邮件（只 Save，绝不 Send）。"""
-    import win32com.client as win32
-    ol = win32.Dispatch("Outlook.Application")
-    mail = ol.CreateItem(0)  # 0 = olMailItem
-    mail.To = ";".join(split_mails(rec.get("to", "")))
-    cc = split_mails(rec.get("cc", ""))
-    if cc:
-        mail.CC = ";".join(cc)
-    bcc = split_mails(rec.get("bcc", ""))
-    if bcc:
-        mail.BCC = ";".join(bcc)
-    mail.Subject = render_template(subject_tpl, rec, escape=False)
-    mail.HTMLBody = render_template(body_tpl, rec)
-    from_addr = rec.get("from_addr", "")
-    if from_addr:
-        mail.SentOnBehalfOfName = from_addr
-    for f in attachments:
-        mail.Attachments.Add(str(Path(f).resolve()))  # Outlook 是独立进程，必须绝对路径
-    mail.Save()  # 只存草稿；不调用 Send
-    return mail
-
-
-def _load_data_file(path):
-    """读取数据 json。返回 (data, error)；error 非 None 表示文件存在但读不了。"""
-    p = Path(path)
-    if not p.exists():
-        return None, None
-    try:
-        d = json.loads(p.read_text(encoding="utf-8-sig"))  # 容忍 BOM
-    except Exception as e:
-        return None, f"{e}"
-    if not isinstance(d, dict) or not isinstance(d.get("lps"), list):
-        return None, "数据结构不合法（缺少 lps 列表）"
-    norm, drop = [], 0
-    for rec in d["lps"]:  # 规范化：丢非 dict 条目、补默认字段
-        if not isinstance(rec, dict):
-            drop += 1
-            continue
-        base = {"name": "", "wm": "", "to": "", "cc": "", "bcc": "",
-                "files": "", "subject": "", "open_pw": "", "owner_pw": "",
-                "merge_group": ""}
-        base.update({k: v for k, v in rec.items() if isinstance(v, str)})
-        norm.append(base)
-    d["lps"] = norm
-    d.setdefault("subject", DEFAULT_SUBJECT)
-    d.setdefault("body", DEFAULT_BODY)
-    return d, None
-
-
 def render_preview_pixmap(html, width=620, dpi=110):
-    """用 PyMuPDF Story 引擎把 HTML 渲染成 tk 可用的 PNG 字节（近似预览）。
-    挂载系统微软雅黑以支持中文粗体；无该字体时退回内置字体。"""
+    """用 PyMuPDF Story 引擎把 HTML 渲染成 tk 可用的 PNG 字节（近似预览）。"""
     import os
     import tempfile
     css = ('@font-face {font-family:cn; src:url(msyh.ttc);}'
@@ -593,13 +395,12 @@ def render_preview_pixmap(html, width=620, dpi=110):
         height = 2400  # 长模板先给足高度，按实际内容裁切
         mediabox = fitz.Rect(0, 0, width, height)
         dev = writer.begin_page(mediabox)
-        more, filled = story.place(mediabox + (pad, pad, -pad, -pad))
+        story.place(mediabox + (pad, pad, -pad, -pad))
         story.draw(dev)
         writer.end_page()
         writer.close()
         doc = fitz.open(path)
         page = doc[0]
-        # 找到内容实际底边，裁掉大片空白
         blocks = [b for b in page.get_text("blocks") if b[4].strip()]
         bottom = max((b[3] for b in blocks), default=height // 2) + pad * 2
         clip = fitz.Rect(0, 0, width, min(bottom + 8, height))
@@ -650,715 +451,1460 @@ class ToolTip:
 
 # ---------- GUI ----------
 
+WB_STEPS = [
+    ("收件人", "recipients"),
+    ("文档流水线", "pipeline"),
+    ("附件", "attachments"),
+    ("邮件模板", "mail"),
+    ("总览", "overview"),
+    ("预览与生成", "run"),
+]
+
+# 步骤索引（写死数字容易改一步就错，用常量）
+WB_STEP_RECIPIENTS = 0
+WB_STEP_PIPELINE = 1
+WB_STEP_ATTACHMENTS = 2
+WB_STEP_MAIL = 3
+WB_STEP_OVERVIEW = 4
+WB_STEP_RUN = 5
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("980x680")
+        root.geometry("1200x780")
         try:
             root.state("zoomed")
         except Exception:
             pass
 
-        self.data = self.load_data()
-        self.pdfs = []
-        self.running = False
-        import queue as _qmod
-        self._q = _qmod.Queue()
-        self._after_id = None
-        self._preview_img = None
+        self._boot_error = None
+        self.store = Store()
+        self.settings = dict(self.store.load_settings()[0])
+        self._run_migration()
 
-        # 首页导航 + 页面切换
-        self._pages = {}
-        self._container = ttk.Frame(root)
-        self._container.pack(fill="both", expand=True)
-        self._build_homepage()
+        self.cur_event_id = None
+        self.cur_event = None
+        self.running = False
+        self._q = _queue.Queue()
+        self._jobs = _queue.Queue()
+        self._worker_thread = None
+        self._preview_img = None
+        self._wm_preview_img = None
+        self._screens = {}
+        self._wb_step = 0
+        self._wb_content = None
+        self._wb_step_buttons = []
+        self._wb_event = None
+        self._wb_step_sub = ["", "", "", "", ""]
+        self._poll_id = None
+        self._shell_widgets = []
+        self._wb_last_run = None
+
+        self._build_shell()
         if getattr(self, "_boot_error", None):
-            self.root.after(200, lambda: messagebox.showerror("数据文件损坏", self._boot_error))
+            self.root.after(200, lambda: messagebox.showerror("数据读取失败", self._boot_error))
         self.root.after(150, self._poll_queue)
-        if self.data.get("auto_update", True):
+        if self.settings.get("auto_update", True):
             self.root.after(2500, lambda: self.check_update(auto=True))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ----- 数据 -----
+    # ================= 启动 / 迁移 =================
 
-    def load_data(self):
-        d, err = _load_data_file(DATA_FILE)
-        if err is not None:
-            # 文件存在但损坏：改名留证，绝不覆盖成演示数据（防口令丢失）
-            stamp = date.today().strftime("%Y%m%d-%H%M%S")
-            bak = DATA_FILE.with_name(f"lp_data.corrupt-{stamp}.json")
-            try:
-                DATA_FILE.replace(bak)
-            except OSError:
-                bak = None
-            msg = "lp_data.json 读取失败：" + err + "\n"
-            if bak:
-                msg += "原文件已备份为 " + bak.name + "\n"
-            msg += "已用空清单启动，请检查备份文件。"
-            self._boot_error = msg
-            return {"lps": [], "subject": DEFAULT_SUBJECT, "body": DEFAULT_BODY}
-        if d is None:  # 文件确实不存在才用示例种子
-            seed, _e = _load_data_file(DATA_FILE.parent / "lp_data.example.json")
-            d = seed or {"lps": [], "subject": DEFAULT_SUBJECT, "body": DEFAULT_BODY}
-            try:
-                DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2),
-                                     encoding="utf-8")
-            except Exception:
-                pass
-        return d
+    def _run_migration(self):
+        """首次启动：v2 的 lp_data.json → lp_data/ 目录；没有旧数据则播种示例。"""
+        if not needs_migration(self.store):
+            self.settings, err = self.store.load_settings()
+            if err:
+                self._boot_error = err
+            # 空目录（第一次装 v3）→ 播种示例数据
+            if not self.store.list_scenarios() and not self.store.list_events():
+                try:
+                    ok, notes = lp_v3.seed_demo(self.store)
+                    if ok:
+                        self.root.after(300, lambda: messagebox.showinfo(
+                            "已载入示例数据",
+                            "第一次运行，已为你准备了一份示例数据：\n\n"
+                            + "\n".join("· " + n for n in notes)
+                            + "\n\n收件人邮箱都是虚构的（保留域名），"
+                              "可以放心点「生成全部 Outlook 草稿」试跑全流程。"))
+                except Exception as e:
+                    self._boot_error = "示例数据初始化失败：%s" % e
+            return
+        ok, notes, err = migrate_v2_to_v3(self.store)
+        self.settings, serr = self.store.load_settings()
+        if serr:
+            self._boot_error = serr
+        if ok:
+            self.root.after(300, lambda: messagebox.showinfo(
+                "已升级到 v3 数据结构",
+                "已把 v2 数据迁移为 lp_data/ 目录结构：\n\n"
+                + "\n".join("· " + n for n in notes)
+                + "\n\n原 lp_data.json 已改名保留为 lp_data.json.bak（未删除，可回退）。"))
+        elif err:
+            self._boot_error = "数据迁移未完成：%s" % err
 
-    def save_data(self):
-        # 原子写：.tmp → 替换；旧文件轮转 .bak，写坏也不丢上一份
+    # ================= 外壳 =================
+
+    def _build_shell(self):
+        style = ttk.Style()
         try:
-            raw = json.dumps(self.data, ensure_ascii=False, indent=2)
-            tmp = DATA_FILE.with_suffix(".json.tmp")
-            tmp.write_text(raw, encoding="utf-8")
-            if DATA_FILE.exists():
-                DATA_FILE.replace(DATA_FILE.with_suffix(".json.bak"))
-            os.replace(tmp, DATA_FILE)
-        except Exception as e:
-            messagebox.showerror("保存失败",
-                                 f"无法写入 {DATA_FILE}\n{e}")
+            style.theme_use("vista")
+        except Exception:
+            pass
+        style.configure("Nav.TButton", padding=(10, 7), anchor="w")
+        style.configure("Step.TButton", padding=(8, 6), anchor="w")
+        style.configure("Head.TLabel", font=("", 15, "bold"))
+        style.configure("Sub.TLabel", foreground="#666")
+        style.configure("Card.TLabelframe", padding=8)
 
-    def _build_homepage(self):
-        """首页：流程导航（纯标准 ttk，零自定义字体/光标/hover）"""
-        home = ttk.Frame(self._container)
-        self._pages["home"] = home
+        # --- 顶栏 ---
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", padx=10, pady=(8, 4))
+        self._shell_widgets.append(top)
+        ttk.Label(top, text="文档分发助手", style="Head.TLabel").pack(side="left")
+        self.crumb = ttk.Label(top, text="", style="Sub.TLabel")
+        self.crumb.pack(side="left", padx=14)
+        ttk.Button(top, text="检查更新", command=lambda: self.check_update(False)
+                   ).pack(side="right")
+        ttk.Label(top, text="v" + APP_VERSION, foreground="#888").pack(side="right", padx=10)
 
-        ttk.Label(home, text="文档分发助手",
-                  font=("", 20, "bold")).pack(pady=(30, 4))
-        ttk.Label(home, text=f"v{APP_VERSION}  批量加密分发 · 逐人水印 · Outlook 草稿",
-                  font=("", 10)).pack(pady=(0, 20))
+        # --- 主体：左导航 + 右内容 ---
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self._shell_widgets.append(body)
+        nav = ttk.Frame(body, width=152)
+        nav.pack(side="left", fill="y")
+        nav.pack_propagate(False)
+        ttk.Label(nav, text="主导航", foreground="#888").pack(anchor="w", padx=8, pady=(4, 2))
+        for key, text in (("home", "事件库"),):
+            b = ttk.Button(nav, text=text, style="Nav.TButton",
+                           command=lambda k=key: self.show_screen(k))
+            b.pack(fill="x", padx=4, pady=1)
+        ttk.Label(nav, text="全局", foreground="#888").pack(anchor="w", padx=8, pady=(12, 2))
+        for key, text in (("settings", "设置"), ("help", "帮助")):
+            b = ttk.Button(nav, text=text, style="Nav.TButton",
+                           command=lambda k=key: self.show_screen(k))
+            b.pack(fill="x", padx=4, pady=1)
 
-        # 按钮行
-        btns = ttk.Frame(home)
-        btns.pack(pady=10)
+        self.content = ttk.Frame(body)
+        self.content.pack(side="left", fill="both", expand=True)
+        # 启动后直接落在「场景与事件」页
+        self.show_screen("home")
 
-        steps = [
-            ("1\n收件人管理", "导入维护清单", "lp"),
-            ("2\n邮件模板", "所见即所得", "tpl"),
-            ("3\nWord模板", "批量生成通知", "word"),
-            ("4\n生成/草稿", "水印加密+Outlook", "run"),
-        ]
-        for i, (title, desc, page) in enumerate(steps):
-            col = ttk.Frame(btns)
-            col.grid(row=0, column=i, padx=6)
-            b = ttk.Button(col, text=title, width=14,
-                           command=lambda pg=page: self._show_page(pg))
-            b.pack(pady=(4, 2))
-            ttk.Label(col, text=desc, font=("", 8),
-                      foreground="#666").pack(pady=(0, 4))
-            if i < 3:
-                ttk.Label(btns, text="-->", font=("", 10)
-                          ).grid(row=0, column=i * 2 + 1, sticky="s", pady=(0, 25))
+    def show_screen(self, name):
+        """切换顶层页面（首次进入时构建）。"""
+        for f in self._screens.values():
+            f.pack_forget()
+        if name not in self._screens:
+            frame = ttk.Frame(self.content)
+            self._screens[name] = frame
+            builder = {
+                "home": self._build_home,
+                "settings": self._build_settings,
+                "help": self._build_help,
+                "event": self._build_workbench,
+            }.get(name)
+            if builder:
+                builder(frame)
+        self._screens[name].pack(fill="both", expand=True)
+        self._set_crumb({
+            "home": "事件库", "settings": "设置", "help": "帮助",
+        }.get(name, name))
+        if name == "home":
+            self._refresh_home()
+        elif name == "settings":
+            self._refresh_settings()
 
-        # 状态行
-        status = ttk.Frame(home)
-        status.pack(side="bottom", fill="x", padx=16, pady=8)
-        n = len(self.data.get("lps", []))
-        ttk.Label(status, text=f"当前清单：{n} 位收件人").pack(side="left")
-        ttk.Label(status, text="v" + APP_VERSION,
-                  foreground="#aaa").pack(side="right")
-
-        home.pack(fill="both", expand=True)
-
-    def _build_word_page(self, parent):
-        """Word 模板批量生成：字段映射 + 数据表 + 生成 PDF/Word"""
-
-        # --- 顶部操作说明 ---
-        help_frame = ttk.LabelFrame(parent, text=" 操作说明 ")
-        help_frame.pack(fill="x", padx=6, pady=(4, 2))
-        help_text = (
-            "1. 准备 Word 模板（.docx），在需要替换的位置写占位符："
-            "{{LP_Name}} 或 ?LP_Name?（两种格式都支持）\n"
-            "2. 准备数据表（Excel 第一行=列名，如：LP_Name | Call_Amount | Unfunded）"
-            "→ 点「导入Excel」\n"
-            "3. 点「检测占位符」自动从模板提取 → 在映射表指定每个占位符对应哪列数据\n"
-            "4. 选择输出格式（PDF 或 Word）和输出目录 → 点「批量生成」"
-        )
-        ttk.Label(help_frame, text=help_text, justify="left", font=("", 9),
-                  foreground="#444", padding=(8, 4)).pack(anchor="w")
-        ttk.Button(help_frame, text="下载示例模板+数据表",
-                   command=self._wt_download_examples).pack(anchor="w", padx=8, pady=(2, 6))
-        # --- 上方：模板与输出设置 ---
-        top = ttk.LabelFrame(parent, text=" 模板与输出 ")
-        top.pack(fill="x", padx=6, pady=4)
-
-        r1 = ttk.Frame(top); r1.pack(fill="x", padx=4, pady=3)
-        ttk.Label(r1, text="Word模板：").pack(side="left")
-        self._wt_path = tk.StringVar(value=self.data.get("word_template") or "")
-        ttk.Entry(r1, textvariable=self._wt_path, width=50).pack(side="left", padx=4)
-        ttk.Button(r1, text="选择…", command=self._wt_pick).pack(side="left")
-        ttk.Button(r1, text="检测占位符", command=self._wt_detect).pack(side="left", padx=6)
-
-        r2 = ttk.Frame(top); r2.pack(fill="x", padx=4, pady=3)
-        ttk.Label(r2, text="输出格式：").pack(side="left")
-        self._wt_fmt = tk.StringVar(value="pdf")
-        ttk.Radiobutton(r2, text="PDF", variable=self._wt_fmt, value="pdf").pack(side="left", padx=4)
-        ttk.Radiobutton(r2, text="Word (.docx)", variable=self._wt_fmt, value="docx").pack(side="left", padx=4)
-        ttk.Label(r2, text="   输出目录：").pack(side="left")
-        self._wt_outdir = tk.StringVar(
-            value=self.data.get("wt_outdir") or str(Path.home() / "Documents" / "Word批量生成"))
-        ttk.Entry(r2, textvariable=self._wt_outdir, width=40).pack(side="left", padx=4)
-        ttk.Button(r2, text="浏览", command=self._wt_browse_out).pack(side="left")
-
-        # --- 中部左右分栏：字段映射 + 数据表 ---
-        mid = ttk.PanedWindow(parent, orient="horizontal")
-        mid.pack(fill="both", expand=True, padx=6, pady=4)
-
-        # 左：字段映射表
-        map_frame = ttk.LabelFrame(mid, text=" 字段映射（Word占位符 ← 数据列） ")
-        map_frame.pack_propagate(False)
-        self._wt_map_tree = ttk.Treeview(map_frame, columns=["ph", "col"],
-                                          show="headings", height=8)
-        self._wt_map_tree.heading("ph", text="Word 占位符")
-        self._wt_map_tree.heading("col", text="数据列名")
-        self._wt_map_tree.column("ph", width=150)
-        self._wt_map_tree.column("col", width=150)
-        map_scroll = ttk.Scrollbar(map_frame, orient="vertical",
-                                    command=self._wt_map_tree.yview)
-        self._wt_map_tree.configure(yscrollcommand=map_scroll.set)
-        self._wt_map_tree.pack(side="left", fill="both", expand=True, padx=(4,0), pady=4)
-        map_scroll.pack(side="right", fill="y")
-
-        map_btns = ttk.Frame(map_frame)
-        map_btns.pack(fill="x", padx=4, pady=2)
-        ttk.Button(map_btns, text="添加映射", command=self._wt_add_map).pack(side="left", padx=2)
-        ttk.Button(map_btns, text="删除选中", command=self._wt_del_map).pack(side="left", padx=2)
-
-        mid.add(map_frame, weight=0)
-
-        # 右：数据表（可导入 Excel）
-        data_frame = ttk.LabelFrame(mid, text=" 数据表（从 Excel 导入或手动填写） ")
-        self._wt_data_tree = ttk.Treeview(data_frame, show="headings", height=10)
-        data_vsb = ttk.Scrollbar(data_frame, orient="vertical",
-                                  command=self._wt_data_tree.yview)
-        data_hsb = ttk.Scrollbar(data_frame, orient="horizontal",
-                                  command=self._wt_data_tree.xview)
-        self._wt_data_tree.configure(yscrollcommand=data_vsb.set,
-                                      xscrollcommand=data_hsb.set)
-        self._wt_data_tree.pack(side="left", fill="both", expand=True, padx=(4,0), pady=4)
-        data_vsb.pack(side="right", fill="y")
-        data_hsb.pack(side="bottom", fill="x")
-
-        data_btns = ttk.Frame(data_frame)
-        data_btns.pack(fill="x", padx=4, pady=2)
-        ttk.Button(data_btns, text="导入Excel", command=self._wt_import_data).pack(side="left", padx=2)
-        ttk.Button(data_btns, text="清空数据", command=self._wt_clear_data).pack(side="left", padx=2)
-
-        mid.add(data_frame, weight=1)
-
-        # --- 下方：操作与日志 ---
-        bot = ttk.LabelFrame(parent, text=" 操作 ")
-        bot.pack(fill="both", padx=6, pady=4)
-
-        act = ttk.Frame(bot); act.pack(fill="x", padx=4, pady=3)
-        self._wt_gen_btn = ttk.Button(act, text="批量生成", command=self._wt_generate)
-        self._wt_gen_btn.pack(side="left", padx=4)
-        self._wt_stop_btn = ttk.Button(act, text="停止", command=self._wt_stop)
-        self._wt_stop_btn.pack(side="left")
-        self._wt_stop_btn.state(["disabled"])
-        ttk.Label(act, text="  从 Word 模板逐行替换占位符并导出（格式保持不变）",
-                  foreground="#666").pack(side="left", padx=8)
-
-        self._wt_log = tk.Text(bot, height=6, state="disabled",
-                                font=("Consolas", 9), background="#fafafa")
-        self._wt_log.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # 恢复已有映射
-        for m in self.data.get("wt_mappings", []):
-            self._wt_map_tree.insert("", "end", values=m)
-
-    def _wt_download_examples(self):
-        """生成并保存示例 Word 模板 + Excel 数据表"""
-        outdir = filedialog.askdirectory(title="选择保存示例的目录")
-        if not outdir:
-            return
-        outdir = Path(outdir)
-        # 1. 生成示例 Word 模板
-        try:
-            import win32com.client
-            word = win32com.Dispatch("Word.Application")
-            word.Visible = False
-            doc = word.Documents.Add()
-            doc.Content.Text = (
-                "Capital Call Notice\n\n"
-                "Dear {{LP_Name}},\n\n"
-                "This is to notify you of a capital call for your investment.\n\n"
-                "Call Amount: USD {{Call_Amount}}\n"
-                "Unfunded Commitment: USD {{Unfunded}}\n"
-                "Due Date: {{Due_Date}}\n\n"
-                "Please remit the above amount to:\n"
-                "Bank: {{Bank_Name}}\n"
-                "Account: {{Account_No}}\n\n"
-                "Sincerely,\nFund Manager")
-            tpl_path = outdir / "示例通知模板.docx"
-            doc.SaveAs2(str(tpl_path.resolve()), FileFormat=16)
-            doc.Close(SaveChanges=0)
-            word.Quit()
-        except Exception as e:
-            messagebox.showwarning("示例模板", f"Word 模板生成失败（需安装 Word）：{e}")
-            tpl_path = None
-
-        # 2. 生成示例 Excel 数据表
-        import openpyxl
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.append(["LP_Name", "Call_Amount", "Unfunded", "Due_Date",
-                    "Bank_Name", "Account_No"])
-        ws.append(["Max Hill Worldwide Limited", "200,000", "800,000",
-                    "2026-11-15", "HSBC Hong Kong", "123-456789-001"])
-        ws.append(["S.F. LCVC (BVI) Limited", "2,000,000", "8,000,000",
-                    "2026-11-15", "HSBC Hong Kong", "123-456789-002"])
-        ws.append(["HHGL Fund, L.P.", "400,000", "1,600,000",
-                    "2026-11-15", "Citibank Singapore", "876-54321-003"])
-        for col, w in zip("ABCDEF", [30, 14, 14, 12, 20, 18]):
-            ws.column_dimensions[col].width = w
-        data_path = outdir / "示例数据表.xlsx"
-        wb.save(data_path)
-
-        msg = f"示例文件已保存到：{outdir}\n"
-        if tpl_path and tpl_path.exists():
-            msg += f"  • {tpl_path.name}（Word 模板，含 6 个占位符）\n"
-        msg += f"  • {data_path.name}（Excel 数据表，3 行示例数据）\n\n"
-        msg += "使用方法：\n1. 打开 Word 模板看占位符写法\n2. 导入 Excel 数据表\n3. 检测占位符并映射\n4. 批量生成"
-        messagebox.showinfo("示例已生成", msg)
-
-    def _wt_pick(self):
-        path = filedialog.askopenfilename(
-            title="选择 Word 模板",
-            filetypes=[("Word 文档", "*.docx;*.doc")])
-        if path:
-            self._wt_path.set(path)
-            self.data["word_template"] = path
-            self.save_data()
-
-    def _wt_detect(self):
-        """从 Word 模板检测占位符（{{xxx}} 和 ?xxx? 两种格式）"""
-        path = self._wt_path.get().strip()
-        if not path or not Path(path).exists():
-            messagebox.showwarning("Word 模板", "请先选择有效的 .docx 文件")
-            return
-        try:
-            import win32com.client
-            word = win32com.client.Dispatch("Word.Application")
-            word.Visible = False
-            doc = word.Documents.Open(path, ReadOnly=True)
-            text = doc.Content.Text
-            doc.Close(SaveChanges=0)
-            word.Quit()
-            # 检测两种占位符格式
-            placeholders = set(re.findall(r"\{\{[^}]+\}\}", text))
-            placeholders |= set(re.findall(r"\?[^?\s]{2,30}\?", text))
-            if not placeholders:
-                messagebox.showinfo("检测结果", "未检测到占位符。\n"
-                                    "支持格式：{{字段名}} 或 ?字段名?")
-                return
-            # 更新映射表
-            existing = {self._wt_map_tree.item(i)["values"][0]
-                        for i in self._wt_map_tree.get_children()}
-            for ph in sorted(placeholders):
-                if ph not in existing:
-                    self._wt_map_tree.insert("", "end", values=(ph, ""))
-            messagebox.showinfo("检测结果",
-                                f"检测到 {len(placeholders)} 个占位符，已添加到映射表。\n"
-                                "请为每个占位符指定对应的数据列名。")
-        except Exception as e:
-            messagebox.showerror("检测失败", str(e))
-
-    def _wt_add_map(self):
-        ph = tk.simpledialog.askstring("添加映射", "Word 占位符（如 {{LP_Name}} 或 ?CC1?）:")
-        if not ph:
-            return
-        col = tk.simpledialog.askstring("添加映射", "对应数据列名（如 name / call_amount）:")
-        if col:
-            self._wt_map_tree.insert("", "end", values=(ph, col))
-            self._wt_save_mappings()
-
-    def _wt_del_map(self):
-        for i in self._wt_map_tree.selection():
-            self._wt_map_tree.delete(i)
-        self._wt_save_mappings()
-
-    def _wt_save_mappings(self):
-        mappings = [self._wt_map_tree.item(i)["values"]
-                    for i in self._wt_map_tree.get_children()]
-        self.data["wt_mappings"] = [list(m) for m in mappings]
-        self.save_data()
-
-    def _wt_browse_out(self):
-        d = filedialog.askdirectory(title="输出目录")
-        if d:
-            self._wt_outdir.set(d)
-            self.data["wt_outdir"] = d
-            self.save_data()
-
-    def _wt_import_data(self):
-        """从 Excel 导入数据表（第一行为列名）"""
-        path = filedialog.askopenfilename(
-            title="导入数据表",
-            filetypes=[("Excel/CSV", "*.xlsx;*.csv")])
-        if not path:
-            return
-        try:
-            rows = read_spreadsheet(path)
-            if not rows or len(rows) < 2:
-                messagebox.showwarning("导入", "至少需要表头行 + 1 行数据")
-                return
-            headers = [str(h).strip() for h in rows[0] if h]
-            self._wt_data_tree.delete(*self._wt_data_tree.get_children())
-            self._wt_data_tree["columns"] = headers
-            for h in headers:
-                self._wt_data_tree.heading(h, text=h)
-                self._wt_data_tree.column(h, width=100)
-            for row in rows[1:]:
-                vals = [str(v) if v else "" for v in row[:len(headers)]]
-                self._wt_data_tree.insert("", "end", values=vals)
-            messagebox.showinfo("导入完成",
-                                f"已导入 {len(rows)-1} 行 × {len(headers)} 列。\n"
-                                "请在映射表中为每个 Word 占位符指定列名。")
-        except Exception as e:
-            messagebox.showerror("导入失败", str(e))
-
-    def _wt_clear_data(self):
-        self._wt_data_tree.delete(*self._wt_data_tree.get_children())
-
-    def _wt_generate(self):
-        """批量生成：逐行替换占位符并导出"""
-        tpl = self._wt_path.get().strip()
-        if not tpl or not Path(tpl).exists():
-            messagebox.showwarning("Word 模板", "请先选择有效的模板文件")
-            return
-        data_rows = []
-        for item in self._wt_data_tree.get_children():
-            data_rows.append(dict(zip(
-                self._wt_data_tree["columns"],
-                self._wt_data_tree.item(item)["values"])))
-        if not data_rows:
-            messagebox.showwarning("数据表", "数据表为空，请先导入")
-            return
-        mappings = {str(ph): str(col)
-                    for ph, col in (self._wt_map_tree.item(i)["values"]
-                                    for i in self._wt_map_tree.get_children())
-                    if col}
-        if not mappings:
-            messagebox.showwarning("字段映射", "映射表为空。请先「检测占位符」并指定列名。")
-            return
-        outdir = Path(self._wt_outdir.get())
-        outdir.mkdir(parents=True, exist_ok=True)
-        fmt = self._wt_fmt.get()
-        self._wt_gen_btn.state(["disabled"])
-        self._wt_stop_btn.state(["!disabled"])
-        self._wt_cancel = threading.Event()
-        self._wt_log_msg(f"开始：{len(data_rows)} 行，格式={'PDF' if fmt=='pdf' else 'Word'}")
-
-        def worker():
-            import pythoncom
-            import win32com.client
-            pythoncom.CoInitialize()
-            word = None
-            try:
-                word = win32com.client.Dispatch("Word.Application")
-                word.Visible = False
-                word.DisplayAlerts = 0
-                ok, fail = 0, 0
-                for i, row in enumerate(data_rows):
-                    if self._wt_cancel.is_set():
-                        self._wt_log_msg("已停止")
-                        break
-                    try:
-                        doc = word.Documents.Open(tpl, ReadOnly=True)
-                        for ph, col in mappings.items():
-                            val = str(row.get(col, ""))
-                            doc.Content.Find.Execute(
-                                ph, False, False, False, False, False,
-                                True, 1, False, val, 2)
-                        name_val = str(row.get(list(mappings.values())[0]
-                                                if mappings else "name", f"row{i+1}"))
-                        safe = sanitize_filename(name_val, 60)
-                        if fmt == "pdf":
-                            out = outdir / (safe + ".pdf")
-                            doc.SaveAs2(str(out.resolve()), FileFormat=17)
-                        else:
-                            out = outdir / (safe + ".docx")
-                            doc.SaveAs2(str(out.resolve()), FileFormat=16)
-                        doc.Close(SaveChanges=0)
-                        ok += 1
-                        self._wt_log_msg(f"[OK] {out.name}")
-                    except Exception as e:
-                        fail += 1
-                        self._wt_log_msg(f"[失败] 行{i+1}: {e}")
-                        try:
-                            doc.Close(SaveChanges=0)
-                        except Exception:
-                            pass
-                self._wt_log_msg(f"完成：成功 {ok}，失败 {fail}")
-            except Exception as e:
-                self._wt_log_msg(f"全局错误：{e}")
-            finally:
-                if word:
-                    try:
-                        word.Quit()
-                    except Exception:
-                        pass
-                pythoncom.CoUninitialize()
-                self.root.after(0, lambda: (
-                    self._wt_gen_btn.state(["!disabled"]),
-                    self._wt_stop_btn.state(["disabled"])))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _wt_stop(self):
-        if hasattr(self, "_wt_cancel"):
-            self._wt_cancel.set()
-
-    def _wt_log_msg(self, msg):
-        def append():
-            self._wt_log.configure(state="normal")
-            self._wt_log.insert("end", msg + chr(10))
-            self._wt_log.see("end")
-            self._wt_log.configure(state="disabled")
-        self.root.after(0, append)
-
-    def _build_draft_page(self, parent):
-        """草稿与发送：检查附件 + 生成草稿 + 发送指引"""
-        guide = ttk.Frame(parent)
-        guide.pack(fill="x", padx=6, pady=4)
-        ttk.Label(guide, text="此页面与「生成文件」页面下半部分相同：批量生成加密文件 + Outlook 草稿。",
-                  foreground="#666").pack(anchor="w")
-        ttk.Label(guide, text="草稿只写入 Outlook 草稿箱（.Save），绝不自动发送。发送前请逐封人工复核。",
-                  foreground="#b00").pack(anchor="w")
-        ttk.Button(guide, text="前往生成页面 →", width=18,
-                   command=lambda: self._show_page("run")).pack(anchor="w", pady=4)
-        ttk.Label(guide, text="生成完成后，到 Outlook 草稿箱逐封检查：收件人/抄送/标题/正文/附件/口令。",
-                  foreground="#666").pack(anchor="w", pady=(8,0))
-
-    def _show_page(self, name):
-        """切换到指定功能页面（首次进入时构建）"""
-        for pg in self._pages.values():
-            pg.pack_forget()
-        if name not in self._pages:
-            frame = ttk.Frame(self._container)
-            self._pages[name] = frame
-
-            nav = ttk.Frame(frame)
-            nav.pack(fill="x", padx=4, pady=2)
-            ttk.Button(nav, text="< 首页", width=8,
-                       command=lambda: self._show_page("home")).pack(side="left")
-            titles = {"lp": "收件人管理", "tpl": "邮件模板",
-                      "word": "Word 模板批量生成",
-                      "run": "生成文件 / Outlook 草稿"}
-            ttk.Label(nav, text=titles.get(name, name),
-                      font=("", 11, "bold")).pack(side="left", padx=12)
-
-            content = ttk.Frame(frame)
-            content.pack(fill="both", expand=True)
-            if name == "lp":
-                self.tab_lp = content
-                self.build_tab_lp()
-            elif name == "tpl":
-                self.tab_tpl = content
-                self.build_tab_tpl()
-            elif name == "word":
-                self._build_word_page(content)
-            elif name == "run":
-                self.tab_run = content
-                self.build_tab_run()
-
-        self._pages[name].pack(fill="both", expand=True)
+    def _set_crumb(self, text):
+        self.crumb.configure(text=text)
 
     def _guide(self, parent, text):
-        """页顶部的流程指引条。"""
+        """页顶部的说明条。"""
         ttk.Label(parent, text=text, background="#eef3fa", foreground="#2b4a75",
-                  padding=(10, 7), wraplength=1150, justify="left").pack(
-            fill="x", padx=6, pady=(6, 2))
+                  padding=(10, 7), wraplength=1080, justify="left").pack(
+            fill="x", pady=(0, 4))
 
-    # ----- Tab1: 收件人管理 -----
+    # ================= 事件库（主页面） =================
 
-    def build_tab_lp(self):
-        f = self.tab_lp
-        self._guide(f, "总流程：①本页导入/维护收件人清单 → ②页编辑邮件模板 → ③页添加原件 PDF 生成"
-                      "加密文件与 Outlook 草稿 → 到 Outlook 草稿箱逐封复核后手动发送。\n"
-                      "本页操作：双击行编辑；导入时同名覆盖更新、异名新增；口令列留空自动生成随机口令。")
+    def _build_home(self, parent=None):
+        """事件库：唯一的主页面。
+
+        一次分发 = 一个事件，里面装「发送模式 + 收件人 + 流水线 + 邮件模板」。
+        「场景模板」收进同一页的第二个标签页，不再单独占一个导航入口
+        （之前是「场景与事件 / 场景模板 / 收件人库」三个入口，用户看不懂区别）。
+        """
+        f = parent if parent is not None else self._screens["home"]
+
+        head = ttk.Frame(f)
+        head.pack(fill="x", pady=(0, 4))
+        ttk.Label(head, text="事件库", style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text="一次分发 = 一个事件：发送模式 + 收件人 + 流水线 + 邮件模板",
+                  style="Sub.TLabel").pack(side="left", padx=12)
+
+        self.home_nb = ttk.Notebook(f)
+        self.home_nb.pack(fill="both", expand=True)
+
+        self.home_tab_ev = ttk.Frame(self.home_nb)
+        self.home_nb.add(self.home_tab_ev, text=" 事件 ")
+        self.home_tab_sc = ttk.Frame(self.home_nb)
+        self.home_nb.add(self.home_tab_sc, text=" 场景模板 ")
+
+        self._build_events_tab(self.home_tab_ev)
+        self._build_scenes(self.home_tab_sc)
+
+    def _build_events_tab(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(0, 4))
+        for text, cmd in (("新建事件", self._new_event),
+                          ("复制", self._dup_event),
+                          ("删除", self._del_event),
+                          ("打开工作台", self._open_selected_event)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        for text, cmd in (("导入收件人…", self._lib_import_recipients),
+                          ("导出收件人…", self._lib_export_recipients),
+                          ("导出全部收件人…", self._lib_export_all_recipients),
+                          ("导出事件…", self._lib_export_event),
+                          ("导入事件备份…", self._lib_import_event),
+                          ("备份全部…", self._lib_export_backup)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="刷新", command=self._refresh_home).pack(side="left", padx=8)
+        self.home_status = ttk.Label(bar, text="", style="Sub.TLabel")
+        self.home_status.pack(side="right")
+
+        paned = tk.PanedWindow(parent, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        # 左：事件表
+        left = ttk.Frame(paned)
+        cols = ["name", "mode", "recips", "steps", "atts", "status", "last"]
+        heads = ["事件名称", "发送模式", "收件人", "流水线", "附件", "状态", "最近执行"]
+        self.ev_tree = ttk.Treeview(left, columns=cols, show="headings",
+                                    selectmode="browse")
+        for c, h in zip(cols, heads):
+            self.ev_tree.heading(c, text=h)
+            self.ev_tree.column(c, width=190 if c == "name" else 86)
+        vsb = ttk.Scrollbar(left, orient="vertical", command=self.ev_tree.yview)
+        self.ev_tree.configure(yscrollcommand=vsb.set)
+        self.ev_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.ev_tree.bind("<Double-1>", lambda _e: self._open_selected_event())
+        self.ev_tree.bind("<<TreeviewSelect>>", lambda _e: self._draw_selected_flow())
+
+        # 右：流程图
+        right = ttk.Frame(paned)
+        self.flow_frame = ttk.LabelFrame(right, text=" 流程图 ",
+                                         style="Card.TLabelframe")
+        self.flow_frame.pack(fill="both", expand=True)
+        self.flow_title = ttk.Label(self.flow_frame, text="", style="Sub.TLabel",
+                                    wraplength=460, justify="left")
+        self.flow_title.pack(anchor="w", padx=8, pady=(4, 0))
+        self.flow_canvas = tk.Canvas(self.flow_frame, height=300,
+                                     highlightthickness=0, background="#fbfcfe")
+        self.flow_canvas.pack(fill="both", expand=True, padx=6, pady=6)
+        self.flow_canvas.bind("<Configure>", lambda _e: self._draw_selected_flow())
+
+        paned.add(left)
+        paned.add(right)
+        # weight 让左右两栏按 3:2 分配（部分 Tk 版本 add 不接受 weight，失败不影响使用）
+        for w, child in ((3, left), (2, right)):
+            try:
+                paned.paneconfigure(child, weight=w)
+            except Exception:
+                pass
+
+    def _refresh_home(self):
+        self._refresh_events_tab()
+        self._refresh_scenes()
+
+    def _refresh_events_tab(self):
+        events = self.store.list_events()
+        self.ev_tree.delete(*self.ev_tree.get_children())
+        for e in events:
+            last = ""
+            st = e.get("status", "")
+            runs = self.store.list_runs(e["id"])
+            if runs:
+                r = runs[0]
+                items = r.get("items") or []
+                ok = sum(1 for i in items if i.get("draft") == "ok")
+                last = "%s · %d/%d" % ((r.get("started_at") or "")[5:16], ok, len(items))
+                if not st:
+                    st = "已生成草稿"
+            mode = lp_v3.send_mode_of(e)
+            self.ev_tree.insert("", "end", iid=e["id"], values=[
+                e.get("name", ""),
+                lp_v3.SEND_MODE_LABELS.get(mode, mode),
+                len(e.get("recipients", [])), len(e.get("pipeline", [])),
+                len(e.get("attachments", [])), st or "草稿", last or "—"])
+        self.home_status.configure(text="共 %d 个事件" % len(events))
+        self._draw_selected_flow()
+
+    # ---------- 流程图 ----------
+
+    def _draw_selected_flow(self):
+        eid = self._selected_event_id()
+        ev = None
+        if eid:
+            ev, _err = self.store.load_event(eid)
+        if ev:
+            self.flow_title.configure(
+                text="事件「%s」· %s · 收件人 %d 位 · 流水线 %d 个条目"
+                     % (ev.get("name", ""),
+                        lp_v3.SEND_MODE_LABELS.get(lp_v3.send_mode_of(ev), ""),
+                        len(ev.get("recipients", [])), len(ev.get("pipeline", []))))
+        else:
+            self.flow_title.configure(
+                text="在上表里选中一个事件，这里会画出它的流程图"
+                     "（条目可在「文档流水线」里自由增删排序）")
+        self._draw_flow(self.flow_canvas, ev)
+
+    def _draw_flow(self, canvas, event):
+        """把事件画成流程图：收件人 → 流水线条目 → 附件包 → Outlook 草稿。"""
+        canvas.delete("all")
+        if event is None:
+            canvas.create_text(
+                16, 16, anchor="nw", fill="#888888", justify="left",
+                text="还没有选中事件。\n\n"
+                     "流程图按「收件人 → 流水线条目 → 附件包 → Outlook 草稿」画出来，\n"
+                     "条目可以在「文档流水线」里自由增删和排序。")
+            return
+        nodes = lp_v3.flow_nodes(event)
+        width = max(canvas.winfo_width(), 360)
+        box_h, gap = 56, 26
+        box_w = 152
+        avail = width - 24
+        # 优先把整条链压成一行（盒子太窄就换行，避免挤成一团）
+        if len(nodes) * (box_w + gap) > avail:
+            fit = int(avail / len(nodes)) - gap
+            if fit >= 96:
+                box_w = fit
+            else:
+                box_w = 152
+        per_row = max(1, (avail) // (box_w + gap))
+        if len(nodes) * (box_w + gap) <= avail:
+            per_row = len(nodes)
+        rows = (len(nodes) + per_row - 1) // per_row
+        need_h = rows * (box_h + 34) + 12
+        if canvas.winfo_height() < need_h:
+            canvas.configure(height=need_h)
+        styles = {
+            "source": ("#eef3fa", "#4a6fa5", "#1f3d63"),
+            "step":   ("#ffffff", "#4a6fa5", "#1f3d63"),
+            "output": ("#eaf7ea", "#3f8f4f", "#1e5227"),
+            "draft":  ("#fdf3e3", "#c08a2e", "#6b4712"),
+        }
+        pos = {}
+        for i, n in enumerate(nodes):
+            r, c = divmod(i, per_row)
+            x = 14 + c * (box_w + gap)
+            y = 12 + r * (box_h + 34)
+            pos[i] = (x, y)
+            fill, outline, fg = styles.get(n.get("kind"), styles["step"])
+            if not n.get("enabled", True):
+                fill, outline, fg = "#f3f3f3", "#bcbcbc", "#8a8a8a"
+            canvas.create_rectangle(x, y, x + box_w, y + box_h,
+                                    fill=fill, outline=outline, width=2)
+            canvas.create_text(x + box_w / 2, y + 20, text=n.get("title", ""),
+                               font=("", 9, "bold"), fill=fg, width=box_w - 14)
+            canvas.create_text(x + box_w / 2, y + 39, text=n.get("sub", ""),
+                               font=("", 8), fill="#666666", width=box_w - 14)
+        for i in range(len(nodes) - 1):
+            x0, y0 = pos[i]
+            x1, y1 = pos[i + 1]
+            if (i // per_row) == ((i + 1) // per_row):
+                canvas.create_line(x0 + box_w, y0 + box_h / 2, x1, y1 + box_h / 2,
+                                   fill="#8ea6c4", width=2, arrow="last")
+            else:
+                mid = y0 + box_h + 17
+                canvas.create_line(x0 + box_w / 2, y0 + box_h,
+                                   x0 + box_w / 2, mid, x1, mid, x1, y1,
+                                   fill="#8ea6c4", width=2, arrow="last")
+        canvas.configure(scrollregion=(0, 0, width, need_h))
+
+
+    def _new_scenario(self, from_event=None):
+        name = simpledialog.askstring("新建场景", "场景名称：", initialvalue="新建场景")
+        if not name:
+            return
+        sc = new_scenario(name)
+        if from_event:
+            sc["recipients"] = [normalize_recipient(r) for r in from_event.get("recipients", [])]
+            sc["pipeline"] = [normalize_item(s) for s in from_event.get("pipeline", [])]
+            sc["attachments"] = [normalize_attachment(a) for a in from_event.get("attachments", [])]
+            sc["mail"] = dict(from_event.get("mail") or {})
+            sc["options"] = dict(from_event.get("options") or {})
+        ok, err = self.store.save_scenario(sc)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        self._refresh_home()
+
+    def _new_event(self, scenario=None):
+        ev = new_event("未命名事件", scenario)
+        ok, err = self.store.save_event(ev)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        self._refresh_home()
+        self.open_event(ev["id"])
+
+    def _selected_event_id(self):
+        sel = self.ev_tree.selection()
+        return sel[0] if sel else None
+
+    def _dup_event(self):
+        eid = self._selected_event_id()
+        if not eid:
+            messagebox.showinfo("提示", "请先选中一个事件")
+            return
+        ev, err = self.store.load_event(eid)
+        if not ev:
+            messagebox.showerror("读取失败", err or "事件不存在")
+            return
+        ok, err = self.store.save_event(clone_event(ev))
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        self._refresh_home()
+
+    def _del_event(self):
+        eid = self._selected_event_id()
+        if not eid:
+            messagebox.showinfo("提示", "请先选中一个事件")
+            return
+        ev, _err = self.store.load_event(eid)
+        if not messagebox.askyesno("删除事件",
+                                   "确认删除事件「%s」？\n\n（执行记录会保留）"
+                                   % (ev.get("name", "") if ev else eid)):
+            return
+        self.store.delete_event(eid)
+        self._refresh_home()
+
+    def _open_selected_event(self):
+        eid = self._selected_event_id()
+        if not eid:
+            messagebox.showinfo("提示", "请先选中一个事件")
+            return
+        self.open_event(eid)
+
+    # ================= 场景模板（事件库里的第二个标签页） =================
+
+    def _build_scenes(self, parent=None):
+        f = parent if parent is not None else getattr(self, "home_tab_sc", None)
+        if f is None:
+            return
+        head = ttk.Frame(f)
+        head.pack(fill="x")
+        ttk.Label(head, text="场景模板", style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text="可复用的「怎么做」模板。场景修改不会影响已创建的事件"
+                             "——事件在创建时复制了一份配置。",
+                  style="Sub.TLabel").pack(side="left", padx=12)
         bar = ttk.Frame(f)
-        bar.pack(fill="x", pady=4, padx=6)
+        bar.pack(fill="x", pady=4)
+        ttk.Button(bar, text="新建场景", command=self._new_scenario).pack(side="left")
+        ttk.Button(bar, text="重命名", command=self._rename_scenario).pack(side="left", padx=4)
+        ttk.Button(bar, text="删除场景", command=self._del_scenario).pack(side="left")
+        ttk.Button(bar, text="以此新建事件", command=self._scene_new_event).pack(side="left", padx=8)
+        ttk.Button(bar, text="同步到事件…", command=self._scene_sync_event,
+                   ).pack(side="left")
+        ToolTip(bar.winfo_children()[-1],
+                "把当前场景的流水线/附件/邮件模板/选项覆盖到选中的事件。\n"
+                "收件人按名称合并：已存在的收件人保留自己的口令与自定义字段，"
+                "只补齐空缺。\n事件不会自动跟随场景变化，需要你显式点这个按钮。")
+        cols = ["name", "desc", "recips", "steps", "atts", "derived", "go"]
+        heads = ["名称", "说明", "收件人模板", "流水线", "附件", "派生事件", ""]
+        self.sc_tree = ttk.Treeview(f, columns=cols, show="headings", selectmode="browse")
+        for c, h in zip(cols, heads):
+            self.sc_tree.heading(c, text=h)
+            self.sc_tree.column(c, width=200 if c in ("name", "desc") else 90)
+        vsb = ttk.Scrollbar(f, orient="vertical", command=self.sc_tree.yview)
+        self.sc_tree.configure(yscrollcommand=vsb.set)
+        self.sc_tree.pack(side="top", fill="both", expand=True, padx=4)
+        vsb.pack(side="right", fill="y")
+
+    def _refresh_scenes(self):
+        self.sc_tree.delete(*self.sc_tree.get_children())
+        events = self.store.list_events()
+        derived = {}
+        for e in events:
+            derived[e.get("scenario_id", "")] = derived.get(e.get("scenario_id", ""), 0) + 1
+        for sc in self.store.list_scenarios():
+            self.sc_tree.insert("", "end", iid=sc["id"], values=[
+                sc.get("name", ""), sc.get("description", ""),
+                len(sc.get("recipients", [])), len(sc.get("pipeline", [])),
+                len(sc.get("attachments", [])), derived.get(sc["id"], 0), "›"])
+
+    def _selected_scenario_id(self):
+        sel = self.sc_tree.selection()
+        return sel[0] if sel else None
+
+    def _rename_scenario(self):
+        sid = self._selected_scenario_id()
+        if not sid:
+            messagebox.showinfo("提示", "请先选中一个场景")
+            return
+        sc, err = self.store.load_scenario(sid)
+        if not sc:
+            messagebox.showerror("读取失败", err or "场景不存在")
+            return
+        name = simpledialog.askstring("重命名场景", "场景名称：", initialvalue=sc.get("name", ""))
+        if not name:
+            return
+        sc["name"] = name
+        self.store.save_scenario(sc)
+        self._refresh_scenes()
+
+    def _del_scenario(self):
+        sid = self._selected_scenario_id()
+        if not sid:
+            messagebox.showinfo("提示", "请先选中一个场景")
+            return
+        sc, _err = self.store.load_scenario(sid)
+        if not messagebox.askyesno("删除场景",
+                                   "确认删除场景「%s」？\n\n已创建的事件不受影响。"
+                                   % (sc.get("name", "") if sc else sid)):
+            return
+        self.store.delete_scenario(sid)
+        self._refresh_scenes()
+
+    def _scene_new_event(self):
+        sid = self._selected_scenario_id()
+        if not sid:
+            messagebox.showinfo("提示", "请先选中一个场景")
+            return
+        sc, err = self.store.load_scenario(sid)
+        if not sc:
+            messagebox.showerror("读取失败", err or "场景不存在")
+            return
+        self._new_event(sc)
+
+    def _scene_sync_event(self):
+        """手动把场景配置同步到指定事件（复制式，用户显式触发）。"""
+        sid = self._selected_scenario_id()
+        if not sid:
+            messagebox.showinfo("提示", "请先选中一个场景")
+            return
+        sc, err = self.store.load_scenario(sid)
+        if not sc:
+            messagebox.showerror("读取失败", err or "场景不存在")
+            return
+        events = self.store.list_events()
+        if not events:
+            messagebox.showinfo("提示", "还没有发送事件")
+            return
+        names = [e.get("name", "") for e in events]
+        pick = simpledialog.askstring(
+            "同步到事件",
+            "要把场景「%s」同步到哪个事件？\n请输入事件名称：\n\n%s"
+            % (sc.get("name", ""), "\n".join(names)), initialvalue=names[0])
+        if not pick:
+            return
+        target = next((e for e in events if e.get("name") == pick.strip()), None)
+        if target is None:
+            messagebox.showwarning("同步", "没有找到名为「%s」的事件" % pick)
+            return
+        if not messagebox.askyesno(
+                "确认同步",
+                "将用场景「%s」覆盖事件「%s」的：\n"
+                "· 流水线（%d 步）\n· 静态附件（%d 个）\n· 邮件模板与选项\n\n"
+                "收件人按名称合并，已有口令与自定义字段保留。\n\n确认同步？"
+                % (sc.get("name", ""), target.get("name", ""),
+                   len(sc.get("pipeline", [])), len(sc.get("attachments", [])))):
+            return
+        new_ev, notes = sync_scenario_to_event(sc, target)
+        ok, err = self.store.save_event(new_ev)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        messagebox.showinfo("同步完成", "\n".join("· " + n for n in notes))
+        self._refresh_scenes()
+
+    # ================= 设置 =================
+
+    def _build_settings(self, parent=None):
+        f = parent if parent is not None else self._screens["settings"]
+        ttk.Label(f, text="设置", style="Head.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Label(f, text="全局默认：新建事件时带出，可单独覆盖。",
+                  style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="默认输出目录：").pack(side="left")
+        self.set_outdir = tk.StringVar(value=self.settings.get("outdir", ""))
+        ttk.Entry(row, textvariable=self.set_outdir, width=52).pack(side="left", padx=4)
+        ttk.Button(row, text="浏览", command=self._set_pick_outdir).pack(side="left")
+        ttk.Button(row, text="保存", command=self._save_settings).pack(side="left", padx=8)
+
+        row2 = ttk.Frame(f)
+        row2.pack(fill="x", pady=2)
+        ttk.Label(row2, text="文件名模板：").pack(side="left")
+        self.set_fname = tk.StringVar(value=self.settings.get("filename_tpl", DEFAULT_FILENAME_TPL))
+        ttk.Entry(row2, textvariable=self.set_fname, width=40).pack(side="left", padx=4)
+        ttk.Label(row2, text="字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}",
+                  style="Sub.TLabel").pack(side="left", padx=6)
+        ttk.Button(row2, text="保存", command=self._save_settings).pack(side="left", padx=8)
+
+        row3 = ttk.Frame(f)
+        row3.pack(fill="x", pady=2)
+        self.set_gp_mode = tk.BooleanVar(value=bool(self.settings.get("gp_owner_mode")))
+        ttk.Checkbutton(row3, text="GP 统一权限口令（每个文件同一个 owner 口令）",
+                        variable=self.set_gp_mode).pack(side="left")
+        self.set_gp_pw = tk.StringVar(value=self.settings.get("gp_owner_pw", ""))
+        ttk.Entry(row3, textvariable=self.set_gp_pw, width=22, show="*").pack(side="left", padx=6)
+        ttk.Button(row3, text="保存", command=self._save_settings).pack(side="left", padx=8)
+
+        wm_row = ttk.Frame(f)
+        wm_row.pack(fill="x", pady=6)
+        ttk.Button(wm_row, text="水印设置…", command=self.open_wm_settings).pack(side="left")
+        self.wm_summary = ttk.Label(wm_row, text="", style="Sub.TLabel")
+        self.wm_summary.pack(side="left", padx=10)
+        ttk.Button(wm_row, text="自动更新设置", command=self._save_settings).pack(side="left", padx=10)
+        self.set_auto = tk.BooleanVar(value=bool(self.settings.get("auto_update", True)))
+        ttk.Checkbutton(wm_row, text="启动时检查更新（连接 GitHub）",
+                        variable=self.set_auto).pack(side="left")
+
+        info = ttk.LabelFrame(f, text=" 数据存储 ", style="Card.TLabelframe")
+        info.pack(fill="x", pady=8)
+        self.store_info = ttk.Label(info, text="", style="Sub.TLabel", justify="left")
+        self.store_info.pack(anchor="w", padx=8, pady=6)
+
+    def _refresh_settings(self):
+        self.set_outdir.set(self.settings.get("outdir", ""))
+        self.set_fname.set(self.settings.get("filename_tpl", DEFAULT_FILENAME_TPL))
+        self.set_gp_mode.set(bool(self.settings.get("gp_owner_mode")))
+        self.set_gp_pw.set(self.settings.get("gp_owner_pw", ""))
+        self.set_auto.set(bool(self.settings.get("auto_update", True)))
+        self._update_wm_summary()
+        self.store_info.configure(
+            text="位置：%s\n结构：settings.json · events/ · scenarios/ · runs/\n"
+                 "旧版数据：%s"
+                 % (self.store.data_dir,
+                    "已迁移，保留为 lp_data.json.bak" if self.store.legacy_file.with_name(
+                        "lp_data.json.bak").exists() else "无"))
+
+    def _set_pick_outdir(self):
+        d = filedialog.askdirectory(title="默认输出目录")
+        if d:
+            self.set_outdir.set(d)
+            self._save_settings()
+
+    def _save_settings(self):
+        self.settings["outdir"] = self.set_outdir.get().strip()
+        self.settings["filename_tpl"] = self.set_fname.get().strip() or DEFAULT_FILENAME_TPL
+        self.settings["gp_owner_mode"] = bool(self.set_gp_mode.get())
+        self.settings["gp_owner_pw"] = self.set_gp_pw.get().strip()
+        self.settings["auto_update"] = bool(self.set_auto.get())
+        ok, err = self.store.save_settings(self.settings)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        self._update_wm_summary()
+
+    # ================= 帮助 =================
+
+    def _build_help(self, parent=None):
+        f = parent if parent is not None else self._screens["help"]
+        ttk.Label(f, text="帮助", style="Head.TLabel").pack(anchor="w", pady=(0, 6))
+        box = ttk.LabelFrame(f, text=" Word 占位符写法 ", style="Card.TLabelframe")
+        box.pack(fill="x", pady=4)
+        ttk.Label(box, justify="left", text=(
+            "在 Word 模板需要替换的位置写占位符，两种格式都支持：\n"
+            "    {{LP_Name}}    或    ?LP_Name?\n\n"
+            "替换通过 Word 查找替换完成，字体、字号、颜色、表格、页眉页脚、分页全部保持原样。\n"
+            "在「文档流水线 → 字段映射」里，每个占位符单独选一个来源：\n"
+            "    · 收件人名称 / 水印名称 / 打开口令 / 日期 —— 内置\n"
+            "    · 收件人字段 —— 收件人表里的自定义列（可临时加列）\n"
+            "    · 事件常量 —— 事件选项里定义的固定值\n"
+            "    · 外部数据表 —— 从 Excel 按收件人匹配进来的列\n"
+            "表格里有一列「预览值」，直接显示以第一位收件人为例填进去会是什么。\n"
+            "注意：权限口令不是可用字段，架构上无法写进邮件或文档。")
+        ).pack(anchor="w", padx=10, pady=8)
+        flow = ttk.LabelFrame(f, text=" 怎么用 ", style="Card.TLabelframe")
+        flow.pack(fill="x", pady=4)
+        ttk.Label(flow, justify="left", text=(
+            "一次分发 = 一个「事件」，整个流程就三段：\n"
+            "    ① 收件人 —— 谁收、多少人、发几封（发送模式）\n"
+            "    ② 文档流水线 —— 一张表，每一行 = 一个要附上的东西\n"
+            "         · 生成文档：用 Word 模板给每人生成一份内容不同的文档\n"
+            "         · 附加文件：把磁盘上已有的文件放进附件包\n"
+            "         每一行还能勾选「转 PDF / 加水印 / 加密」，并单独设「产出粒度」\n"
+            "    ③ 邮件模板 —— 主题与正文，{{字段}} 按每位收件人替换\n\n"
+            "两个「模式」别搞混：\n"
+            "    发送模式（事件级）→ 决定几封邮件：每人一份 / 按组合并 / 全部合并\n"
+            "    产出粒度（条目级）→ 决定这一条产出几份文件：每人一份 / 每组合并一份 / 全员共用一份\n\n"
+            "操作顺序：\n"
+            "1. 事件库 → 新建事件（或从「场景模板」复制一份配置）\n"
+            "2. 收件人：先「下载导入模板」发给业务方填，填好导回来；\n"
+            "    导入会先做数据校验，逐行列出问题，确认后才写入\n"
+            "3. 文档流水线：点「＋ 生成文档」或「＋ 附加文件」加行；\n"
+            "    单击行在下方改参数，按住行上下拖动改顺序，Ctrl/Shift 多选批量删除\n"
+            "4. 附件：不想走流水线时，用它快捷挂载静态文件（全部 / 指定收件人 / 按组）\n"
+            "5. 邮件模板：写主题与正文\n"
+            "6. 总览：核对每位收件人最终收到什么、邮件长什么样\n"
+            "7. 预览与生成：预检 → 生成全部 Outlook 草稿（只建草稿，不发送）\n\n"
+            "在事件库里选中任一事件，右侧会画出它的流程图。\n"
+            "导出备份：事件库里可导出收件人 Excel、事件 JSON、整库备份。\n\n"
+            "生成完成后到 Outlook 草稿箱逐封复核，人工发送。")
+        ).pack(anchor="w", padx=10, pady=8)
+
+    # ================= 事件工作台 =================
+
+    def open_event(self, event_id):
+        ev, err = self.store.load_event(event_id)
+        if err:
+            messagebox.showerror("读取失败", err)
+            return
+        if not ev:
+            messagebox.showerror("读取失败", "事件不存在")
+            return
+        self._wb_event = ev
+        self.cur_event_id = event_id
+        self._wb_step = 0
+        if "event" in self._screens:
+            for c in self._screens["event"].winfo_children():
+                c.destroy()
+            self._build_workbench(self._screens["event"])
+        else:
+            self.show_screen("event")
+        # 关键：重建工作台后必须重新 show_screen 把它 pack 回来。
+        # show_screen 会把其它页 pack_forget，若不重新 pack，第二次点
+        # 「打开工作台」就是空操作（界面完全没反应）。
+        self.show_screen("event")
+        self._set_crumb("事件 · %s" % ev.get("name", ""))
+
+    def _build_workbench(self, f):
+        # 顶栏：事件名 + 元信息
+        top = ttk.Frame(f)
+        top.pack(fill="x", pady=(0, 4))
+        self.wb_title = ttk.Label(top, text="", style="Head.TLabel")
+        self.wb_title.pack(side="left")
+        self.wb_meta = ttk.Label(top, text="", style="Sub.TLabel")
+        self.wb_meta.pack(side="left", padx=12)
+        ttk.Button(top, text="事件信息…", command=self._wb_event_info).pack(side="right")
+        ttk.Button(top, text="返回列表", command=lambda: self.show_screen("home")
+                   ).pack(side="right", padx=6)
+
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True)
+
+        # 左侧步骤导航
+        nav = ttk.Frame(body, width=168)
+        nav.pack(side="left", fill="y")
+        nav.pack_propagate(False)
+        self._wb_step_buttons = []
+        for i, (title, _key) in enumerate(WB_STEPS):
+            b = ttk.Button(nav, style="Step.TButton", text="", width=20,
+                           command=lambda n=i: self._wb_show_step(n))
+            b.pack(fill="x", padx=4, pady=1)
+            self._wb_step_buttons.append(b)
+
+        # 右侧内容区
+        self._wb_content = ttk.Frame(body)
+        self._wb_content.pack(side="left", fill="both", expand=True)
+
+        # 底部操作条
+        foot = ttk.Frame(f)
+        foot.pack(fill="x", pady=(6, 0))
+        self.btn_preflight = ttk.Button(foot, text="预检", command=self._wb_preflight)
+        self.btn_preflight.pack(side="left")
+        self.btn_generate = ttk.Button(foot, text="生成全部 Outlook 草稿",
+                                       command=self._wb_generate)
+        self.btn_generate.pack(side="left", padx=6)
+        self.btn_rerun = ttk.Button(foot, text="只重跑失败项", command=self._wb_rerun_failed)
+        self.btn_rerun.pack(side="left")
+        self.wb_progress = ttk.Progressbar(foot, length=180, mode="determinate")
+        self.wb_progress.pack(side="right")
+        self.wb_status = ttk.Label(foot, text="", style="Sub.TLabel")
+        self.wb_status.pack(side="right", padx=10)
+        ttk.Label(foot, foreground="#b00",
+                  text="草稿只写入 Outlook 草稿箱，不会发送；发送前请人工复核"
+                  ).pack(side="left", padx=14)
+
+        self._wb_refresh_nav()
+        self._wb_show_step(0)
+
+    def _wb_refresh_nav(self):
+        ev = self._wb_event or {}
+        mode = lp_v3.send_mode_of(ev)
+        mode_label = lp_v3.SEND_MODE_LABELS.get(mode, mode)
+        subs = ["%d 位 · %s" % (len(ev.get("recipients", [])), mode_label),
+                "%d 条" % len(ev.get("pipeline", [])),
+                "%d 个" % len(ev.get("attachments", [])),
+                "已配置" if ev.get("mail", {}).get("subject") else "未配置",
+                "%d 封" % len(lp_v3.draft_units(ev)),
+                "未执行"]
+        for i, (title, _k) in enumerate(WB_STEPS):
+            self._wb_step_buttons[i].configure(
+                text="(%d) %s\n      %s" % (i + 1, title, subs[i]))
+        self.wb_title.configure(text=ev.get("name", "事件"))
+        self.wb_meta.configure(text="发送模式：%s ｜ 收件人 %d ｜ 条目 %d"
+                               % (mode_label,
+                                  len(ev.get("recipients", [])),
+                                  len(ev.get("pipeline", []))))
+
+    def _wb_show_step(self, idx):
+        self._wb_step = idx
+        for c in self._wb_content.winfo_children():
+            c.destroy()
+        builder = [self._wb_step_recipients, self._wb_step_pipeline,
+                   self._wb_step_attachments, self._wb_step_mail,
+                   self._wb_step_overview, self._wb_step_run][idx]
+        builder(self._wb_content)
+        self._set_crumb("事件 · %s · %s" % (self._wb_event.get("name", ""),
+                                            WB_STEPS[idx][0]))
+
+    def _wb_save(self):
+        if not self._wb_event:
+            return
+        ok, err = self.store.save_event(self._wb_event)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+        self._wb_refresh_nav()
+
+    def _wb_event_info(self):
+        ev = self._wb_event
+        win = tk.Toplevel(self.root)
+        win.title("事件信息")
+        win.grab_set()
+        rows = [("事件名称", "name"), ("业务类型", "biz_type"),
+                ("截止日期", "due_date"), ("备注", "notes")]
+        entries = {}
+        for i, (label, key) in enumerate(rows):
+            ttk.Label(win, text=label + "：").grid(row=i, column=0, sticky="e", padx=6, pady=4)
+            e = ttk.Entry(win, width=46)
+            e.insert(0, ev.get(key, ""))
+            e.grid(row=i, column=1, padx=6, pady=4)
+            entries[key] = e
+
+        # 发送模式（只读展示 + 可改）
+        i = len(rows)
+        ttk.Label(win, text="发送模式：").grid(row=i, column=0, sticky="e", padx=6, pady=4)
+        mode_var = tk.StringVar(value=lp_v3.SEND_MODE_LABELS.get(
+            lp_v3.send_mode_of(ev), lp_v3.send_mode_of(ev)))
+        ttk.Combobox(win, textvariable=mode_var, state="readonly", width=14,
+                     values=[l for _k, l, _d in lp_v3.SEND_MODES]
+                     ).grid(row=i, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(win, text=lp_v3.SEND_MODE_DESC.get(lp_v3.send_mode_of(ev), ""),
+                  foreground="#666").grid(row=i + 1, column=1, sticky="w", padx=6)
+
+        def ok():
+            for k, e in entries.items():
+                ev[k] = e.get().strip()
+            for k, l, _d in lp_v3.SEND_MODES:
+                if l == mode_var.get():
+                    opts = ev.setdefault("options", {})
+                    opts["send_mode"] = k
+                    opts["merge_groups"] = (k != "per_lp")
+                    break
+            self._wb_save()
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=i + 2, column=0, columnspan=2, pady=8)
+        ttk.Button(btns, text="保存", command=ok).pack(side="left", padx=8)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
+
+    # ---------- 步骤 1：收件人 ----------
+
+    def _wb_field_columns(self):
+        """收件人自定义字段列（按首次出现顺序）。"""
+        cols = []
+        for r in (self._wb_event or {}).get("recipients", []):
+            for k in (r.get("fields") or {}):
+                if k not in cols:
+                    cols.append(k)
+        return cols
+
+    def _wb_step_recipients(self, parent):
+        ev = self._wb_event
+        ttk.Label(parent, text="收件人", style="Head.TLabel").pack(anchor="w")
+
+        # --- 发送模式（事件级开关：决定几封邮件 / 几份文档）---
+        mode_row = ttk.Frame(parent)
+        mode_row.pack(fill="x", pady=(4, 2))
+        ttk.Label(mode_row, text="发送模式：").pack(side="left")
+        cur_mode = lp_v3.send_mode_of(ev)
+        self._wb_mode_var = tk.StringVar(value=lp_v3.SEND_MODE_LABELS.get(cur_mode, cur_mode))
+        cb = ttk.Combobox(mode_row, textvariable=self._wb_mode_var, state="readonly",
+                          width=14, values=[l for _k, l, _d in lp_v3.SEND_MODES])
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", self._wb_change_send_mode)
+        self._wb_mode_hint = ttk.Label(mode_row, text="", style="Sub.TLabel")
+        self._wb_mode_hint.pack(side="left", padx=8)
+        self._wb_update_mode_hint()
+
+        fcols = self._wb_field_columns()
+        ttk.Label(parent, text="自定义字段列供文档映射使用%s。"
+                  % ("（当前：" + "、".join(fcols) + "）" if fcols else "（还没有）"),
+                  style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(0, 4))
         for text, cmd, tip in [
-            ("导入 Excel/CSV", self.do_import,
-             "从 xlsx/csv 批量导入收件人清单。\n按表头名识别列（收件人名称/邮箱/抄送/标题/口令等），"
-             "多余的列忽略。\n同名 LP 覆盖更新，新的追加；口令留空自动生成。"),
-            ("导出空白模板", self.export_template,
-             "导出一份只有表头和示例行的空白 Excel，发给业务方填写后再导回来。"),
-            ("导出示例清单", self.export_sample,
-             "导出 8 条虚构演示数据，用于体验/测试全流程，可直接导入。"),
-            ("新增", lambda: self.edit_dialog(None), "手工添加一条收件人（权限口令默认遮蔽）。"),
-            ("编辑", lambda: self.edit_selected(), "编辑选中行（也可直接双击行）。"),
-            ("删除", self.delete_selected,
-             "删除选中的收件人（Ctrl/Shift 可多选，一次批量删除）。"),
-            ("检查附件", self.check_attachments,
-             "检查每个收件人的「附件路径」字段里的文件是否都存在（ready）。"
-             "路径支持多个，用 ; 分隔。"),
-            ("补齐缺失口令", self.fill_passwords,
-             "为清单里打开口令/权限口令为空的收件人批量生成随机口令（导入时一般已自动补齐）。"),
+            ("导入 Excel/CSV", self._wb_import_recipients,
+             "从 xlsx/csv 批量导入收件人清单。\n"
+             "流程：选文件 → 逐行数据校验 → 可视化导入结果 → 写入。\n"
+             "按表头名识别列；未识别的列会作为「自定义字段」收进来，供文档映射使用。\n"
+             "同名 LP 覆盖更新、异名新增；口令列留空自动生成随机口令。"),
+            ("下载导入模板", self._wb_export_template,
+             "导出一份带表头、示例行和「填写说明」页的 Excel，\n"
+             "发给业务方按说明填写后再导回来。"),
+            ("导出收件人 Excel", self._wb_export_recipients,
+             "把当前事件的收件人清单导出成 Excel（含自定义字段列与口令）。"),
+            ("新增", self._wb_edit_recipient, "手工添加一位收件人。"),
+            ("编辑", self._wb_edit_recipient, "编辑选中的收件人（也可直接双击行）。"),
+            ("删除", self._wb_delete_recipients, "删除选中的收件人（可多选）。"),
+            ("添加自定义字段列", self._wb_add_field_column,
+             "给收件人表加一个自定义字段列（Call_Amount / Unfunded 这类），\n"
+             "之后在编辑对话框里给每位收件人填值。"),
+            ("套用字段模板", self._wb_apply_field_template,
+             "用设置里预定义的字段模板（如「催缴场景字段」）一次性铺开多列。"),
+            ("检查附件", self._wb_check_attachments, "检查收件人专属附件文件是否存在。"),
+            ("补齐缺失口令", self._wb_fill_passwords,
+             "为打开口令/权限口令为空的收件人批量生成随机口令。"),
         ]:
             b = ttk.Button(bar, text=text, command=cmd)
-            b.pack(side="left", padx=3)
+            b.pack(side="left", padx=2)
             ToolTip(b, tip)
 
-        cols = ["name", "wm", "to", "cc", "bcc", "files", "open_pw", "owner_pw", "subject"]
-        heads = ["收件人名称", "水印名称", "收件人(To)", "抄送(CC)", "密送(BCC)",
-                 "附件路径(额外)", "打开口令", "权限口令(勿发)", "邮件标题(空=用模板)"]
-        self.tree = ttk.Treeview(f, columns=cols, show="headings",
-                                 selectmode="extended")  # 支持Ctrl/Shift多选批量删除
+        cols = ["name", "to", "cc", "bcc", "wm", "group"] + fcols + ["open_pw", "owner_pw"]
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组"] + fcols + \
+                ["打开口令", "权限口令(勿发)"]
+        # 注意：Treeview 必须建在 frame 里。之前建在 parent 里、却 pack 进 frame，
+        # 结果它被排到了 frame 下面，表格被挤成右下角一小块。
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, heads):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=150 if c in ("to", "subject") else 110)
-        # 横向+纵向滚动条（列多时可左右拖动看完整数据）
-        tree_scroll = ttk.Frame(f)
-        tree_scroll.pack(fill="both", expand=True, padx=6, pady=4)
-        vsb = ttk.Scrollbar(tree_scroll, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(tree_scroll, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
+            tree.heading(c, text=h)
+            tree.column(c, width=150 if c in ("to", "cc", "bcc") else 100)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         hsb.pack(side="bottom", fill="x")
-        self.tree.bind("<Double-1>", lambda e: self.edit_selected())
+        tree.bind("<Double-1>", lambda _e: self._wb_edit_recipient())
+        self._wb_rec_tree = tree
 
-        ttk.Label(f, foreground="#b00",
-                  text="安全提示：本程序同目录的 lp_data.json 含全部权限口令，属敏感文件，请限定在本机/受控共享目录使用。"
-                  ).pack(fill="x", padx=8, pady=4)
-        self.refresh_tree()
+        for r in ev.get("recipients", []):
+            vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", "")]
+            vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
+            vals += [r.get("open_pw", ""),
+                     "••••" if r.get("owner_pw") else ""]
+            tree.insert("", "end", values=vals)
 
-    def refresh_tree(self):
-        self.tree.delete(*self.tree.get_children())
+        ttk.Label(parent, foreground="#b00", text=(
+            "安全提示：本程序同目录的 lp_data/ 含全部权限口令，属敏感文件，"
+            "请限定在本机/受控共享目录使用。")).pack(fill="x", pady=(4, 0))
 
-        for rec in self.data["lps"]:
-            self.tree.insert("", "end", values=[
-                rec.get("name", ""), rec.get("wm", ""), rec.get("to", ""),
-                rec.get("cc", ""), rec.get("bcc", ""), rec.get("files", ""),
-                rec.get("open_pw", ""),
-                "••••" if rec.get("owner_pw") else "",   # 列表掩码，防演示/截图泄露
-                rec.get("subject", "")])
+    # ---------- 发送模式 ----------
 
-    def selected_index(self):
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        return self.tree.index(sel[0])
+    def _wb_update_mode_hint(self):
+        if not hasattr(self, "_wb_mode_var"):
+            return
+        label = self._wb_mode_var.get()
+        desc = ""
+        for _k, l, d in lp_v3.SEND_MODES:
+            if l == label:
+                desc = d
+                break
+        n = len((self._wb_event or {}).get("recipients") or [])
+        self._wb_mode_hint.configure(text="%s（当前 %d 位收件人）" % (desc, n))
 
-    def do_import(self):
+    def _wb_change_send_mode(self, _evt=None):
+        """切换发送模式（事件级开关：决定几封邮件 / 几份文档）。"""
+        if not self._wb_event:
+            return
+        label = self._wb_mode_var.get()
+        mode = None
+        for k, l, _d in lp_v3.SEND_MODES:
+            if l == label:
+                mode = k
+                break
+        if not mode:
+            return
+        opts = self._wb_event.setdefault("options", {})
+        if opts.get("send_mode") == mode:
+            return
+        opts["send_mode"] = mode
+        opts["merge_groups"] = (mode != "per_lp")
+        self._wb_save()
+        self._wb_update_mode_hint()
+        n = len(self._wb_event.get("recipients") or [])
+        messagebox.showinfo(
+            "发送模式已切换",
+            "已切换为「%s」。\n\n%s\n\n当前 %d 位收件人 → 将生成 %d 封草稿。"
+            % (label, lp_v3.SEND_MODE_DESC.get(mode, ""), n,
+               len(lp_v3.draft_units(self._wb_event))))
+
+    def _wb_export_recipients(self):
+        """导出当前事件的收件人清单（Excel）。"""
+        ev = self._wb_event
+        if not ev:
+            return
+        recips = ev.get("recipients") or []
+        if not recips:
+            messagebox.showinfo("提示", "这个事件还没有收件人")
+            return
+        rows = lp_v3.recipients_to_rows(recips)
+        self._write_xlsx_sheets(
+            "收件人清单_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 40),
+            [("收件人清单", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
+            "已导出",
+            "收件人清单已导出。\n\n注意：文件里含打开口令与权限口令，属敏感文件，"
+            "请按与 lp_data/ 相同的管控要求保存。")
+
+    # ---------- 导入：模板下载 / 数据校验 / 可视化结果 ----------
+
+    def _wb_import_recipients(self):
+        """收件人步骤里的「导入 Excel/CSV」。"""
+        if not self._wb_event:
+            return
+        stats = self._do_import_recipients(self._wb_event)
+        if stats:
+            self._wb_show_step(self._wb_step)
+
+    def _do_import_recipients(self, ev):
+        """导入收件人清单（收件人步骤与事件库共用同一套流程）。
+
+        选文件 → 逐行数据校验 → 可视化导入结果 → 写入事件。
+        返回统计 dict；用户取消则返回 None。
+        """
         path = filedialog.askopenfilename(title="选择收件人清单",
-                                          filetypes=[("表格", "*.xlsx *.csv"), ("所有文件", "*.*")])
+                                          filetypes=[("表格", "*.xlsx *.csv"),
+                                                     ("所有文件", "*.*")])
+        if not path:
+            return None
+        try:
+            rows = read_spreadsheet(path)
+        except Exception as e:
+            messagebox.showerror("读取失败", str(e))
+            return None
+        existing = [r.get("name", "") for r in ev.get("recipients", [])]
+        result = lp_v3.validate_recipient_rows(rows, existing)
+        action = self._show_import_result(result, path)
+        if not action:
+            return None
+        stats = self._apply_import_rows(result, ev,
+                                        only_ok=(action == "ok_only"))
+        ok, err = self.store.save_event(ev)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return None
+        stats["field_cols"] = result.get("field_cols") or []
+        stats["unknown_cols"] = result.get("unknown_cols") or []
+        return stats
+
+    def _apply_import_rows(self, result, ev, only_ok=True):
+        """把校验通过的行写进事件。返回统计。"""
+        by_name = {r.get("name", ""): r for r in ev.get("recipients", [])}
+        updated = added = skipped = 0
+        for item in result.get("items") or []:
+            rec = item.get("record") or {}
+            name = rec.get("name", "")
+            if only_ok and item.get("status") == "error":
+                skipped += 1
+                continue
+            if not name:
+                skipped += 1
+                continue
+            cur = by_name.get(name)
+            if cur is None:
+                ev.setdefault("recipients", []).append(rec)
+                by_name[name] = rec
+                added += 1
+                continue
+            # 合并而非替换：导入值为空则保留原值（防口令被清空重发）
+            for k, v in rec.items():
+                if k == "fields":
+                    for fk, fv in (v or {}).items():
+                        if fv:
+                            cur.setdefault("fields", {})[fk] = fv
+                elif k == "attachments":
+                    if v:
+                        merged = list(cur.get("attachments") or [])
+                        for p in v:
+                            if p not in merged:
+                                merged.append(p)
+                        cur["attachments"] = merged
+                elif v and v != cur.get(k, ""):
+                    cur[k] = v
+            updated += 1
+        filled = 0
+        for r in ev.get("recipients", []):
+            if not r.get("open_pw"):
+                r["open_pw"] = gen_pw()
+                filled += 1
+            if not r.get("owner_pw"):
+                r["owner_pw"] = gen_pw()
+                filled += 1
+        return {"updated": updated, "added": added, "skipped": skipped,
+                "filled": filled}
+
+    def _show_import_result(self, result, path):
+        """可视化导入结果：逐行状态 + 问题清单 + 导出明细。
+
+        返回 'ok_only'（只导无错行）/ 'all'（全导）/ None（取消）。
+        """
+        win = tk.Toplevel(self.root)
+        win.title("导入结果预览")
+        win.geometry("1020x580")
+        win.minsize(760, 400)
+        win.transient(self.root)
+        decision = {"action": None}
+
+        items = result.get("items") or []
+        n_err = sum(1 for i in items if i.get("status") == "error")
+        n_warn = sum(1 for i in items if i.get("status") == "warning")
+        n_ok = sum(1 for i in items if i.get("status") == "ok")
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=(10, 2))
+        ttk.Label(head, text="导入结果预览", style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text=Path(path).name, style="Sub.TLabel").pack(side="left", padx=10)
+
+        summary = ttk.Frame(win)
+        summary.pack(fill="x", padx=12)
+        ttk.Label(summary, text="共 %d 行" % len(items)).pack(side="left")
+        ttk.Label(summary, text="通过 %d" % n_ok, foreground="#2f7d32").pack(side="left", padx=14)
+        ttk.Label(summary, text="警告 %d" % n_warn, foreground="#b8860b").pack(side="left")
+        ttk.Label(summary, text="错误 %d" % n_err, foreground="#b00").pack(side="left", padx=14)
+        for m in result.get("fatal") or []:
+            ttk.Label(summary, text="✕ " + m, foreground="#b00",
+                      wraplength=860, justify="left").pack(anchor="w")
+        for m in result.get("notes") or []:
+            ttk.Label(summary, text="· " + m, foreground="#666",
+                      wraplength=860, justify="left").pack(anchor="w")
+        if result.get("unknown_cols"):
+            ttk.Label(summary, style="Sub.TLabel", wraplength=860, justify="left",
+                      text="未识别的列（会作为自定义字段收进收件人）：%s"
+                           % "、".join(result["unknown_cols"])).pack(anchor="w", pady=(4, 0))
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12, pady=8)
+        cols = ["no", "name", "status", "msg"]
+        heads = ["行号", "收件人名称", "结果", "问题"]
+        widths = {"no": 58, "name": 190, "status": 64, "msg": 520}
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+            tree.column(c, width=widths[c], stretch=(c == "msg"), anchor="w")
+        tree.tag_configure("error", foreground="#b00")
+        tree.tag_configure("warning", foreground="#b8860b")
+        tree.tag_configure("ok", foreground="#2f7d32")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        label_of = {"ok": "通过", "warning": "警告", "error": "错误"}
+        for it in items:
+            st = it.get("status", "ok")
+            msgs = list(it.get("errors") or []) + list(it.get("warnings") or [])
+            tree.insert("", "end", values=(it.get("no", ""), it.get("name", ""),
+                                          label_of.get(st, st), "；".join(msgs)),
+                        tags=(st,))
+
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=12, pady=(0, 10))
+
+        def _finish(act):
+            decision["action"] = act
+            win.destroy()
+
+        ttk.Button(foot, text="导入无错误的 %d 行" % (n_ok + n_warn),
+                   command=lambda: _finish("ok_only")).pack(side="left")
+        ttk.Button(foot, text="全部导入（含错误行 %d）" % n_err,
+                   command=lambda: _finish("all")).pack(side="left", padx=6)
+        ttk.Button(foot, text="导出问题明细…",
+                   command=lambda: self._export_import_problems(result)
+                   ).pack(side="left")
+        ttk.Button(foot, text="取消", command=lambda: _finish(None)).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", lambda: _finish(None))
+        win.wait_window()
+        return decision["action"]
+
+    def _export_import_problems(self, result):
+        """把导入问题明细导出成 Excel，方便业务方改完再导。"""
+        rows = [["行号", "收件人名称", "级别", "问题"]]
+        for it in result.get("items") or []:
+            level = {"ok": "通过", "warning": "警告", "error": "错误"}.get(
+                it.get("status", ""), it.get("status", ""))
+            msgs = list(it.get("errors") or []) + list(it.get("warnings") or [])
+            if not msgs:
+                continue
+            rows.append([it.get("no", ""), it.get("name", ""), level, "；".join(msgs)])
+        if len(rows) == 1:
+            rows.append(["—", "—", "—", "没有发现问题"])
+        self._write_xlsx_sheets(
+            "导入问题明细.xlsx",
+            [("问题明细", rows, [10, 30, 10, 90])],
+            "已导出", "问题明细已导出，按提示修改后重新导入即可。")
+
+    # ---------- 导出 / 备份 ----------
+
+    def _lib_import_recipients(self):
+        """事件库里的「导入收件人」：导入到当前选中的事件。"""
+        eid = self._selected_event_id()
+        if not eid:
+            messagebox.showinfo("提示", "请先在事件表里选中一个事件")
+            return
+        ev, err = self.store.load_event(eid)
+        if not ev:
+            messagebox.showerror("读取失败", err or "事件不存在")
+            return
+        stats = self._do_import_recipients(ev)
+        if not stats:
+            return
+        msg = "导入完成：新增 %d，更新 %d" % (stats["added"], stats["updated"])
+        if stats["skipped"]:
+            msg += "，跳过 %d 行错误" % stats["skipped"]
+        if stats["filled"]:
+            msg += "。自动生成缺失口令 %d 个" % stats["filled"]
+        if stats["field_cols"]:
+            msg += "\n收进自定义字段列：" + "、".join(stats["field_cols"])
+        messagebox.showinfo("导入完成", msg)
+        self._refresh_home()
+
+    def _lib_export_recipients(self):
+        """导出选中事件的收件人清单（Excel）。"""
+        eid = self._selected_event_id()
+        if not eid:
+            messagebox.showinfo("提示", "请先在事件表里选中一个事件")
+            return
+        ev, err = self.store.load_event(eid)
+        if not ev:
+            messagebox.showerror("读取失败", err or "事件不存在")
+            return
+        recips = ev.get("recipients") or []
+        if not recips:
+            messagebox.showinfo("提示", "这个事件还没有收件人")
+            return
+        rows = lp_v3.recipients_to_rows(recips)
+        name = "收件人清单_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 40)
+        self._write_xlsx_sheets(
+            name, [("收件人清单", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
+            "已导出",
+            "收件人清单已导出。\n\n注意：文件里含打开口令与权限口令，属于敏感文件，"
+            "请按与 lp_data/ 相同的管控要求保存。")
+
+    def _lib_export_all_recipients(self):
+        """导出全部事件的收件人（合并，带「所属事件」列）。"""
+        events = self.store.list_events()
+        if not events:
+            messagebox.showinfo("提示", "还没有事件")
+            return
+        rows = [["所属事件"] + list(lp_v3.EXPORT_BASE_HEADERS)]
+        for e in events:
+            for r in (e.get("recipients") or []):
+                one = lp_v3.recipients_to_rows([r])
+                rows.append([e.get("name", "")] + one[1])
+        self._write_xlsx_sheets(
+            "全部收件人清单.xlsx",
+            [("全部收件人", rows, [26, 36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
+            "已导出", "全部事件的收件人已导出（含口令，属敏感文件）。")
+
+    def _lib_export_event(self):
+        """导出单个事件配置（JSON 备份，可再导入还原）。"""
+        eid = self._selected_event_id()
+        if not eid:
+            messagebox.showinfo("提示", "请先在事件表里选中一个事件")
+            return
+        ev, err = self.store.load_event(eid)
+        if not ev:
+            messagebox.showerror("读取失败", err or "事件不存在")
+            return
+        payload = lp_v3.event_export_payload(ev)
+        path = filedialog.asksaveasfilename(
+            title="导出事件配置", defaultextension=".json",
+            initialfile="事件_%s.json" % sanitize_filename(ev.get("name", "事件"), 40),
+            filetypes=[("JSON", "*.json")])
         if not path:
             return
         try:
-            rows = read_spreadsheet(path)
-            lps, unknown = parse_import_rows(rows)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            return
+        messagebox.showinfo("已导出",
+                            "事件配置已导出。\n\n还原方式：事件库 → 导入收件人… 旁边的"
+                            "「导入事件备份…」（或直接把这个 JSON 放回 lp_data/events/）。")
+
+    def _lib_export_backup(self):
+        """导出整库备份（设置 + 事件 + 场景 + 执行记录）。"""
+        data = lp_v3.backup_payload(self.store)
+        path = filedialog.asksaveasfilename(
+            title="备份全部数据", defaultextension=".json",
+            initialfile="doc-mailer_备份_%s.json" % datetime.now().strftime("%Y%m%d-%H%M%S"),
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            return
+        messagebox.showinfo(
+            "已备份",
+            "已备份 %d 个事件、%d 个场景、%d 条执行记录。\n\n"
+            "注意：备份含全部权限口令，属敏感文件。"
+            % (len(data["events"]), len(data["scenarios"]), len(data["runs"])))
+
+    def _lib_import_event(self):
+        """从 JSON 备份还原一个事件（新建，不覆盖同名事件）。"""
+        path = filedialog.askopenfilename(title="导入事件备份",
+                                          filetypes=[("JSON", "*.json"),
+                                                     ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
         except Exception as e:
             messagebox.showerror("导入失败", str(e))
             return
-        if not lps:
-            messagebox.showwarning("导入", "没有解析到任何收件人记录（需要表头 + 名称列）")
+        ok, ev, err = lp_v3.event_import_payload(payload)
+        if not ok:
+            messagebox.showerror("导入失败", err)
             return
-        # 合并而非替换：同名记录按字段合并，导入值为空则保留原值（防口令被清空重发）
-        by_name = {r["name"]: r for r in self.data["lps"]}
-        in_file_seen = set()
-        updated, added, dup_in_file = 0, 0, []
-        for rec in lps:
-            if rec["name"] in in_file_seen:
-                dup_in_file.append(rec["name"])
-                continue
-            in_file_seen.add(rec["name"])
-            if rec["name"] in by_name:
-                cur = by_name[rec["name"]]
-                for k, v in rec.items():
-                    if v and v != cur.get(k, ""):
-                        cur[k] = v
-                updated += 1
-            else:
-                self.data["lps"].append(rec)
-                by_name[rec["name"]] = rec
-                added += 1
-        filled = 0
-        for r in self.data["lps"]:
-            if not r.get("open_pw"):
-                r["open_pw"] = gen_pw(); filled += 1
-            if not r.get("owner_pw"):
-                r["owner_pw"] = gen_pw(); filled += 1
-        if not messagebox.askyesno(
-                "确认导入",
-                f"解析 {len(lps)} 条：更新 {updated} 条、新增 {added} 条"
-                + (f"、文件内重名跳过 {len(dup_in_file)} 条" if dup_in_file else "")
-                + "。\n\n确认写入？"):
+        ev["id"] = ""
+        ev["name"] = (ev.get("name") or "导入事件") + "（导入）"
+        ev["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ev["updated_at"] = ev["created_at"]
+        ev["status"] = ""
+        ok, err = self.store.save_event(ev)
+        if not ok:
+            messagebox.showerror("保存失败", err)
             return
-        self.save_data()
-        self.refresh_tree()
-        msg = (f"导入完成：更新 {updated}，新增 {added}。"
-               + (f"\n自动生成缺失口令 {filled} 个。" if filled else ""))
-        if unknown:
-            msg += "\n未识别的列（已忽略）：" + "、".join(unknown)
-        if dup_in_file:
-            msg += "\n文件内重名已跳过：" + "、".join(dup_in_file[:5])
-        messagebox.showinfo("导入完成", msg)
+        messagebox.showinfo("导入完成", "事件「%s」已导入。" % ev["name"])
+        self._refresh_home()
 
+    # ---------- 模板下载 ----------
 
-    def export_template(self):
-        self._write_xlsx("收件人清单导入模板.xlsx", [MOCK_HEADERS,
-                       ["示例：苏州某某科技有限公司", "（留空=同收件人名称）",
-                        "a@x.com;b@x.com", "cc@x.com", "bcc@x.com",
-                        "（留空=用邮件模板）",
-                        "C:\\Document\\补充说明.pdf（多个用;分隔，可留空）",
-                        "（留空=自动生成）", "（留空=自动生成，勿发给LP）"]],
-                       "模板已导出", "表头列名即导入识别依据，可增删其他列。\n口令列留空会自动生成随机口令。")
-
-    def export_sample(self):
-        self._write_xlsx("收件人清单示例（演示数据）.xlsx", [MOCK_HEADERS] + MOCK_LPS,
-                         "示例清单已导出",
-                         "共 8 条虚构演示数据（通用客户场景），可直接「导入 Excel/CSV」体验全流程。\n"
-                         "邮箱均为保留域名，不会发往真实地址（草稿也需人工确认才会发送）。")
+    def _wb_export_template(self):
+        """下载收件人清单导入模板（含填写说明页）。"""
+        headers = list(MOCK_HEADERS) + ["Call_Amount", "Unfunded", "Due_Date"]
+        row = ["示例：苏州某某科技有限公司", "（留空=同收件人名称）", "a@x.com;b@x.com",
+               "cc@x.com", "bcc@x.com", "（留空=用邮件模板）",
+               "C:\\Document\\补充说明.pdf（多个用;分隔，可留空）",
+               "（留空=自动生成）", "（留空=自动生成，勿发给LP）",
+               "200,000", "800,000", "2026-11-15"]
+        guide = [
+            ["列名", "必填", "说明"],
+            ["收件人名称", "是", "收件单位全称；识别依据，也是水印默认文字"],
+            ["水印名称", "否", "留空 = 同收件人名称"],
+            ["收件人", "是", "收件邮箱；多个用 ; 分隔（英文逗号是文件名的一部分，不做分隔）"],
+            ["抄送 / 密送", "否", "邮箱；多个用 ; 分隔"],
+            ["邮件标题", "否", "留空 = 用邮件模板里的主题"],
+            ["附件路径", "否", "本地文件路径；多个用 ; 分隔"],
+            ["打开口令", "否", "留空 = 自动生成随机口令（收件人打开文件用）"],
+            ["权限口令", "否", "留空 = 自动生成（控制打印权限，绝不会进入邮件）"],
+            ["合并组", "否", "仅「按组合并」发送模式生效；同组共用一封邮件、附件包合并"],
+            ["其它任意列", "否", "作为自定义字段收进收件人，可在流水线的字段映射里用到"],
+        ]
+        self._write_xlsx_sheets(
+            "收件人清单导入模板.xlsx",
+            [("收件人清单", [headers, row], [36, 20, 28, 16, 16, 22, 34, 14, 24, 14, 14, 14]),
+             ("填写说明", guide, [18, 8, 78])],
+            "模板已导出",
+            "把模板发给业务方填写，填完再导回来。\n"
+            "表头列名即识别依据；未识别的列会作为自定义字段收进来，"
+            "可在流水线里映射到 Word 占位符。\n"
+            "口令列留空会自动生成随机口令。")
 
     def _write_xlsx(self, default_name, rows, ok_title, ok_msg):
+        """单表 Excel 导出（兼容旧调用）。"""
+        return self._write_xlsx_sheets(
+            default_name, [("Sheet1", rows, [36, 20, 28, 16, 16, 22, 34, 14, 24, 14, 14, 14])],
+            ok_title, ok_msg)
+
+    def _write_xlsx_sheets(self, default_name, sheets, ok_title, ok_msg):
+        """导出多页 Excel。sheets = [(表名, 二维列表, 列宽列表), ...]"""
         path = filedialog.asksaveasfilename(title="保存", defaultextension=".xlsx",
                                             initialfile=default_name,
                                             filetypes=[("Excel", "*.xlsx")])
         if not path:
-            return
+            return None
         import openpyxl
+        from openpyxl.utils import get_column_letter
         wb = openpyxl.Workbook()
-        ws = wb.active
-        for row in rows:
-            ws.append(row)
-        for col, w in zip("ABCDEFGHI", [36, 20, 28, 16, 16, 22, 34, 14, 24]):
-            ws.column_dimensions[col].width = w
+        wb.remove(wb.active)
+        for title, rows, widths in sheets:
+            ws = wb.create_sheet(title=str(title)[:31])
+            for row in rows or []:
+                ws.append(list(row))
+            for i, w in enumerate(widths or []):
+                ws.column_dimensions[get_column_letter(i + 1)].width = w
+            try:
+                for c in ws[1]:
+                    c.font = openpyxl.styles.Font(bold=True)
+            except Exception:
+                pass
         try:
             wb.save(path)
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
-            return
+            return None
         messagebox.showinfo(ok_title, ok_msg)
+        return path
 
-    def edit_dialog(self, idx):
-        rec = dict(self.data["lps"][idx]) if idx is not None else {
-            "name": "", "wm": "", "to": "", "cc": "", "bcc": "", "files": "",
-            "subject": "", "open_pw": gen_pw(), "owner_pw": gen_pw()}
+    def _wb_selected_recipients(self):
+        tree = getattr(self, "_wb_rec_tree", None)
+        if tree is None:
+            return []
+        ev = self._wb_event
+        idxs = sorted((tree.index(i) for i in tree.selection()), reverse=True)
+        return [ev["recipients"][i] for i in idxs]
+
+    def _wb_edit_recipient(self):
+        tree = getattr(self, "_wb_rec_tree", None)
+        ev = self._wb_event
+        sel = tree.selection() if tree else ()
+        rec = dict(ev["recipients"][tree.index(sel[0])]) if sel else {
+            "name": "", "wm": "", "to": "", "cc": "", "bcc": "",
+            "open_pw": gen_pw(), "owner_pw": gen_pw(), "fields": {},
+            "attachments": [], "group": ""}
         win = tk.Toplevel(self.root)
-        win.title("编辑收件人" if idx is not None else "新增收件人")
+        win.title("编辑收件人" if sel else "新增收件人")
         win.grab_set()
-        entries = {}
         rows = [("收件人名称（水印默认用同名）", "name"), ("水印名称", "wm"),
                 ("收件人To（多人用;分隔）", "to"), ("抄送CC（可空）", "cc"),
                 ("密送BCC（可空）", "bcc"),
-                ("附件路径（多个用;分隔，可空）", "files"),
+                ("合并发送组（同名=一封邮件，可空）", "group"),
+                ("专属附件（多个用;分隔，可空）", "attachments"),
                 ("邮件标题（空=用模板）", "subject"),
-                ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw"),
-                ("合并发送组（同名=一封邮件，可空）", "merge_group")]
+                ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw")]
+        entries = {}
         for i, (label, key) in enumerate(rows):
             ttk.Label(win, text=label).grid(row=i, column=0, sticky="e", padx=6, pady=4)
             e = ttk.Entry(win, width=52, show="*" if key == "owner_pw" else "")
-            e.insert(0, rec.get(key, ""))
+            val = rec.get(key, "")
+            if key == "attachments":
+                val = ";".join(rec.get("attachments") or [])
+            e.insert(0, val)
             e.grid(row=i, column=1, padx=6, pady=4)
             entries[key] = e
-        ttk.Label(win, text="权限口令输入框默认遮蔽，仅内部留档", foreground="#888").grid(
-            row=len(rows), column=1, sticky="w")
+        r0 = len(rows)
+        ttk.Label(win, text="自定义字段", foreground="#444").grid(
+            row=r0, column=0, sticky="e", padx=6, pady=(8, 2))
+        field_entries = {}
+        fcols = self._wb_field_columns()
+        if not fcols:
+            ttk.Label(win, text="（还没有自定义字段列，可先在收件人页点"
+                          "「添加自定义字段列」）", foreground="#888"
+                      ).grid(row=r0, column=1, sticky="w", padx=6)
+        for j, k in enumerate(fcols):
+            ttk.Label(win, text=k).grid(row=r0 + 1 + j, column=0, sticky="e", padx=6, pady=2)
+            e = ttk.Entry(win, width=52)
+            e.insert(0, (rec.get("fields") or {}).get(k, ""))
+            e.grid(row=r0 + 1 + j, column=1, padx=6, pady=2)
+            field_entries[k] = e
 
         def ok():
             out = {k: e.get().strip() for k, e in entries.items()}
@@ -1369,107 +1915,1188 @@ class App:
                 messagebox.showwarning("口令", "权限口令不能与打开口令相同", parent=win)
                 return
             out["wm"] = out["wm"] or out["name"]
-            if idx is None:
-                self.data["lps"].append(out)
+            out["attachments"] = split_paths(out.get("attachments", ""))
+            out["fields"] = {k: e.get().strip() for k, e in field_entries.items()}
+            if sel:
+                ev["recipients"][tree.index(sel[0])] = out
             else:
-                self.data["lps"][idx] = out
-            self.save_data()
-            self.refresh_tree()
+                ev["recipients"].append(out)
+            self._wb_save()
+            self._wb_show_step(self._wb_step)
             win.destroy()
 
         btns = ttk.Frame(win)
-        btns.grid(row=len(rows) + 1, column=0, columnspan=2, pady=8)
+        btns.grid(row=r0 + 1 + len(fcols), column=0, columnspan=2, pady=8)
         ttk.Button(btns, text="保存", command=ok).pack(side="left", padx=8)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
 
-    def edit_selected(self):
-        idx = self.selected_index()
-        if idx is None:
-            messagebox.showinfo("提示", "请先选中一行")
-            return
-        self.edit_dialog(idx)
-
-    def delete_selected(self):
-        sel = self.tree.selection()
+    def _wb_delete_recipients(self):
+        tree = getattr(self, "_wb_rec_tree", None)
+        ev = self._wb_event
+        sel = tree.selection() if tree else ()
         if not sel:
             return
-        idxs = sorted((self.tree.index(i) for i in sel), reverse=True)
-        names = [self.data["lps"][i]["name"] for i in reversed(idxs)]
+        idxs = sorted((tree.index(i) for i in sel), reverse=True)
+        names = [ev["recipients"][i]["name"] for i in reversed(idxs)]
         preview = "\n".join(names[:6]) + ("…" if len(names) > 6 else "")
-        if messagebox.askyesno("删除", f"确认删除选中的 {len(names)} 条？\n\n{preview}"):
-            for i in idxs:  # 从大到小删，避免索引位移
-                del self.data["lps"][i]
-            self.save_data()
-            self.refresh_tree()
+        if messagebox.askyesno("删除", "确认删除选中的 %d 条？\n\n%s" % (len(names), preview)):
+            for i in idxs:
+                del ev["recipients"][i]
+            self._wb_save()
+            self._wb_show_step(self._wb_step)
 
-    def check_attachments(self):
+    def _wb_add_field_column(self):
+        name = simpledialog.askstring("添加自定义字段列",
+                                       "字段名（如 Call_Amount）：")
+        if not name:
+            return
+        name = name.strip()
+        ev = self._wb_event
+        if not any(name in (r.get("fields") or {}) for r in ev["recipients"]):
+            for r in ev["recipients"]:
+                r.setdefault("fields", {}).setdefault(name, "")
+        self._wb_save()
+        self._wb_show_step(self._wb_step)
+
+    def _wb_apply_field_template(self):
+        templates = self.settings.get("field_templates") or []
+        if not templates:
+            messagebox.showinfo("字段模板", "还没有预定义的字段模板")
+            return
+        names = [t.get("name", "") for t in templates]
+        pick = simpledialog.askstring("套用字段模板",
+                                       "选择字段模板：\n\n" + "\n".join(names),
+                                       initialvalue=names[0])
+        if not pick:
+            return
+        tpl = next((t for t in templates if t.get("name") == pick), None)
+        if tpl is None:
+            return
+        ev = self._wb_event
+        cols = tpl.get("columns") or []
+        for r in ev["recipients"]:
+            for c in cols:
+                r.setdefault("fields", {}).setdefault(c, "")
+        self._wb_save()
+        self._wb_show_step(self._wb_step)
+        messagebox.showinfo("已套用", "已添加字段列：" + "、".join(cols))
+
+    def _wb_check_attachments(self):
         total, missing = 0, []
-        for rec in self.data["lps"]:
-            for path in split_paths(rec.get("files", "")):
+        for rec in self._wb_event.get("recipients", []):
+            for path in rec.get("attachments") or []:
                 total += 1
                 if not Path(path).exists():
-                    missing.append(f"{rec['name']}：{path}")
+                    missing.append("%s：%s" % (rec.get("name", ""), path))
         if not missing:
-            extra = "" if total else "\n（当前没有任何 LP 配置附件路径）"
-            messagebox.showinfo("附件检查",
-                                f"全部就绪：{total} 个附件路径均存在。" + extra)
+            messagebox.showinfo("附件检查", "全部就绪：%d 个附件路径均存在。" % total)
         else:
             lines = "\n".join(missing[:15]) + ("…" if len(missing) > 15 else "")
-            messagebox.showwarning(
-                "附件检查",
-                f"{total - len(missing)}/{total} 个就绪，"
-                f"以下 {len(missing)} 个不存在：\n\n{lines}\n\n"
-                "缺失的附件在生成草稿时会被跳过并记入日志。")
+            messagebox.showwarning("附件检查",
+                                   "%d/%d 个就绪，以下 %d 个不存在：\n\n%s\n\n"
+                                   "缺失的附件在生成草稿时会被跳过并记入日志。"
+                                   % (total - len(missing), total, len(missing), lines))
 
-    def fill_passwords(self):
+    def _wb_fill_passwords(self):
         n = 0
-        for rec in self.data["lps"]:
+        for rec in self._wb_event.get("recipients", []):
             if not rec.get("open_pw"):
                 rec["open_pw"] = gen_pw(); n += 1
             if not rec.get("owner_pw"):
                 rec["owner_pw"] = gen_pw(); n += 1
-        self.save_data()
-        self.refresh_tree()
-        messagebox.showinfo("补齐口令", f"新生成 {n} 个口令（导入时留空的会已自动生成，此按钮用于兜底）")
+        self._wb_save()
+        self._wb_show_step(self._wb_step)
+        messagebox.showinfo("补齐口令", "新生成 %d 个口令" % n)
 
-    # ----- Tab2: 邮件模板 -----
+    # ---------- 步骤 2：文档流水线 ----------
 
-    def build_tab_tpl(self):
-        f = self.tab_tpl
-        self._guide(f, "本页编辑邮件标题与正文模板（所见即所得）：左侧编辑、右侧实时预览，"
-                      "中缝可拖动调整宽度；从 Word/网页复制后 Ctrl+V 自动保留样式。"
-                      "{{字段}} 会按每个收件人自动替换，③页生成时生效。")
-        ttk.Label(f, text="邮件标题模板：").pack(anchor="w", padx=8, pady=(8, 0))
-        self.subject_var = tk.StringVar(value=self.data.get("subject", DEFAULT_SUBJECT))
-        ttk.Entry(f, textvariable=self.subject_var).pack(fill="x", padx=8)
+# ---------- 步骤 2：文档流水线（v3.1：条目表格） ----------
 
-        self._build_editor_toolbar(f)
+    def _wb_pipeline_items(self):
+        return (self._wb_event or {}).setdefault("pipeline", [])
 
-        # pack 顺序决定空间分配：底部按钮和右侧预览必须先占位，编辑区最后扩展
-        bot = ttk.Frame(f)
-        bot.pack(side="bottom", fill="x", padx=8, pady=4)
-        for text, cmd, tip in [
-            ("保存模板", self.save_template, "把当前标题+正文保存为模板（关窗时也会自动保存）。"),
-            ("导入HTML文件…", self.import_html,
-             "从 .html/.htm/.txt 文件导入正文（自动识别编码并抽取 <body>），导入即保存。"),
-            ("恢复默认", self.reset_template, "恢复出厂默认模板（覆盖当前内容）。"),
-            ("刷新预览", self.refresh_preview,
-             "用当前选中的收件人（无选中用示例值）重新渲染右侧预览。"),
-        ]:
-            b = ttk.Button(bot, text=text, command=cmd)
-            b.pack(side="left") if text == "保存模板" else b.pack(side="left", padx=6)
-            ToolTip(b, tip)
+    def _wb_item_by_id(self, iid):
+        for it in self._wb_pipeline_items():
+            if it.get("id") == iid:
+                return it
+        return None
+
+    def _wb_selected_item_id(self):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        if tree is not None:
+            sel = tree.selection()
+            if sel:
+                return sel[0]
+        return getattr(self, "_wb_sel_item", None)
+
+    # ---------- 表格渲染 ----------
+
+    def _wb_item_source_text(self, item):
+        params = item.get("params") or {}
+        if (item.get("kind") or "generate") == "generate":
+            tp = (params.get("template_path") or "").strip()
+            return Path(tp).name if tp else "（未选模板）"
+        files = params.get("files") or []
+        if not files:
+            return "（未选文件）"
+        if len(files) == 1:
+            return Path(str(files[0])).name
+        return "%s 等 %d 个文件" % (Path(str(files[0])).name, len(files))
+
+    def _wb_item_proc_text(self, item):
+        params = item.get("params") or {}
+        procs = []
+        if (item.get("kind") or "generate") == "generate" and params.get("to_pdf"):
+            procs.append("PDF")
+        if params.get("watermark"):
+            procs.append("水印")
+        if params.get("encrypt"):
+            procs.append("加密")
+        return "·".join(procs) if procs else "—"
+
+    def _wb_fill_pipe_table(self, keep_sel=None):
+        # 按事件数据重画条目表格（尽量保持当前选中行）。
+        tree = getattr(self, "_wb_pipe_tree", None)
+        if tree is None:
+            return
+        sel = keep_sel or getattr(self, "_wb_sel_item", None)
+        tree.delete(*tree.get_children())
+        items = self._wb_pipeline_items()
+        for i, it in enumerate(items):
+            iid = it.get("id") or ("it-%d" % i)
+            it["id"] = iid
+            tree.insert("", "end", iid=iid, values=(
+                str(i + 1),
+                it.get("name") or ITEM_KIND_LABELS.get(it.get("kind"), "条目"),
+                ITEM_KIND_LABELS.get(it.get("kind"), ""),
+                self._wb_item_source_text(it),
+                self._wb_item_proc_text(it),
+                GRANULARITY_LABELS.get(it.get("granularity") or "per_lp", ""),
+                "✓" if it.get("enabled", True) else "—",
+            ))
+        if sel and tree.exists(sel):
+            tree.selection_set(sel)
+            tree.focus(sel)
+        elif items:
+            first = items[0].get("id")
+            if first and tree.exists(first):
+                tree.selection_set(first)
+        cnt = getattr(self, "_wb_pipe_count", None)
+        if cnt is not None:
+            on = len([i for i in items if i.get("enabled", True)])
+            cnt.configure(text="共 %d 个条目（启用 %d）" % (len(items), on))
+
+    # ---------- 流水线页 ----------
+
+    def _wb_step_pipeline(self, parent):
+        ttk.Label(parent, text="文档流水线", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(parent, text=(
+            "每一行 = 一个要附上的东西，只有两种：\n"
+            "    ① 生成文档 —— 用 Word 模板给每位收件人生成一份内容不同的文档\n"
+            "    ② 附加文件 —— 把磁盘上已有的文件放进附件包\n"
+            "单击行 → 下方参数区；按住行上下拖动 → 改顺序；Ctrl/Shift 多选 → 批量删除。"),
+            style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(bar, text="＋ 生成文档",
+                   command=lambda: self._wb_add_item("generate")).pack(side="left")
+        ttk.Button(bar, text="＋ 附加文件",
+                   command=lambda: self._wb_add_item("attach")).pack(side="left", padx=4)
+        ttk.Button(bar, text="删除选中",
+                   command=self._wb_del_selected_items).pack(side="left")
+        ttk.Button(bar, text="插入示例链路",
+                   command=self._wb_add_example_chain).pack(side="left", padx=4)
+        ttk.Button(bar, text="清空", command=self._wb_clear_items).pack(side="left")
+        self._wb_pipe_count = ttk.Label(bar, foreground="#888", text="")
+        self._wb_pipe_count.pack(side="left", padx=10)
+
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, pady=(0, 6))
+        cols = ["no", "name", "kind", "source", "proc", "gran", "on"]
+        heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "产出粒度", "启用"]
+        tree = ttk.Treeview(frame, columns=cols, show="headings",
+                            selectmode="extended", height=8)
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+        tree.column("no", width=36, stretch=False, anchor="center")
+        tree.column("name", width=170)
+        tree.column("kind", width=78, stretch=False)
+        tree.column("source", width=250)
+        tree.column("proc", width=108, stretch=False)
+        tree.column("gran", width=108, stretch=False)
+        tree.column("on", width=44, stretch=False, anchor="center")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._wb_pipe_tree = tree
+
+        tree.bind("<<TreeviewSelect>>", self._wb_on_pipe_select)
+        tree.bind("<Double-1>", self._wb_on_pipe_double)
+        tree.bind("<ButtonPress-1>", self._wb_pipe_press)
+        tree.bind("<B1-Motion>", self._wb_pipe_motion)
+        tree.bind("<ButtonRelease-1>", self._wb_pipe_release)
+
+        # 参数区（单独一个 frame：切换选中行时只重画这里，表格不闪）
+        self._wb_params_frame = ttk.Frame(parent)
+        self._wb_params_frame.pack(fill="both", expand=True, pady=(0, 4))
+
+        self._wb_fill_pipe_table()
+        if not self._wb_pipeline_items():
+            ttk.Label(self._wb_params_frame,
+                      text="还没有条目。点上面的「＋ 生成文档」或「＋ 附加文件」开始。",
+                      style="Sub.TLabel").pack(anchor="w", padx=4, pady=6)
+            return
+        iid = self._wb_selected_item_id()
+        item = self._wb_item_by_id(iid) if iid else None
+        if item is None:
+            item = self._wb_pipeline_items()[0]
+            self._wb_sel_item = item.get("id")
+        self._wb_render_params(item)
+
+    def _wb_render_params(self, item):
+        f = getattr(self, "_wb_params_frame", None)
+        if f is None:
+            return
+        for c in f.winfo_children():
+            c.destroy()
+        # 重建前清掉上一批 tk 变量的保活列表
+        self._wb_keep = []
+        if item is None:
+            return
+        self._wb_item_params(f, item)
+
+    def _wb_keep_var(self, var):
+        """保住 tk 变量对象。
+
+        坑：tk.StringVar 的 Python 侧一旦被 GC，它的 __del__ 会把 Tcl 变量一起
+        删掉，Entry 就会莫名其妙变空（控件本身还活着，但值没了）。
+        所以凡是给控件用的变量，都要在这份列表里吊住。
+        """
+        keep = getattr(self, "_wb_keep", None)
+        if keep is None:
+            keep = []
+            self._wb_keep = keep
+        keep.append(var)
+        return var
+
+    # ---------- 选中 / 拖动排序 / 多选删除 ----------
+
+    def _wb_on_pipe_select(self, _evt=None):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        self._wb_sel_item = sel[0]
+        item = self._wb_item_by_id(sel[0])
+        if item is not None:
+            self._wb_render_params(item)
+
+    def _wb_on_pipe_double(self, event):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        if tree is None:
+            return
+        if tree.identify_column(event.x) == "#7":
+            return
+        iid = tree.identify_row(event.y)
+        item = self._wb_item_by_id(iid) if iid else None
+        if item is not None:
+            self._wb_rename_item(item)
+
+    def _wb_pipe_press(self, event):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        if tree is None:
+            return
+        self._wb_drag_iid = ""
+        self._wb_drag_start_y = event.y
+        self._wb_drag_moved = False
+        self._wb_drop_iid = ""
+        self._wb_drop_idx = None
+        # 点「启用」列 = 开关启用状态（不进入拖动）
+        if tree.identify_column(event.x) == "#7":
+            iid = tree.identify_row(event.y)
+            item = self._wb_item_by_id(iid) if iid else None
+            if item is not None:
+                item["enabled"] = not item.get("enabled", True)
+                self._wb_save()
+                self.root.after_idle(self._wb_after_toggle, item.get("id"))
+            return
+        # Ctrl/Shift = 多选，不启动拖动
+        if (event.state & 0x0004) or (event.state & 0x0001):
+            return
+        iid = tree.identify_row(event.y)
+        if iid:
+            self._wb_drag_iid = iid
+
+    def _wb_after_toggle(self, iid):
+        self._wb_fill_pipe_table(keep_sel=iid)
+        item = self._wb_item_by_id(iid)
+        if item is not None:
+            self._wb_render_params(item)
+
+    def _wb_pipe_motion(self, event):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        if tree is None:
+            return
+        iid = getattr(self, "_wb_drag_iid", "")
+        if not iid:
+            return
+        if not self._wb_drag_moved:
+            if abs(event.y - self._wb_drag_start_y) < 6:
+                return
+            self._wb_drag_moved = True
+        rows = [r for r in tree.get_children() if not r.startswith("__drop__")]
+        if iid not in rows:
+            return
+        target = tree.identify_row(event.y)
+        idx = len(rows)
+        if target and target in rows:
+            idx = rows.index(target)
+            bbox = tree.bbox(target)
+            if bbox and event.y > bbox[1] + bbox[3] / 2.0:
+                idx += 1
+        self._wb_drop_idx = idx
+        old = getattr(self, "_wb_drop_iid", "")
+        if old:
+            try:
+                tree.delete(old)
+            except Exception:
+                pass
+        self._wb_drop_iid = tree.insert("", idx,
+                                         values=("↓ 放到这里 ↓", "", "", "", "", "", ""))
+        tree.see(self._wb_drop_iid)
+
+    def _wb_pipe_release(self, _event):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        iid = getattr(self, "_wb_drag_iid", "")
+        moved = getattr(self, "_wb_drag_moved", False)
+        drop_iid = getattr(self, "_wb_drop_iid", "")
+        idx = getattr(self, "_wb_drop_idx", None)
+        self._wb_drag_iid = ""
+        self._wb_drag_moved = False
+        self._wb_drop_iid = ""
+        self._wb_drop_idx = None
+        if tree is None or not iid or not moved or idx is None:
+            return
+        if drop_iid:
+            try:
+                tree.delete(drop_iid)
+            except Exception:
+                pass
+        rows = [r for r in tree.get_children() if r != drop_iid]
+        if iid not in rows:
+            return
+        di = rows.index(iid)
+        pos = idx - (1 if di < idx else 0)
+        pos = max(0, min(pos, len(rows) - 1))
+        new_order = [r for r in rows if r != iid]
+        new_order.insert(pos, iid)
+        items = self._wb_pipeline_items()
+        by_id = dict((it.get("id"), it) for it in items)
+        ordered = [by_id[r] for r in new_order if r in by_id]
+        for it in items:
+            if it.get("id") not in new_order:
+                ordered.append(it)
+        items[:] = ordered
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=iid)
+        item = self._wb_item_by_id(iid)
+        if item is not None:
+            self._wb_render_params(item)
+
+    # ---------- 条目增删改 ----------
+
+    def _wb_add_item(self, kind):
+        it = new_item(kind)
+        self._wb_pipeline_items().append(it)
+        self._wb_sel_item = it.get("id")
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=it.get("id"))
+        self._wb_render_params(it)
+
+    def _wb_del_selected_items(self):
+        tree = getattr(self, "_wb_pipe_tree", None)
+        sel = list(tree.selection()) if tree is not None else []
+        if not sel:
+            messagebox.showinfo("删除选中",
+                                "请先在表格里选中要删除的条目（Ctrl/Shift 可多选）。")
+            return
+        items = self._wb_pipeline_items()
+        names = [it.get("name") or ITEM_KIND_LABELS.get(it.get("kind"), "条目")
+                 for it in items if it.get("id") in sel]
+        if not messagebox.askyesno("删除选中",
+                                   "确认删除 %d 个条目？\n\n%s"
+                                   % (len(sel), "\n".join(names[:12]))):
+            return
+        items[:] = [it for it in items if it.get("id") not in sel]
+        self._wb_sel_item = None
+        self._wb_save()
+        self._wb_fill_pipe_table()
+        self._wb_render_params(None)
+
+    def _wb_clear_items(self):
+        if not self._wb_pipeline_items():
+            return
+        if not messagebox.askyesno("清空", "确认删除全部流水线条目？"):
+            return
+        self._wb_event["pipeline"] = []
+        self._wb_sel_item = None
+        self._wb_save()
+        self._wb_fill_pipe_table()
+        self._wb_render_params(None)
+
+    def _wb_add_example_chain(self):
+        # 一键插入示例链路：一个「生成文档」条目（转 PDF + 水印 + 加密）
+        items = self._wb_pipeline_items()
+        if items:
+            if not messagebox.askyesno("插入示例链路",
+                                       "当前已有条目，示例链路会追加在后面。\n继续？"):
+                return
+        it = new_item("generate", "示例：对账单")
+        it["params"]["to_pdf"] = True
+        it["params"]["watermark"] = True
+        it["params"]["encrypt"] = True
+        it["granularity"] = "per_lp"
+        items.append(it)
+        self._wb_sel_item = it.get("id")
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=it.get("id"))
+        self._wb_render_params(it)
+        messagebox.showinfo("已插入",
+                            "已追加一个「生成文档」条目：\n"
+                            "Word 模板 → 转 PDF → 加水印 → 加密（权限默认仅打印）。\n"
+                            "记得给它选一个 .docx 模板。")
+
+    def _wb_rename_item(self, item):
+        win = tk.Toplevel(self.root)
+        win.title("重命名条目")
+        win.grab_set()
+        ttk.Label(win, text="条目名称：").pack(anchor="w", padx=12, pady=(10, 2))
+        var = tk.StringVar(value=item.get("name") or "")
+        e = ttk.Entry(win, textvariable=var, width=36)
+        e.pack(anchor="w", padx=12)
+        e.focus_set()
+        e.select_range(0, "end")
+
+        def ok():
+            name = var.get().strip()
+            if name:
+                item["name"] = name
+                self._wb_save()
+            win.destroy()
+            self._wb_fill_pipe_table(keep_sel=item.get("id"))
+            self._wb_render_params(item)
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="确定", command=ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+        e.bind("<Return>", lambda _e2: ok())
+
+    # ---------- 条目参数区 ----------
+
+    def _wb_item_params(self, parent, item):
+        kind = item.get("kind") or "generate"
+        params = item.setdefault("params", {})
+        title = item.get("name") or ITEM_KIND_LABELS.get(kind, "条目")
+        box = ttk.LabelFrame(parent, text=" 选中条目：%s " % title,
+                             style="Card.TLabelframe")
+        box.pack(fill="x", pady=(0, 6))
+
+        r0 = ttk.Frame(box)
+        r0.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(r0, text="名称：").pack(side="left")
+        name_var = self._wb_keep_var(tk.StringVar(value=item.get("name") or ""))
+        ttk.Entry(r0, textvariable=name_var, width=28).pack(side="left", padx=4)
+        ttk.Button(r0, text="改名", width=6,
+                   command=lambda: self._wb_rename_item(item)).pack(side="left")
+        ttk.Label(r0, text="   类型：%s" % ITEM_KIND_LABELS.get(kind, ""),
+                  foreground="#666").pack(side="left", padx=(12, 0))
+        ToolTip(r0, ITEM_KIND_DESC.get(kind, ""))
+
+        if kind == "generate":
+            r1 = ttk.Frame(box)
+            r1.pack(fill="x", padx=8, pady=4)
+            ttk.Label(r1, text="Word 模板：").pack(side="left")
+            tpl_var = self._wb_keep_var(tk.StringVar(value=params.get("template_path", "")))
+            ttk.Entry(r1, textvariable=tpl_var, width=54).pack(side="left", padx=4)
+            ttk.Button(r1, text="选择…", width=6,
+                       command=lambda: self._wb_pick_template(item, tpl_var)).pack(side="left")
+            ttk.Button(r1, text="检测占位符", width=10,
+                       command=lambda: self._wb_detect_placeholders(item)).pack(side="left", padx=4)
+            ttk.Label(box, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
+                      foreground="#888").pack(anchor="w", padx=8, pady=(0, 4))
+        else:
+            r1 = ttk.Frame(box)
+            r1.pack(fill="x", padx=8, pady=4)
+            ttk.Label(r1, text="文件（每行一个路径）：").pack(side="left", anchor="n")
+            files_text = tk.Text(r1, height=4, width=58, wrap="none")
+            files_text.pack(side="left", padx=4)
+            for p in (params.get("files") or []):
+                files_text.insert("end", str(p) + "\n")
+            btns = ttk.Frame(r1)
+            btns.pack(side="left", anchor="n", padx=4)
+            ttk.Button(btns, text="添加文件…", width=12,
+                       command=lambda: self._wb_add_attach_files(item, files_text)).pack(side="left")
+            ttk.Button(btns, text="从 Excel 导入路径…", width=18,
+                       command=lambda: self._wb_import_attach_paths(item, files_text)).pack(side="left", pady=4)
+            ttk.Button(btns, text="保存", width=6,
+                       command=lambda: self._wb_save_attach_files(item, files_text)).pack(side="left")
+            ttk.Label(box, text=(
+                "同一个文件会被复制进附件包；内容相同、文件名相同则所有收件人共用一份"
+                "（把「产出粒度」改成「每人一份」可让每人的文件名带上自己的名字）。"),
+                foreground="#888", wraplength=880, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+
+        # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
+        r2 = ttk.Frame(box)
+        r2.pack(fill="x", padx=8, pady=4)
+        ttk.Label(r2, text="处理：").pack(side="left")
+        to_pdf_var = self._wb_keep_var(tk.BooleanVar(value=bool(params.get("to_pdf"))))
+        wm_var = self._wb_keep_var(tk.BooleanVar(value=bool(params.get("watermark"))))
+        enc_var = self._wb_keep_var(tk.BooleanVar(value=bool(params.get("encrypt"))))
+        if kind == "generate":
+            ttk.Checkbutton(r2, text="转成 PDF", variable=to_pdf_var,
+                            command=lambda: self._wb_item_flag(item, "to_pdf", to_pdf_var)
+                            ).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r2, text="加水印", variable=wm_var,
+                        command=lambda: self._wb_item_flag(item, "watermark", wm_var)
+                        ).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r2, text="加密（AES-256）", variable=enc_var,
+                        command=lambda: self._wb_item_flag(item, "encrypt", enc_var)
+                        ).pack(side="left")
+        ToolTip(r2, "处理顺序固定，你不用排：转 PDF → 加水印 → 加密。\n"
+                   "加密只对 PDF 生效；打开口令取该收件人的打开口令。")
+
+        # --- 权限位（仅加密时出现）---
+        if params.get("encrypt"):
+            r3 = ttk.Frame(box)
+            r3.pack(fill="x", padx=8, pady=(0, 4))
+            ttk.Label(r3, text="权限：").pack(side="left")
+            perms = params.get("permissions")
+            perms = list(perms) if isinstance(perms, list) else list(lp_v3.DEFAULT_PERMISSIONS)
+            for pk in lp_v3.PERMISSIONS:
+                pv = self._wb_keep_var(tk.BooleanVar(value=pk in perms))
+                ttk.Checkbutton(r3, text=lp_v3.PERMISSION_LABELS.get(pk, pk),
+                                variable=pv,
+                                command=lambda k=pk, v=pv: self._wb_item_perm(item, k, v)
+                                ).pack(side="left", padx=(0, 10))
+            ttk.Label(r3, foreground="#888", text=(
+                "默认只允许打印。全部取消 = 收件人只能打开查看，不能打印/编辑/复制。")
+            ).pack(side="left")
+
+        # --- 产出粒度（条目级：这一条产出几份文件）---
+        r4 = ttk.Frame(box)
+        r4.pack(fill="x", padx=8, pady=4)
+        ttk.Label(r4, text="产出粒度（这一条产出几份文件）：").pack(side="left")
+        cur_gran = item.get("granularity") or "per_lp"
+        gran_var = self._wb_keep_var(tk.StringVar(value=GRANULARITY_LABELS.get(cur_gran, cur_gran)))
+        cb = ttk.Combobox(r4, textvariable=gran_var, state="readonly", width=16,
+                          values=[GRANULARITY_LABELS[g] for g in lp_v3.GRANULARITIES])
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>",
+                lambda _e: self._wb_set_item_gran(item, gran_var.get()))
+        ToolTip(cb, "\n".join("· %s：%s" % (GRANULARITY_LABELS[g],
+                                            lp_v3.GRANULARITY_DESC.get(g, ""))
+                              for g in lp_v3.GRANULARITIES)
+                   + "\n\n注意：事件里的「发送模式」决定几封邮件，这里决定这一条产出几份文件。")
+        ttk.Label(r4, foreground="#888",
+                  text=lp_v3.GRANULARITY_DESC.get(cur_gran, "")).pack(side="left", padx=8)
+
+        if kind == "generate":
+            mbox = ttk.LabelFrame(parent, text=" 字段映射（Word 占位符 → 数据来源） ",
+                                  style="Card.TLabelframe")
+            mbox.pack(fill="both", expand=True, pady=(0, 6))
+            self._wb_mapping_panel(mbox, item)
+
+    # ---------- 字段级来源（映射表）----------
+
+    def _wb_sheet_cols(self, item):
+        path = ((item.get("sheet") or {}).get("path") or "").strip()
+        if not path or not Path(path).exists():
+            return []
+        try:
+            rows = lp_v3.sheet_to_dicts(lp_v3.read_spreadsheet(path))
+        except Exception:
+            return []
+        return list(rows[0].keys()) if rows else []
+
+    def _wb_sheet_row(self, item, rec):
+        if not rec:
+            return None
+        try:
+            ctx = lp_v3.RunContext(self._wb_event, Path.cwd())
+            return ctx.sheet_for(item, rec)
+        except Exception:
+            return None
+
+    def _wb_field_source_options(self, item, rec0):
+        return lp_v3.field_source_options(self._wb_event, rec0,
+                                         self._wb_sheet_cols(item))
+
+    def _wb_src_label(self, src, opts):
+        if not src:
+            return "（未映射）"
+        for key, cat, label in opts:
+            if key == src:
+                return "%s：%s" % (cat, label)
+        return src
+
+    def _wb_mapping_panel(self, parent, item):
+        ev = self._wb_event
+        recips = ev.get("recipients") or []
+        rec0 = recips[0] if recips else {}
+        mapping = item.setdefault("mapping", {})
+        opts = self._wb_field_source_options(item, rec0)
+        sheet_row = self._wb_sheet_row(item, rec0)
+        rows = lp_v3.item_placeholders(item, ev, rec0, sheet_row)
+
+        if not mapping:
+            ttk.Label(parent, text=(
+                "还没有映射。点上面参数区的「检测占位符」自动读取模板里的占位符，"
+                "再逐个确认来源（双击表格行可改）。"),
+                style="Sub.TLabel").pack(anchor="w", padx=8, pady=6)
+
+        cols = ["ph", "src", "val"]
+        heads = ["Word 占位符", "填什么（数据来源）",
+                 "预览值（以「%s」为例）" % (rec0.get("name") or "第一位收件人")]
+        tree = ttk.Treeview(parent, columns=cols, show="headings", height=7,
+                            selectmode="extended")
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+        tree.column("ph", width=190)
+        tree.column("src", width=230)
+        tree.column("val", width=250)
+        tree.pack(fill="both", expand=True, padx=8, pady=4)
+        tree.bind("<Double-1>", lambda e, it=item: self._wb_edit_mapping(it))
+        self._wb_map_iids = {}
+        for i, (ph, src, val) in enumerate(rows):
+            iid = "m%d" % i
+            self._wb_map_iids[iid] = ph
+            tree.insert("", "end", iid=iid,
+                        values=(ph, self._wb_src_label(src, opts), val))
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(bar, text="＋ 添加映射行",
+                   command=lambda: self._wb_add_mapping(item)).pack(side="left")
+        ttk.Button(bar, text="删除选中",
+                   command=lambda: self._wb_del_mapping(item, tree)).pack(side="left", padx=4)
+        ttk.Label(bar, foreground="#888", text=(
+            "权限口令不是可映射的字段（架构上无法写进文档或邮件）。")
+        ).pack(side="left", padx=8)
+
+        # 外部数据表：只有在真的选了「外部数据表」来源时才出现
+        if any(str(v).startswith("sheet.") for v in mapping.values()):
+            sh = item.setdefault("sheet", {"path": "", "key_col": "", "match_col": "name"})
+            sbox = ttk.LabelFrame(parent, text=" 外部数据表 ", style="Card.TLabelframe")
+            sbox.pack(fill="x", padx=8, pady=(0, 4))
+            s1 = ttk.Frame(sbox)
+            s1.pack(fill="x", padx=8, pady=4)
+            ttk.Label(s1, text="数据表：").pack(side="left")
+            path_var = self._wb_keep_var(tk.StringVar(value=sh.get("path", "")))
+            ttk.Entry(s1, textvariable=path_var, width=44).pack(side="left", padx=4)
+            ttk.Button(s1, text="选择…", width=6,
+                       command=lambda: self._wb_pick_sheet(item)).pack(side="left")
+            ttk.Label(s1, text="   匹配列（表内）：").pack(side="left", padx=(10, 0))
+            key_var = self._wb_keep_var(tk.StringVar(value=sh.get("key_col", "")))
+            ttk.Entry(s1, textvariable=key_var, width=16).pack(side="left", padx=4)
+            ttk.Label(s1, text="   收件人匹配字段：").pack(side="left", padx=(10, 0))
+            match_var = self._wb_keep_var(tk.StringVar(value=sh.get("match_col", "name")))
+            ttk.Entry(s1, textvariable=match_var, width=16).pack(side="left", padx=4)
+            ttk.Label(s1, foreground="#888", text="（默认 name = 收件人名称）").pack(side="left", padx=6)
+            s2 = ttk.Frame(sbox)
+            s2.pack(fill="x", padx=8, pady=(0, 4))
+            ttk.Button(s2, text="保存数据表配置", width=14, command=lambda: self._wb_save_sheet_cfg(
+                item, path_var.get(), key_var.get(), match_var.get())).pack(side="left")
+            ttk.Button(s2, text="下载数据表模板", width=14,
+                       command=self._wb_export_sheet_template).pack(side="left", padx=4)
+            ttk.Button(s2, text="校验数据表", width=12,
+                       command=lambda: self._wb_check_sheet(item)).pack(side="left")
+            ttk.Label(s2, foreground="#666", text=(
+                "第一列默认当匹配列；导入时会校验「列是否存在 / key 是否重复 / "
+                "有多少收件人匹配不上」。")
+            ).pack(side="left", padx=8)
+
+    def _wb_add_mapping(self, item):
+        mapping = item.setdefault("mapping", {})
+        i = len(mapping) + 1
+        name = "{{字段%d}}" % i
+        while name in mapping:
+            i += 1
+            name = "{{字段%d}}" % i
+        mapping[name] = ""
+        self._wb_save()
+        self._wb_render_params(item)
+
+    def _wb_del_mapping(self, item, tree):
+        sel = list(tree.selection())
+        if not sel:
+            return
+        mapping = item.setdefault("mapping", {})
+        iids = getattr(self, "_wb_map_iids", {}) or {}
+        for iid in sel:
+            ph = iids.get(iid)
+            if ph:
+                mapping.pop(ph, None)
+        self._wb_save()
+        self._wb_render_params(item)
+
+    def _wb_edit_mapping(self, item):
+        ev = self._wb_event
+        recips = ev.get("recipients") or []
+        rec0 = recips[0] if recips else {}
+        mapping = item.setdefault("mapping", {})
+        if not mapping:
+            return
+        opts = self._wb_field_source_options(item, rec0)
+        src_keys = [k for k, _c, _l in opts]
+        src_labels = ["%s：%s" % (c, l) for _k, c, l in opts]
+
+        win = tk.Toplevel(self.root)
+        win.title("占位符来源")
+        win.grab_set()
+        ttk.Label(win, text="选择占位符，再选它的数据来源：", justify="left").pack(
+            anchor="w", padx=12, pady=(10, 4))
+        ph_var = tk.StringVar(value=list(mapping.keys())[0])
+        ph_box = ttk.Combobox(win, textvariable=ph_var, state="readonly", width=40)
+        ph_box.pack(anchor="w", padx=12)
+        ttk.Label(win, text="来源：", justify="left").pack(anchor="w", padx=12, pady=(10, 4))
+        cur = mapping.get(ph_var.get(), "")
+        idx = src_keys.index(cur) if cur in src_keys else 0
+        src_var = tk.StringVar(value=src_labels[idx] if src_labels else "")
+        src_box = ttk.Combobox(win, textvariable=src_var, state="readonly", width=40,
+                               values=src_labels)
+        src_box.pack(anchor="w", padx=12)
+        ttk.Label(win, foreground="#666", justify="left", wraplength=430, text=(
+            "· 收件人名称 / 水印名称 / 打开口令 / 日期 —— 内置\n"
+            "· 收件人字段 —— 收件人表里你自己加的列（可临时加列）\n"
+            "· 事件常量 —— 事件选项里定义的固定值\n"
+            "· 外部数据表 —— 从 Excel 按收件人匹配进来的列")
+        ).pack(anchor="w", padx=12, pady=(6, 0))
+
+        def ok():
+            sel = src_box.get()
+            key = ""
+            for i, s in enumerate(src_labels):
+                if s == sel:
+                    key = src_keys[i]
+                    break
+            mapping[ph_var.get()] = key
+            self._wb_save()
+            win.destroy()
+            self._wb_render_params(item)
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="确定", command=ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+
+    def _wb_guess_source(self, ph, ev, rec0, sheet_cols):
+        key = lp_v3.placeholder_key(ph)
+        for c in sheet_cols:
+            if c.lower() == key.lower():
+                return "sheet." + c
+        return lp_v3.auto_map_placeholder(ph, ev, rec0)
+
+    def _wb_detect_placeholders(self, item):
+        tpl = (item.get("params") or {}).get("template_path", "").strip()
+        if not tpl or not Path(tpl).exists():
+            messagebox.showwarning("检测占位符", "请先为这个条目选择有效的 .docx 模板")
+            return
+        try:
+            found = wm.detect_placeholders(tpl)
+        except Exception as e:
+            messagebox.showerror("检测失败", str(e))
+            return
+        if not found:
+            messagebox.showinfo("检测结果", "模板里没有检测到占位符。\n"
+                                "支持两种写法：{{字段}} 或 ?字段?")
+            return
+        ev = self._wb_event
+        recips = ev.get("recipients") or []
+        rec0 = recips[0] if recips else {}
+        sheet_cols = self._wb_sheet_cols(item)
+        mapping = item.setdefault("mapping", {})
+        added = 0
+        for ph in found:
+            if ph not in mapping:
+                mapping[ph] = self._wb_guess_source(ph, ev, rec0, sheet_cols)
+                added += 1
+        self._wb_save()
+        self._wb_render_params(item)
+        unresolved = [p for p, s in mapping.items() if not s]
+        msg = "检测到 %d 个占位符，新增 %d 个映射。\n" % (len(found), added)
+        if unresolved:
+            msg += ("\n以下占位符没有找到对应字段（预检会报错），请双击手动指定来源：\n"
+                    + "\n".join(unresolved[:10]))
+        messagebox.showinfo("检测结果", msg)
+
+    # ---------- 模板 / 文件选择 ----------
+
+    def _wb_pick_template(self, item, var):
+        path = filedialog.askopenfilename(title="选择 Word 模板",
+                                          filetypes=[("Word 文档", "*.docx;*.doc")])
+        if path:
+            var.set(path)
+            item.setdefault("params", {})["template_path"] = path
+            self._wb_save()
+            self._wb_render_params(item)
+
+    def _wb_attach_files_from_text(self, tw):
+        out = []
+        for line in tw.get("1.0", "end").splitlines():
+            s = line.strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    def _wb_write_attach_files(self, item, files, tw):
+        item.setdefault("params", {})["files"] = files
+        self._wb_save()
+        tw.delete("1.0", "end")
+        for p in files:
+            tw.insert("end", p + "\n")
+        self._wb_fill_pipe_table(keep_sel=item.get("id"))
+
+    def _wb_add_attach_files(self, item, tw):
+        paths = filedialog.askopenfilenames(title="选择要附加的文件")
+        if not paths:
+            return
+        cur = self._wb_attach_files_from_text(tw)
+        for p in paths:
+            if p not in cur:
+                cur.append(p)
+        self._wb_write_attach_files(item, cur, tw)
+
+    def _wb_save_attach_files(self, item, tw):
+        self._wb_write_attach_files(item, self._wb_attach_files_from_text(tw), tw)
+
+    def _wb_import_attach_paths(self, item, tw):
+        path = filedialog.askopenfilename(title="选择路径清单（Excel/CSV）",
+                                          filetypes=[("表格", "*.xlsx;*.csv"),
+                                                     ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            rows = lp_v3.read_spreadsheet(path)
+        except Exception as e:
+            messagebox.showerror("读取失败", str(e))
+            return
+        if not rows:
+            messagebox.showerror("读取失败", "文件里读不到任何行")
+            return
+        headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+        win = tk.Toplevel(self.root)
+        win.title("选择路径列")
+        win.grab_set()
+        ttk.Label(win, text="哪一列是文件路径？", justify="left").pack(
+            anchor="w", padx=12, pady=(10, 4))
+        var = tk.StringVar(value=headers[0] if headers else "")
+        ttk.Combobox(win, textvariable=var, state="readonly", width=36,
+                     values=[h for h in headers if h]).pack(anchor="w", padx=12)
+
+        def ok():
+            win.destroy()
+            col = var.get()
+            if not col or col not in headers:
+                return
+            ci = headers.index(col)
+            cur = self._wb_attach_files_from_text(tw)
+            added = 0
+            for r in rows[1:]:
+                if ci >= len(r):
+                    continue
+                for p in lp_v3.split_paths(str(r[ci] or "")):
+                    if p and p not in cur:
+                        cur.append(p)
+                        added += 1
+            self._wb_write_attach_files(item, cur, tw)
+            messagebox.showinfo("导入完成",
+                                "从「%s」的「%s」列导入 %d 条路径。"
+                                % (Path(path).name, col, added))
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="导入", command=ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+
+    # ---------- 外部数据表 ----------
+
+    def _wb_pick_sheet(self, item):
+        path = filedialog.askopenfilename(title="选择外部数据表",
+                                          filetypes=[("表格", "*.xlsx;*.csv"),
+                                                     ("所有文件", "*.*")])
+        if not path:
+            return
+        sh = item.setdefault("sheet", {"path": "", "key_col": "", "match_col": "name"})
+        sh["path"] = path
+        if not sh.get("key_col"):
+            try:
+                rows = lp_v3.read_spreadsheet(path)
+                if rows and rows[0]:
+                    sh["key_col"] = str(rows[0][0]).strip()
+            except Exception:
+                pass
+        self._wb_save()
+        self._wb_render_params(item)
+        self._wb_check_sheet(item)
+
+    def _wb_save_sheet_cfg(self, item, path, key_col, match_col):
+        sh = item.setdefault("sheet", {"path": "", "key_col": "", "match_col": "name"})
+        sh["path"] = path.strip()
+        sh["key_col"] = key_col.strip()
+        sh["match_col"] = match_col.strip() or "name"
+        self._wb_save()
+        self._wb_render_params(item)
+
+    def _wb_export_sheet_template(self):
+        headers = ["收件人名称", "Call_Amount", "Unfunded", "Due_Date"]
+        row = ["示例：苏州某某科技有限公司", "200,000", "800,000", "2026-11-15"]
+        guide = [
+            ["列名", "必填", "说明"],
+            ["第一列（示例为「收件人名称」）", "是",
+             "匹配列。必须能与收件人的名称完全对上（默认取收件人名称字段）"],
+            ["其它任意列", "否",
+             "数据列。在「字段映射」里把 Word 占位符指向这些列（来源选「外部数据表」）"],
+        ]
+        self._write_xlsx_sheets(
+            "外部数据表模板.xlsx",
+            [("数据表", [headers, row], [36, 16, 16, 16]),
+             ("填写说明", guide, [30, 8, 74])],
+            "模板已导出",
+            "数据表模板已导出。\n第一列必须与收件人名称能对上；\n"
+            "其余列会在字段映射的「外部数据表」来源里变成可选字段。")
+
+    def _wb_check_sheet(self, item):
+        sh = item.get("sheet") or {}
+        path = sh.get("path", "")
+        if not path:
+            return
+        try:
+            rows = lp_v3.read_spreadsheet(path)
+        except Exception as e:
+            messagebox.showerror("数据表读取失败", str(e))
+            return
+        if not rows:
+            messagebox.showerror("数据表校验", "文件是空的（读不到任何行）")
+            return
+        headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+        key_col = (sh.get("key_col") or (headers[0] if headers else "")).strip()
+        problems, warns = [], []
+        if key_col not in headers:
+            problems.append("匹配列「%s」不在表头里。表头是：%s"
+                            % (key_col, "、".join(h for h in headers if h)))
+            key_col = headers[0] if headers else ""
+        data = [r for r in rows[1:] if any(str(c).strip() for c in r if c is not None)]
+        if not data:
+            problems.append("表头下面没有数据行")
+        seen, dup = {}, []
+        for i, r in enumerate(data):
+            try:
+                v = str(r[headers.index(key_col)]).strip() if key_col in headers else ""
+            except Exception:
+                v = ""
+            if not v:
+                warns.append("第 %d 行没有填匹配列的值" % (i + 2))
+            elif v in seen:
+                dup.append(v)
+            else:
+                seen[v] = i + 2
+        if dup:
+            problems.append("匹配列有重复值：%s（前一个在第 %d 行）"
+                            % ("、".join(dup[:5]), seen.get(dup[0], 0)))
+        match_col = (sh.get("match_col") or "name").strip()
+        recips = (self._wb_event or {}).get("recipients") or []
+        unmatched = []
+        if recips and match_col == "name":
+            names = set(seen.keys())
+            for r in recips:
+                if r.get("name", "") not in names:
+                    unmatched.append(r.get("name", ""))
+        msg = "数据表：%s\n匹配列：%s\n数据行：%d" % (Path(path).name, key_col, len(data))
+        if recips and match_col == "name":
+            msg += "\n能匹配上的收件人：%d / %d" % (len(recips) - len(unmatched), len(recips))
+        if problems:
+            messagebox.showerror("数据表校验未通过",
+                                 msg + "\n\n" + "\n".join("✕ " + p for p in problems))
+            return
+        extra = []
+        if unmatched:
+            extra.append("有 %d 位收件人在数据表里找不到对应行（他们会拿不到这些字段）：\n%s"
+                         % (len(unmatched), "、".join(unmatched[:8])))
+        if warns:
+            extra.append("\n".join(warns[:5]))
+        if extra:
+            messagebox.showwarning("数据表校验通过（有问题需要注意）",
+                                   msg + "\n\n" + "\n\n".join(extra))
+        else:
+            messagebox.showinfo("数据表校验通过", msg + "\n\n没有问题。")
+
+    # ---------- 勾选项 / 粒度 ----------
+
+    def _wb_item_flag(self, item, key, var):
+        item.setdefault("params", {})[key] = bool(var.get())
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=item.get("id"))
+        self._wb_render_params(item)
+
+    def _wb_item_perm(self, item, pk, var):
+        params = item.setdefault("params", {})
+        perms = params.get("permissions")
+        perms = list(perms) if isinstance(perms, list) else list(lp_v3.DEFAULT_PERMISSIONS)
+        perms = [x for x in perms if x in lp_v3.PERMISSIONS]
+        if var.get():
+            if pk not in perms:
+                perms.append(pk)
+        else:
+            perms = [x for x in perms if x != pk]
+        params["permissions"] = perms
+        self._wb_save()
+        self._wb_render_params(item)
+
+    def _wb_set_item_gran(self, item, label):
+        for g, lab in GRANULARITY_LABELS.items():
+            if lab == label:
+                item["granularity"] = g
+                break
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=item.get("id"))
+        self._wb_render_params(item)
+
+    # ---------- 步骤 3：附件 ----------
+
+    def _wb_step_attachments(self, parent):
+        ev = self._wb_event
+        ttk.Label(parent, text="附件（快捷挂载）", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(parent, text=(
+            "不想走流水线时的快捷入口：直接把磁盘上的文件挂给收件人。\n"
+            "（要每人一份的内容，请用「文档流水线」里的「生成文档」条目）\n"
+            "静态文件按范围分配：全部收件人 / 指定收件人 / 按合并组。"),
+            style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(bar, text="添加附件", command=self._wb_add_attachment).pack(side="left")
+        ttk.Button(bar, text="删除选中", command=self._wb_del_attachment).pack(side="left", padx=4)
+        ttk.Button(bar, text="检查文件存在性", command=self._wb_check_attachments2
+                   ).pack(side="left")
+
+        cols = ["name", "path", "scope", "target", "ok", "go"]
+        heads = ["附件名", "路径", "范围", "目标", "状态", ""]
+        # 同上：Treeview 必须建在 frame 里，否则会被排到 frame 下面
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+            tree.column(c, width=200 if c == "path" else 110)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self._wb_att_tree = tree
+
+        for a in ev.get("attachments", []):
+            target = ""
+            if a.get("scope") == "specific":
+                target = "、".join(a.get("targets") or [])
+            elif a.get("scope") == "group":
+                target = a.get("group", "")
+            exists = "存在" if (a.get("path") and Path(a["path"]).exists()) else "文件不存在"
+            tree.insert("", "end", values=[
+                a.get("name", ""), a.get("path", ""),
+                {"all": "全部", "specific": "指定", "group": "按组"}.get(a.get("scope"), "全部"),
+                target or "—", exists, "›"])
+        ttk.Label(parent, foreground="#444", text=(
+            "流水线产出的文件（Word→PDF→水印→加密）自动进入对应收件人的附件包，"
+            "此处仅管理额外附加的静态文件。")).pack(fill="x", pady=(6, 0))
+
+    def _wb_add_attachment(self):
+        path = filedialog.askopenfilename(title="选择附件文件")
+        if not path:
+            return
+        name = simpledialog.askstring("添加附件", "附件显示名（可空=用文件名）：",
+                                      initialvalue=Path(path).name)
+        if name is None:
+            return
+        att = normalize_attachment({"name": name.strip() or Path(path).name,
+                                    "path": path, "scope": "all"})
+        self._wb_event.setdefault("attachments", []).append(att)
+        self._wb_save()
+        self._wb_show_step(self._wb_step)
+
+    def _wb_del_attachment(self):
+        tree = getattr(self, "_wb_att_tree", None)
+        ev = self._wb_event
+        sel = tree.selection() if tree else ()
+        if not sel:
+            return
+        for i in sorted((tree.index(s) for s in sel), reverse=True):
+            del ev["attachments"][i]
+        self._wb_save()
+        self._wb_show_step(self._wb_step)
+
+    def _wb_check_attachments2(self):
+        missing = [a.get("path", "") for a in self._wb_event.get("attachments", [])
+                   if not (a.get("path") and Path(a["path"]).exists())]
+        total = len(self._wb_event.get("attachments", []))
+        if not missing:
+            messagebox.showinfo("附件检查", "全部就绪：%d 个附件文件均存在。" % total)
+        else:
+            messagebox.showwarning("附件检查",
+                                   "%d/%d 个就绪，以下不存在：\n\n%s\n\n"
+                                   "缺失的附件在生成草稿时会被跳过并记入日志。"
+                                   % (total - len(missing), total,
+                                      "\n".join(missing[:15])))
+
+    # ---------- 步骤 4：邮件模板 ----------
+
+    def _wb_step_mail(self, parent):
+        ev = self._wb_event
+        mail = ev.setdefault("mail", {})
+        ttk.Label(parent, text="邮件模板", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(parent, text="与流水线字段共用同一套字段表。",
+                  style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+
+        top = ttk.Frame(parent)
+        top.pack(fill="x", pady=2)
+        ttk.Label(top, text="主题：").pack(side="left")
+        self.mail_subject_var = tk.StringVar(value=mail.get("subject", ""))
+        ttk.Entry(top, textvariable=self.mail_subject_var, width=70).pack(side="left", padx=4)
+
+        row2 = ttk.Frame(parent)
+        row2.pack(fill="x", pady=2)
+        ttk.Label(row2, text="代发地址：").pack(side="left")
+        self.mail_from_var = tk.StringVar(value=mail.get("from_addr", ""))
+        ttk.Entry(row2, textvariable=self.mail_from_var, width=34).pack(side="left", padx=4)
+        ttk.Label(row2, text="默认抄送：").pack(side="left", padx=(10, 0))
+        self.mail_cc_var = tk.StringVar(value=mail.get("cc_default", ""))
+        ttk.Entry(row2, textvariable=self.mail_cc_var, width=26).pack(side="left", padx=4)
+        ttk.Label(row2, text="默认密送：").pack(side="left", padx=(10, 0))
+        self.mail_bcc_var = tk.StringVar(value=mail.get("bcc_default", ""))
+        ttk.Entry(row2, textvariable=self.mail_bcc_var, width=26).pack(side="left", padx=4)
+
+        self._build_editor_toolbar(parent)
+
+        bot = ttk.Frame(parent)
+        bot.pack(side="bottom", fill="x", pady=4)
+        ttk.Button(bot, text="保存模板", command=self._wb_save_mail).pack(side="left")
+        ttk.Button(bot, text="导入HTML文件…", command=self._wb_import_html).pack(side="left", padx=6)
+        ttk.Button(bot, text="恢复默认", command=self._wb_reset_mail).pack(side="left")
+        ttk.Button(bot, text="刷新预览", command=self._wb_refresh_preview).pack(side="left", padx=6)
         ttk.Label(bot, foreground="#888", text=(
-            "Word/网页复制后 Ctrl+V 自动保留样式　|　"
-            "字段：{{LP名称}} {{水印名称}} {{打开口令}} {{日期}}（无权限口令字段）"
-        )).pack(side="left", padx=8)
+            "可用字段：收件人名称 / 水印名称 / 打开口令 / 日期"
+            " + 收件人自定义字段 + 事件常量（无权限口令字段）")).pack(side="left", padx=8)
 
-        # 可拖动左右分栏：中缝分隔条可拉动，预览按新宽度重渲染
-        pw = ttk.PanedWindow(f, orient="horizontal")
-        pw.pack(fill="both", expand=True, padx=8, pady=4)
-
-        pvpane = tk.Frame(pw, width=350, background="#ffffff")
-        pvpane.pack_propagate(False)  # 初始宽度
+        pw = ttk.PanedWindow(parent, orient="horizontal")
+        pw.pack(fill="both", expand=True, pady=4)
+        pvpane = tk.Frame(pw, width=340, background="#ffffff")
+        pvpane.pack_propagate(False)
         ttk.Label(pvpane, text="预览（近似渲染，可拖中缝调整）", foreground="#666",
                   background="#ffffff").pack(anchor="w", padx=4, pady=2)
         self.preview_label = tk.Label(pvpane, anchor="nw", background="#ffffff")
@@ -1486,18 +3113,428 @@ class App:
         t.configure(yscrollcommand=sb.set)
         t.bind("<<Paste>>", self._ed_rich_paste)
         t.bind("<KeyRelease>", self._ed_on_key)
-
         pw.add(editpane, weight=1)
         pw.add(pvpane, weight=0)
-        pw.bind("<ButtonRelease-1>", lambda _e: self.refresh_preview())  # 拖完中缝重渲染
+        pw.bind("<ButtonRelease-1>", lambda _e: self._wb_refresh_preview())
 
-        load_html(t, self.data.get("body", DEFAULT_BODY))
+        load_html(t, mail.get("body", "") or DEFAULT_BODY)
+        if not mail.get("subject"):
+            self.mail_subject_var.set(DEFAULT_SUBJECT)
+        self._wb_refresh_preview()
 
-    # ----- 内嵌富文本编辑器 -----
+    def _wb_collect_mail(self):
+        body = (text_to_html(self.body_text)
+                if getattr(self, "body_text", None) is not None
+                else (self._wb_event.get("mail") or {}).get("body", DEFAULT_BODY))
+        return (self.mail_subject_var.get().strip(), body)
+
+    def _wb_save_mail(self):
+        mail = self._wb_event.setdefault("mail", {})
+        mail["subject"], mail["body"] = self._wb_collect_mail()
+        mail["from_addr"] = self.mail_from_var.get().strip()
+        mail["cc_default"] = self.mail_cc_var.get().strip()
+        mail["bcc_default"] = self.mail_bcc_var.get().strip()
+        self._wb_save()
+        self._wb_refresh_preview()
+        messagebox.showinfo("模板", "已保存")
+
+    def _wb_reset_mail(self):
+        if not messagebox.askyesno("恢复默认", "确定覆盖当前主题与正文模板？"):
+            return
+        mail = self._wb_event.setdefault("mail", {})
+        mail["subject"] = DEFAULT_SUBJECT
+        mail["body"] = DEFAULT_BODY
+        self.mail_subject_var.set(DEFAULT_SUBJECT)
+        if getattr(self, "body_text", None) is not None:
+            load_html(self.body_text, DEFAULT_BODY)
+        self._wb_save()
+        self._wb_refresh_preview()
+
+    def _wb_import_html(self):
+        path = filedialog.askopenfilename(title="导入正文 HTML",
+                                          filetypes=[("HTML/文本", "*.html;*.htm;*.txt")])
+        if not path:
+            return
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raw = Path(path).read_text(encoding="gbk", errors="ignore")
+        m = re.search(r"<body[^>]*>(.*)</body>", raw, re.S | re.I)
+        body = m.group(1).strip() if m else raw.strip()
+        if not body:
+            messagebox.showwarning("导入", "文件内容为空")
+            return
+        load_html(self.body_text, body)
+        mail = self._wb_event.setdefault("mail", {})
+        mail["body"] = text_to_html(self.body_text)
+        self._wb_save()
+        self._wb_refresh_preview()
+        messagebox.showinfo("导入完成", "已导入并保存为当前模板。")
+
+    def _wb_refresh_preview(self):
+        try:
+            import io
+            from PIL import Image, ImageTk
+            recips = self._wb_event.get("recipients", [])
+            rec = recips[0] if recips else {
+                "name": "【示例收件人名称】", "wm": "【示例水印名称】", "open_pw": "【示例口令】"}
+            subject, body = self._wb_collect_mail()
+            html = ('<div style="font-family:sans-serif;">'
+                    '<p><b>标题：</b>%s</p><hr>%s</div>'
+                    % (_htmlmod.escape(subject), body))
+            png = render_preview_pixmap(html)
+            img = Image.open(io.BytesIO(png))
+            w = max(self.preview_label.winfo_width(), 200) - 4
+            if w > 20 and img.width > w:
+                img = img.resize((w, int(img.height * w / img.width)))
+            self._preview_img = ImageTk.PhotoImage(img)
+            self.preview_label.configure(image=self._preview_img, text="")
+            self.preview_label.image = self._preview_img
+        except Exception as e:
+            self.preview_label.configure(
+                image="", text="预览渲染失败：%s\n（可点「刷新预览」重试）" % e)
+
+    # ---------- 步骤 5：总览（生成前核对） ----------
+
+    def _wb_step_overview(self, parent):
+        ev = self._wb_event
+        ttk.Label(parent, text="总览", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(parent, text=(
+            "生成前在这里核对：每位收件人（或每个合并组）最终会收到哪些文件、邮件长什么样。"),
+            style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+
+        errors, warnings, info = lp_v3.preflight(ev, self.store)
+        head = ttk.Frame(parent)
+        head.pack(fill="x", pady=(0, 4))
+        for label, value in (("收件人", info["recipients"]),
+                             ("发送模式", lp_v3.SEND_MODE_LABELS.get(
+                                 lp_v3.send_mode_of(ev), "")),
+                             ("流水线条目", info["steps"]),
+                             ("待生成草稿", info["drafts"])):
+            cell = ttk.Frame(head)
+            cell.pack(side="left", padx=(0, 24))
+            ttk.Label(cell, text=label, foreground="#666").pack(anchor="w")
+            ttk.Label(cell, text=str(value), font=("", 13, "bold")).pack(anchor="w")
+        if errors:
+            ttk.Label(head, text="预检未通过：%d 个问题（见「预览与生成」）" % len(errors),
+                      foreground="#b00").pack(side="right")
+        elif warnings:
+            ttk.Label(head, text="预检通过，有 %d 条提醒" % len(warnings),
+                      foreground="#a60").pack(side="right")
+        else:
+            ttk.Label(head, text="预检通过", foreground="#0a0").pack(side="right")
+
+        pw = ttk.PanedWindow(parent, orient="horizontal")
+        pw.pack(fill="both", expand=True, pady=(4, 0))
+        leftpane = ttk.Frame(pw)
+        pw.add(leftpane, weight=1)
+        rightpane = ttk.Frame(pw)
+        pw.add(rightpane, weight=0)
+
+        ttk.Label(leftpane, text="每位收件人 / 合并组最终会收到：",
+                  style="Sub.TLabel").pack(anchor="w")
+        cols = ["who", "files", "count", "pw"]
+        heads = ["收件人 / 合并组", "附件包（文件名）", "件数", "打开口令"]
+        tree = ttk.Treeview(leftpane, columns=cols, show="headings", height=12,
+                            selectmode="browse")
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+        tree.column("who", width=150)
+        tree.column("files", width=380)
+        tree.column("count", width=50, stretch=False, anchor="center")
+        tree.column("pw", width=110, stretch=False)
+        tree.pack(fill="both", expand=True, pady=(2, 0))
+
+        plan = lp_v3.preview_plan(ev)
+        recips = dict((r.get("name", ""), r) for r in ev.get("recipients") or [])
+        self._wb_ov_rows = []
+        self._wb_ov_iids = {}
+        for i, (key, unit, names) in enumerate(plan):
+            rep = unit.get("rep") or {}
+            rec = recips.get(rep.get("name", ""), {})
+            who = unit.get("group") or rep.get("name", key)
+            iid = "ov%d" % i
+            self._wb_ov_rows.append((key, unit, names))
+            self._wb_ov_iids[iid] = i
+            tree.insert("", "end", iid=iid, values=(
+                who, " + ".join(names) if names else "（无附件）",
+                str(len(names)), rec.get("open_pw", "")))
+        if not plan:
+            ttk.Label(leftpane, text="还没有收件人或没有条目，先去前几步配置。",
+                      style="Sub.TLabel").pack(anchor="w", pady=6)
+        tree.bind("<<TreeviewSelect>>", lambda e: self._wb_overview_show(tree))
+        if self._wb_ov_iids:
+            tree.selection_set(sorted(self._wb_ov_iids.keys(),
+                                      key=lambda x: int(x[2:]))[0])
+
+        ttk.Label(rightpane, text="邮件预览（按左侧选中行）：",
+                  style="Sub.TLabel").pack(anchor="w")
+        self._wb_ov_subject = tk.Label(rightpane, anchor="w", justify="left",
+                                       wraplength=440, background="#ffffff")
+        self._wb_ov_subject.pack(fill="x", pady=(2, 2))
+        self._wb_ov_body = tk.Label(rightpane, anchor="nw", justify="left",
+                                    background="#ffffff")
+        self._wb_ov_body.pack(fill="both", expand=True)
+        # 完整附件清单（表格列宽有限会截断，这里给全名）
+        self._wb_ov_files = tk.Text(rightpane, height=7, state="disabled",
+                                    font=("Consolas", 9), background="#fafafa",
+                                    wrap="word")
+        self._wb_ov_files.pack(fill="x", pady=(6, 0))
+        self._wb_overview_show(tree)
+
+    def _wb_overview_show(self, tree):
+        sel = tree.selection()
+        if not sel:
+            return
+        idx = getattr(self, "_wb_ov_iids", {}).get(sel[0])
+        rows = getattr(self, "_wb_ov_rows", [])
+        if idx is None or idx >= len(rows):
+            return
+        _key, unit, names = rows[idx]
+        ev = self._wb_event
+        mail = ev.get("mail") or {}
+        subject_tpl = mail.get("subject") or DEFAULT_SUBJECT
+        body_tpl = mail.get("body") or DEFAULT_BODY
+        rep = unit.get("rep") or {}
+        fmap = lp_v3.build_field_map(rep, ev)
+        owner_pw = rep.get("owner_pw", "")
+        subject = lp_v3.render_with_fields(subject_tpl, fmap, owner_pw)
+        body = lp_v3.render_with_fields(body_tpl, fmap, owner_pw, escape=True)
+        self._wb_ov_subject.configure(text="主题：" + subject)
+        try:
+            import io
+            from PIL import Image, ImageTk
+            html = ('<div style="font-family:sans-serif;">%s</div>' % body)
+            png = render_preview_pixmap(html)
+            img = Image.open(io.BytesIO(png))
+            w = max(self._wb_ov_body.winfo_width(), 220) - 4
+            if w > 20 and img.width > w:
+                img = img.resize((w, int(img.height * w / img.width)))
+            self._wb_ov_img = ImageTk.PhotoImage(img)
+            self._wb_ov_body.configure(image=self._wb_ov_img, text="")
+            self._wb_ov_body.image = self._wb_ov_img
+        except Exception as e:
+            self._wb_ov_body.configure(image="", text=body)
+        who = unit.get("group") or rep.get("name", "")
+        self._wb_ov_subject.configure(
+            text="【%s】主题：%s" % (who, subject))
+        # 完整附件清单
+        try:
+            box = self._wb_ov_files
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            if names:
+                for n in names:
+                    box.insert("end", "· " + n + "\n")
+            else:
+                box.insert("end", "（这位收件人没有附件）\n")
+            box.configure(state="disabled")
+        except Exception:
+            pass
+
+    # ---------- 步骤 6：预览与生成 ----------
+
+    def _wb_step_run(self, parent):
+        ev = self._wb_event
+        ttk.Label(parent, text="预览与生成", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(parent, text="预检通过后一键生成全部 Outlook 草稿（只建草稿，不发送）。",
+                  style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+
+        # --- 预检结果 ---
+        pf = ttk.LabelFrame(parent, text=" 预检结果 ", style="Card.TLabelframe")
+        pf.pack(fill="x", pady=(0, 4))
+        errors, warnings, info = lp_v3.preflight(ev, self.store)
+        stats = ttk.Frame(pf)
+        stats.pack(fill="x", padx=8, pady=4)
+        for label, value in (("收件人", info["recipients"]), ("流水线条目", info["steps"]),
+                              ("附件", info["attachments"]), ("待生成草稿", info["drafts"])):
+            cell = ttk.Frame(stats)
+            cell.pack(side="left", padx=(0, 24))
+            ttk.Label(cell, text=label, foreground="#666").pack(anchor="w")
+            ttk.Label(cell, text=str(value), font=("", 13, "bold")).pack(anchor="w")
+        tags = ttk.Frame(pf)
+        tags.pack(fill="x", padx=8, pady=(0, 6))
+        if errors:
+            ttk.Label(tags, text="预检未通过：%d 个问题" % len(errors),
+                      foreground="#b00").pack(anchor="w")
+            txt = tk.Text(pf, height=min(8, max(3, len(errors) + len(warnings))),
+                          width=100, state="disabled", font=("Consolas", 9),
+                          background="#fafafa")
+            txt.pack(fill="x", padx=8, pady=(0, 6))
+            txt.configure(state="normal")
+            for e in errors:
+                txt.insert("end", "[错误] " + e + "\n")
+            for w in warnings:
+                txt.insert("end", "[提醒] " + w + "\n")
+            txt.configure(state="disabled")
+        else:
+            ttk.Label(tags, text="预检通过", foreground="#0a0").pack(anchor="w")
+            for w in warnings[:6]:
+                ttk.Label(tags, text="· " + w, foreground="#a60").pack(anchor="w")
+            if len(warnings) > 6:
+                ttk.Label(tags, text="…还有 %d 条提醒" % (len(warnings) - 6),
+                          foreground="#a60").pack(anchor="w")
+
+        # --- 产出清单预览 ---
+        pl = ttk.LabelFrame(parent, text=" 产出清单预览 ", style="Card.TLabelframe")
+        pl.pack(fill="both", expand=True, pady=(0, 4))
+        cols = ["name", "files", "group", "pw", "state"]
+        heads = ["收件人 / 合并组", "邮件附件包", "合并组", "打开口令", "状态"]
+        tree = ttk.Treeview(pl, columns=cols, show="headings", height=8)
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+        tree.column("name", width=180)
+        tree.column("files", width=380)
+        tree.column("group", width=90)
+        tree.column("pw", width=100)
+        tree.column("state", width=90)
+        tree.pack(fill="both", expand=True, padx=8, pady=4)
+        plan = lp_v3.preview_plan(ev)
+        recips = {r.get("name", ""): r for r in ev.get("recipients", [])}
+        for key, unit, names in plan:
+            rep = unit.get("rep") or {}
+            rec = recips.get(rep.get("name", ""), {})
+            tree.insert("", "end", values=[
+                unit.get("group") or rep.get("name", key),
+                " + ".join(names),
+                unit.get("group", "") or "—",
+                rec.get("open_pw", ""),
+                "待生成"])
+
+        # --- 执行日志 ---
+        logf = ttk.LabelFrame(parent, text=" 执行日志 ", style="Card.TLabelframe")
+        logf.pack(fill="both", expand=True, pady=(0, 4))
+        self._wb_log_text = tk.Text(logf, height=8, state="disabled",
+                                    font=("Consolas", 9), background="#fafafa")
+        self._wb_log_text.pack(fill="both", expand=True, padx=8, pady=4)
+        for line in (self._wb_last_run or {}).get("logs", [])[-40:]:
+            self._wb_log_text.configure(state="normal")
+            self._wb_log_text.insert("end", line + "\n")
+            self._wb_log_text.configure(state="disabled")
+
+    # ---------- 底栏动作 ----------
+
+    def _wb_preflight(self):
+        ev = self._wb_event
+        if not ev:
+            return
+        errors, warnings, info = lp_v3.preflight(ev, self.store)
+        if errors:
+            messagebox.showerror("预检未通过",
+                                 "以下问题必须先修正：\n\n"
+                                 + "\n".join("· " + e for e in errors[:15])
+                                 + ("\n…" if len(errors) > 15 else ""))
+            return
+        msg = "预检通过。\n\n收件人 %d 位 · 流水线 %d 个条目 · 附件 %d 个 · 待生成草稿 %d 封"
+        msg = msg % (info["recipients"], info["steps"], info["attachments"], info["drafts"])
+        if warnings:
+            msg += "\n\n提醒：\n" + "\n".join("· " + w for w in warnings[:8])
+        messagebox.showinfo("预检结果", msg)
+
+    def _wb_generate(self):
+        self._wb_run(None)
+
+    def _wb_rerun_failed(self):
+        run = self.store.load_last_run(self._wb_event.get("id"))
+        if not run:
+            messagebox.showinfo("重跑", "这个事件还没有执行记录，没有可重跑的失败项。")
+            return
+        names = lp_v3.failed_recipients(run)
+        if not names:
+            messagebox.showinfo("重跑", "上次执行没有失败项。")
+            return
+        if not messagebox.askyesno(
+                "只重跑失败项",
+                "上次执行有 %d 位收件人失败：\n\n%s\n\n只重跑这些收件人？"
+                % (len(names), "\n".join(sorted(names)[:10]))):
+            return
+        self._wb_run(names)
+
+    def _wb_run(self, only_recips):
+        """后台线程执行事件；结果回主线程刷新。"""
+        if self.running:
+            messagebox.showinfo("正在执行", "上一次执行还没结束，请等它完成。")
+            return
+        ev = self._wb_event
+        errors, _warnings, _info = lp_v3.preflight(ev, self.store)
+        if errors:
+            messagebox.showerror("预检未通过",
+                                 "以下问题必须先修正：\n\n"
+                                 + "\n".join("· " + e for e in errors[:15]))
+            return
+        if not messagebox.askyesno(
+                "确认生成",
+                "即将为「%s」生成全部文件与 Outlook 草稿。\n\n"
+                "草稿只写入草稿箱，**不会发送**。\n\n开始？" % ev.get("name", "")):
+            return
+        self.running = True
+        self._cancel = threading.Event()
+        self._wb_set_running(True)
+        self.wb_progress.configure(value=0)
+        self.wb_status.configure(text="正在执行…")
+        if getattr(self, "_wb_log_text", None) is not None:
+            self._wb_log_text.configure(state="normal")
+            self._wb_log_text.delete("1.0", "end")
+            self._wb_log_text.configure(state="disabled")
+
+        def job(get_word):
+            run = lp_v3.run_event(self.store, ev, only_recips=only_recips,
+                                  log=lambda m: self._q.put(("log", m)),
+                                  progress=lambda p: self._q.put(("prog", p)),
+                                  word=get_word())
+            self._q.put(("run_done", run))
+
+        self._submit_job(job)
+
+    # ---------------- 常驻工作线程 ----------------
+    # 为什么要常驻：WordBatch 用 DispatchEx 起**私有** Word 进程，而 close() 只
+    # 释放引用、不调 Quit（Quit 后再释放 COM 引用会触发 0x800706be 致命异常，
+    # 直接杀进程）。所以「每次生成开一个新线程 + 新建 WordBatch」会让
+    # WINWORD.EXE 越堆越多（每个约 170MB），实测能堆到 71 个把机器拖垮。
+    # 改成常驻线程复用同一个 Word 实例后，整个 App 生命周期只留 1 个 Word 进程。
+
+    def _submit_job(self, fn):
+        """把任务丢给常驻工作线程（第一次调用时启动线程）。"""
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(target=self._worker_loop,
+                                                    daemon=True)
+            self._worker_thread.start()
+        self._jobs.put(fn)
+
+    def _worker_loop(self):
+        import pythoncom
+        pythoncom.CoInitialize()
+        word_box = [None]
+
+        def get_word():
+            # 在工作线程里创建（COM 对象不能跨线程用）
+            if word_box[0] is None:
+                word_box[0] = wm.WordBatch()
+            return word_box[0]
+
+        try:
+            while True:
+                fn = self._jobs.get()
+                if fn is None:
+                    break
+                try:
+                    fn(get_word)
+                except Exception as e:
+                    self._q.put(("log", "[致命错误] %s" % e))
+                    self._q.put(("run_done", None))
+                finally:
+                    self._q.put(("done", None))
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    # ================= 富文本编辑器（复用 v2 实现） =================
 
     def _build_editor_toolbar(self, parent):
         bar = ttk.Frame(parent)
-        bar.pack(fill="x", padx=8, pady=(6, 2))
+        bar.pack(fill="x", pady=(4, 2))
         for label, opt in [("B", "b"), ("I", "i"), ("U", "u")]:
             tk.Button(bar, text=label, width=3,
                       font=("", 10, "bold" if opt == "b" else "normal"),
@@ -1508,12 +3545,9 @@ class App:
                                      values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24)])
         self._ed_size.set("14")
         self._ed_size.pack(side="left", padx=2)
-
-        def set_size(_e=None):
-            self._ed_restyle(s=int(self._ed_size.get()))
-
-        self._ed_size.bind("<Return>", set_size)
-        ttk.Button(bar, text="设定", width=4, command=set_size).pack(side="left", padx=1)
+        self._ed_size.bind("<Return>", lambda _e: self._ed_restyle(s=int(self._ed_size.get())))
+        ttk.Button(bar, text="设定", width=4,
+                   command=lambda: self._ed_restyle(s=int(self._ed_size.get()))).pack(side="left", padx=1)
         ttk.Button(bar, text="文字色", width=6, command=self._ed_pick_fg).pack(side="left", padx=2)
         ttk.Button(bar, text="高亮", width=5, command=self._ed_pick_bg).pack(side="left", padx=1)
         ttk.Button(bar, text="居中", width=4,
@@ -1526,8 +3560,15 @@ class App:
         flds = ttk.Menubutton(bar, text="插入字段 ▾")
         m = tk.Menu(flds, tearoff=0)
         for fld in FIELDS:
-            m.add_command(label=fld,
-                          command=lambda x=fld: self.body_text.insert("insert", x))
+            m.add_command(label=fld, command=lambda x=fld: self.body_text.insert("insert", x))
+        for fld in self._wb_field_columns():
+            ph = "{{%s}}" % fld
+            m.add_command(label=ph, command=lambda x=ph: self.body_text.insert("insert", x))
+        consts = ((self._wb_event or {}).get("options") or {}).get("constants") or {}
+        for fld in consts:
+            ph = "{{%s}}" % fld
+            m.add_command(label=ph + "（常量）",
+                          command=lambda x=ph: self.body_text.insert("insert", x))
         flds["menu"] = m
         flds.pack(side="left", padx=2)
 
@@ -1565,8 +3606,8 @@ class App:
         sel = self._ed_need_sel()
         if not sel:
             return
-        a = t.index(f"{sel[0]} linestart")
-        b = t.index(f"{sel[1]} lineend")
+        a = t.index("%s linestart" % sel[0])
+        b = t.index("%s lineend" % sel[1])
         for k, st in list(_TAG_STYLE.items()):
             if st.get("al"):
                 t.tag_remove(k, a, b)
@@ -1597,317 +3638,16 @@ class App:
         t.insert(pos, text)
         for a, b, st in runs:
             if a < b:
-                t.tag_add(_ensure_tag(t, st), f"{pos}+{a}c", f"{pos}+{b}c")
+                t.tag_add(_ensure_tag(t, st), "%s+%dc" % (pos, a), "%s+%dc" % (pos, b))
         self._ed_on_key()
         return "break"
 
     def _ed_on_key(self, _e=None):
         if getattr(self, "_ed_after", None):
             self.root.after_cancel(self._ed_after)
-        self._ed_after = self.root.after(1200, self.refresh_preview)
+        self._ed_after = self.root.after(1200, self._wb_refresh_preview)
 
-    def import_html(self):
-        path = filedialog.askopenfilename(title="导入正文 HTML",
-                                          filetypes=[("HTML/文本", "*.html;*.htm;*.txt")])
-        if not path:
-            return
-        try:
-            raw = Path(path).read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            raw = Path(path).read_text(encoding="gbk", errors="ignore")
-        m = re.search(r"<body[^>]*>(.*)</body>", raw, re.S | re.I)
-        body = m.group(1).strip() if m else raw.strip()
-        if not body:
-            messagebox.showwarning("导入", "文件内容为空")
-            return
-        load_html(self.body_text, body)
-        self.data["body"] = text_to_html(self.body_text)
-        self.save_data()
-        self.refresh_preview()
-        messagebox.showinfo("导入完成", "已导入并保存为当前模板。")
-
-    def collect_template(self):
-        body = (text_to_html(self.body_text)
-                if getattr(self, "body_text", None) is not None
-                else self.data.get("body", DEFAULT_BODY))
-        return self.subject_var.get().strip(), body
-
-    def save_template(self):
-        self.data["subject"], self.data["body"] = self.collect_template()
-        self.save_data()
-        self.refresh_preview()
-        messagebox.showinfo("模板", "已保存")
-
-    def reset_template(self):
-        if not messagebox.askyesno("恢复默认", "确定覆盖当前标题与正文模板？"):
-            return
-        self.subject_var.set(DEFAULT_SUBJECT)
-        if getattr(self, "body_text", None) is not None:
-            load_html(self.body_text, DEFAULT_BODY)
-        self.data["subject"] = DEFAULT_SUBJECT
-        self.data["body"] = DEFAULT_BODY
-        self.save_data()
-        self.refresh_preview()
-
-    def refresh_preview(self):
-        try:
-            import io
-            from PIL import Image, ImageTk
-            idx = self.selected_index()
-            rec = self.data["lps"][idx] if idx is not None and self.data["lps"] else {
-                "name": "【示例收件人名称】", "wm": "【示例水印名称】", "open_pw": "【示例口令】"}
-            subject, body = self.collect_template()
-            html = (f'<div style="font-family:sans-serif;">'
-                    f'<p><b>标题：</b>{render_template(subject, rec)}</p><hr>'
-                    f'{render_template(body, rec)}</div>')
-            png = render_preview_pixmap(html)
-            img = Image.open(io.BytesIO(png))
-            w = max(self.preview_label.winfo_width(), 200) - 4
-            if w > 20 and img.width > w:
-                h = int(img.height * w / img.width)
-                img = img.resize((w, h))
-            self._preview_img = ImageTk.PhotoImage(img)
-            self.preview_label.configure(image=self._preview_img, text="")
-            self.preview_label.image = self._preview_img
-        except Exception as e:
-            self.preview_label.configure(
-                image="", text=f"预览渲染失败：{e}\n（可点「刷新预览」重试）")
-
-
-    # ----- Tab3: 生成 -----
-
-    def build_tab_run(self):
-        f = self.tab_run
-        self._guide(f, "操作步骤：1.「添加原件PDF」（可多选，用未打水印的原件）→ 2. 需要时点「水印设置…」"
-                      "调整并预览 → 3. 点「生成加密文件 + Outlook草稿」（或先「仅生成加密文件」）→ "
-                      "4. 到 Outlook 草稿箱逐封复核，人工发送。\n"
-                      "每个收件人生成一份独立文件（文件名模板可自定义）+ 一封草稿；下方日志逐条显示结果。")
-        top = ttk.Frame(f)
-        top.pack(fill="x", padx=8, pady=6)
-        b_add = ttk.Button(top, text="添加原件PDF", command=self.add_pdf)
-        b_add.pack(side="left")
-        ToolTip(b_add, "选择要分发的原始 PDF（未打水印的版本），可一次多选。")
-        b_rm = ttk.Button(top, text="移除选中", command=self.remove_pdf)
-        b_rm.pack(side="left", padx=4)
-        ToolTip(b_rm, "从左侧列表移除选中的原件。")
-        ttk.Label(top, text="    输出目录：").pack(side="left")
-        # 默认输出到当前用户「文档\LP分发输出」，不暴露程序所在路径；记住上次选择
-        self.outdir_var = tk.StringVar(
-            value=self.data.get("outdir")
-            or str(Path.home() / "Documents" / "LP分发输出"))
-        e_dir = ttk.Entry(top, textvariable=self.outdir_var, width=50)
-        e_dir.pack(side="left", padx=4)
-        ToolTip(e_dir, "默认：文档\\LP分发输出（跟随当前用户）。\n可点「浏览」更改，"
-                       "上次使用的目录会被记住。")
-        b_dir = ttk.Button(top, text="浏览", command=self.browse_outdir)
-        b_dir.pack(side="left")
-        ToolTip(b_dir, "选择输出目录（存放生成的加密文件）。")
-
-        self.pdf_list = tk.Listbox(f, height=5)
-        self.pdf_list.pack(fill="x", padx=8, pady=4)
-
-        opt = ttk.Frame(f)
-        opt.pack(fill="x", padx=8, pady=2)
-        b_wm = ttk.Button(opt, text="水印设置…", command=self.open_wm_settings)
-        b_wm.pack(side="left")
-        ToolTip(b_wm, "布局/字体/字号/颜色/角度/份数均可调，弹窗内即时预览。设置对所有 LP 生效，"
-                      "水印文字本身取每个收件人的「水印名称」。")
-        self.wm_summary = ttk.Label(opt, text="")
-        self.wm_summary.pack(side="left", padx=10)
-        ToolTip(self.wm_summary, "当前水印参数摘要，点「水印设置…」修改。")
-        ttk.Label(opt, foreground="#888",
-                  text="水印文字 = 每个收件人的「水印名称」列").pack(side="left")
-
-        frow = ttk.Frame(f)
-        frow.pack(fill="x", padx=8, pady=2)
-        ttk.Label(frow, text="文件名模板：").pack(side="left")
-        self.fname_var = tk.StringVar(
-            value=self.data.get("filename_tpl") or DEFAULT_FILENAME_TPL)
-        e_fn = ttk.Entry(frow, textvariable=self.fname_var, width=46)
-        e_fn.pack(side="left", padx=4)
-        ToolTip(e_fn, "输出文件名模板，自动补 .pdf 扩展名。\n"
-                      "可用字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}\n"
-                      "例如：{{原件名}}_{{LP名称}}_{{日期}}\n"
-                      "留空恢复默认：{{原件名}}_{{LP名称}}")
-        ttk.Label(frow, foreground="#888",
-                  text="字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}").pack(side="left", padx=4)
-        grow = ttk.Frame(f)
-        grow.pack(fill="x", padx=8, pady=2)
-        self.gp_mode = tk.BooleanVar(value=bool(self.data.get("gp_owner_mode")))
-        cb = ttk.Checkbutton(grow, text="GP统一权限口令", variable=self.gp_mode)
-        cb.pack(side="left")
-        ToolTip(cb, "开启后：所有文件的权限口令统一用下面这一个（即 owner 口令，打开即解除"
-                      "全部限制）；各 LP 仍用自己的打开口令（受限查看/打印）。\n"
-                      "适合 GP/内部一个口令打开任何一份文件。注意：该口令若泄露，"
-                      "全部文件的限制都可被解除——仅限内部留存，绝不进入邮件。")
-        self.gp_pw_var = tk.StringVar(value=self.data.get("gp_owner_pw") or "")
-        e_gp = ttk.Entry(grow, textvariable=self.gp_pw_var, width=22, show="*")
-        e_gp.pack(side="left", padx=6)
-        ToolTip(e_gp, "统一权限口令（内部/GP用）。不能与任何 LP 的打开口令相同，"
-                      "否则那条 LP 将获得全部权限。")
-        ttk.Label(grow, foreground="#888",
-                  text="开启=权限口令统一（GP一个口令开全部文件）；留空自动生成").pack(side="left", padx=4)
-
-        # Word 模板行
-        wrow = ttk.Frame(f)
-        wrow.pack(fill="x", padx=8, pady=2)
-        ttk.Label(wrow, text="Word通知模板：").pack(side="left")
-        self.word_tpl_var = tk.StringVar(value=self.data.get("word_template") or "")
-        e_wt = ttk.Entry(wrow, textvariable=self.word_tpl_var, width=40)
-        e_wt.pack(side="left", padx=4)
-        ToolTip(e_wt, "Word .docx 模板路径。模板中的 {{字段}} 或 ?LP_Name? 会被替换。"
-                      "留空则使用上方 PDF 原件 + 水印模式。")
-        ttk.Button(wrow, text="选择…", command=self.add_word_template).pack(side="left", padx=2)
-        self.word_encrypt_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(wrow, text="生成后加密", variable=self.word_encrypt_var).pack(side="left", padx=6)
-        ttk.Button(wrow, text="从Word模板生成PDF", command=self.generate_from_word
-                   ).pack(side="left", padx=6)
-        ToolTip(wrow.winfo_children()[-1],
-                "从 Word 模板逐收件人生成 PDF（替换占位符后导出）。"
-                "需本机安装 Word。可勾选生成后自动加密。")
-
-        # 发件人（SentOnBehalfOfName）
-        frow2 = ttk.Frame(f)
-        frow2.pack(fill="x", padx=8, pady=2)
-        ttk.Label(frow2, text="发件人（代发地址）：").pack(side="left")
-        self.from_addr_var = tk.StringVar(value=self.data.get("from_addr") or "")
-        e_fa = ttk.Entry(frow2, textvariable=self.from_addr_var, width=30)
-        e_fa.pack(side="left", padx=4)
-        ToolTip(e_fa, "SentOnBehalfOfName：以该地址的名义发送。"
-                      "留空用当前 Outlook 账户。需邮箱已授权代理发送。")
-        ttk.Label(frow2, foreground="#888",
-                  text="留空=默认账户。需要 Exchange/代理发送权限。").pack(side="left", padx=4)
-
-        runbar = ttk.Frame(f)
-        runbar.pack(fill="x", padx=8, pady=6)
-        self.btn_files = ttk.Button(runbar, text="仅生成加密文件",
-                                    command=lambda: self.run_batch(False))
-        self.btn_files.pack(side="left")
-        ToolTip(self.btn_files, "只生成各收件人的水印加密 PDF，不创建 Outlook 草稿。")
-        self.btn_draft = ttk.Button(runbar, text="生成加密文件 + Outlook草稿",
-                                    command=lambda: self.run_batch(True))
-        self.btn_draft.pack(side="left", padx=8)
-        self.btn_stop = ttk.Button(runbar, text="停止",
-                                   command=self._stop_batch)
-        self.btn_stop.pack(side="left")
-        self.btn_stop.state(["disabled"])
-        ToolTip(self.btn_draft, "生成加密文件，并按邮件模板为每个收件人创建一封 Outlook 草稿"
-                                "（含附件）。草稿只入草稿箱，绝不自动发送；无收件人的 LP 自动跳过草稿。")
-        ttk.Label(runbar, foreground="#b00",
-                  text="草稿只写入 Outlook 草稿箱，不会发送；发送前请人工复核。").pack(side="left")
-
-        self.log_text = tk.Text(f, height=14, state="disabled",
-                                font=("Consolas", 10), background="#fafafa")
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=4)
-        vrow = ttk.Frame(f)
-        vrow.pack(fill="x", padx=10, pady=(0, 4))
-        ttk.Label(vrow, text=f"版本 v{APP_VERSION}", foreground="#aaa").pack(side="left")
-        self.auto_upd_var = tk.BooleanVar(value=bool(self.data.get("auto_update", True)))
-        ttk.Checkbutton(vrow, text="启动时检查更新（连接 GitHub）",
-                        variable=self.auto_upd_var,
-                        command=self._save_auto_upd).pack(side="left", padx=16)
-        ttk.Button(vrow, text="检查更新…", command=lambda: self.check_update(False)
-                   ).pack(side="left")
-        self.update_wm_summary()
-
-    def add_pdf(self):
-        files = filedialog.askopenfilenames(title="选择原件 PDF",
-                                            filetypes=[("PDF", "*.pdf")])
-        for fp in files:
-            if fp not in self.pdfs:
-                self.pdfs.append(fp)
-                self.pdf_list.insert("end", fp)
-
-    def add_word_template(self):
-        path = filedialog.askopenfilename(title="选择 Word 通知模板",
-                                          filetypes=[("Word 模板", "*.docx;*.doc")])
-        if path:
-            self.word_tpl_var.set(path)
-            self.data["word_template"] = path
-            self.save_data()
-
-    def generate_from_word(self):
-        """从 Word 模板逐收件人生成 PDF，可选加密"""
-        tpl = self.word_tpl_var.get().strip()
-        if not tpl or not Path(tpl).exists():
-            messagebox.showwarning("Word 模板", "请先选择有效的 .docx 模板文件")
-            return
-        if not self.data["lps"]:
-            messagebox.showwarning("Word 模板", "收件人清单为空")
-            return
-        outdir = Path(self.outdir_var.get())
-        outdir.mkdir(parents=True, exist_ok=True)
-        self.log(f"===== Word 模板模式：{Path(tpl).name} → {len(self.data[chr(39)+chr(108)+chr(112)+chr(115)+chr(39)])} 份 PDF =====")
-        self.running = True
-        self._cancel = threading.Event()
-        self.btn_files.state(["disabled"])
-        self.btn_draft.state(["disabled"])
-        if hasattr(self, "btn_stop"):
-            self.btn_stop.state(["!disabled"])
-
-        lps = self.data["lps"]
-        gp_mode = bool(self.gp_mode.get())
-        gp_pw = self.gp_pw_var.get().strip()
-        if gp_mode and not gp_pw:
-            gp_pw = gen_pw()
-            self.gp_pw_var.set(gp_pw)
-        encrypt = self.word_encrypt_var.get()
-
-        def worker():
-            import pythoncom
-            pythoncom.CoInitialize()
-            try:
-                for rec in lps:
-                    if self._cancel.is_set():
-                        break
-                    try:
-                        replacements = {
-                            "{{name}}": rec.get("name", ""),
-                            "{{收件人名称}}": rec.get("name", ""),
-                            "{{LP名称}}": rec.get("name", ""),
-                            "?LP_Name?": rec.get("name", ""),
-                            "?LP_Name_?": rec.get("name", ""),
-                        }
-                        for k, v in rec.items():
-                            if isinstance(v, str) and v and k != "name":
-                                replacements["{{" + k + "}}"] = v
-                        fname = sanitize_filename(rec.get("name", ""))
-                        pdf_path = outdir / (fname + ".pdf")
-                        wm.generate_notice_pdf(tpl, str(pdf_path), replacements)
-                        self.log(f"[Word→PDF OK] {pdf_path.name}")
-                        if encrypt:
-                            owner_use = gp_pw if gp_mode else rec.get("owner_pw", gen_pw())
-                            enc_out = outdir / (fname + "_enc.pdf")
-                            import fitz as _fz
-                            d = _fz.open(pdf_path)
-                            d.save(enc_out, encryption=_fz.PDF_ENCRYPT_AES_256,
-                                   user_pw=rec.get("open_pw", gen_pw()),
-                                   owner_pw=owner_use,
-                                   permissions=_fz.PDF_PERM_PRINT | _fz.PDF_PERM_ACCESSIBILITY)
-                            d.close()
-                            pdf_path.unlink()
-                            pdf_path = enc_out
-                            self.log(f"[加密OK] {enc_out.name}")
-                    except Exception as e:
-                        self.log(f"[Word→PDF 失败] {rec.get(chr(39)+chr(110)+chr(97)+chr(109)+chr(101)+chr(39), chr(39)+chr(63)+chr(39))}: {e}")
-                self.log("===== Word 模板生成完成 =====")
-                self._q.put(("summary", f"Word 模板模式完成。输出目录：{outdir}"))
-            finally:
-                pythoncom.CoUninitialize()
-                self._q.put(("done", None))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def remove_pdf(self):
-        for i in reversed(self.pdf_list.curselection()):
-            del self.pdfs[i]
-            self.pdf_list.delete(i)
-
-    def browse_outdir(self):
-        d = filedialog.askdirectory(title="输出目录")
-        if d:
-            self.outdir_var.set(d)
-
-    # ----- 水印设置 -----
+    # ================= 水印设置 =================
 
     LAYOUT_OPTS = [("自动（推荐）", "auto"), ("强制单行", "single"), ("强制折行", "wrap")]
     REPEAT_OPTS = [("单个", 1), ("三份（防裁剪）", 3), ("平铺 2列×3行", "tile")]
@@ -1915,24 +3655,25 @@ class App:
     FONT_OPTS = [("默认", ""), ("黑体", "黑体"), ("楷体", "楷体"),
                  ("仿宋", "仿宋"), ("宋体", "宋体"), ("微软雅黑", "微软雅黑")]
 
-    def update_wm_summary(self):
-        c = dict(wm.WM_DEFAULTS, **(self.data.get("wm_settings") or {}))
+    def _update_wm_summary(self):
+        if not hasattr(self, "wm_summary"):
+            return
+        c = dict(wm.WM_DEFAULTS, **(self.settings.get("wm_settings") or {}))
         layout = dict(self.LAYOUT_OPTS).get(c.get("layout"), c.get("layout"))
         rep = {1: "单个", 3: "三份", "tile": "平铺"}.get(c.get("repeat"), c.get("repeat"))
         a = c.get("angle")
-        ang = "对角线" if a is None or float(a) < 0 else f"{float(a):.0f}°"
+        ang = "对角线" if a is None or float(a) < 0 else "%.0f°" % float(a)
         fs = c.get("fs_max") or "自动"
         font = c.get("font") or "默认"
         self.wm_summary.configure(
-            text=f"{layout} · {font} · 字号上限{fs} · {ang} · {rep} · "
-                 f"浓度{float(c.get('opacity', 0.25)):.2f}")
+            text="%s · %s · 字号上限%s · %s · %s · 浓度%.2f"
+                 % (layout, font, fs, ang, rep, float(c.get("opacity", 0.25))))
 
     def open_wm_settings(self):
-        cur = dict(wm.WM_DEFAULTS, **(self.data.get("wm_settings") or {}))
+        cur = dict(wm.WM_DEFAULTS, **(self.settings.get("wm_settings") or {}))
         win = tk.Toplevel(self.root)
         win.title("水印设置")
         win.grab_set()
-
         frm = ttk.Frame(win)
         frm.pack(padx=10, pady=8, fill="x")
         self._wm_vars = {}
@@ -1947,7 +3688,6 @@ class App:
                 ttk.Label(frm, foreground="#888", text=hint).grid(
                     row=r, column=2, sticky="w")
 
-        # 布局
         lay = ttk.Combobox(frm, state="readonly", width=18,
                            values=[n for n, _ in self.LAYOUT_OPTS])
         lay.set(dict((v, n) for n, v in self.LAYOUT_OPTS).get(cur.get("layout"), "自动（推荐）"))
@@ -1957,29 +3697,28 @@ class App:
                      "强制折行：保持大字号、拆成多行。")
         self._wm_vars["layout"] = lay
 
-        # 字体 / 字号 / 角度
         fnt = ttk.Combobox(frm, state="readonly", width=18,
                            values=[n for n, _ in self.FONT_OPTS])
         fnt.set(dict((v, n) for n, v in self.FONT_OPTS).get(cur.get("font"), "默认"))
-        add_row("字体：", fnt); self._wm_vars["font"] = fnt
+        add_row("字体：", fnt)
+        self._wm_vars["font"] = fnt
 
         fsbox = ttk.Frame(frm)
         auto_fs = tk.BooleanVar(value=not cur.get("fs_max"))
         fs_spin_var = tk.IntVar(value=cur.get("fs_max") or 34)
-        cbs = ttk.Checkbutton(fsbox, text="自动", variable=auto_fs)
-        cbs.pack(side="left")
-        sp = ttk.Spinbox(fsbox, from_=16, to=48, width=4, textvariable=fs_spin_var)
-        sp.pack(side="left", padx=4)
+        ttk.Checkbutton(fsbox, text="自动", variable=auto_fs).pack(side="left")
+        ttk.Spinbox(fsbox, from_=16, to=48, width=4, textvariable=fs_spin_var).pack(side="left", padx=4)
         add_row("最大字号：", fsbox)
         self._wm_vars["_auto_fs"], self._wm_vars["fs_max"] = auto_fs, fs_spin_var
 
         ang = ttk.Combobox(frm, state="readonly", width=18,
                            values=[n for n, _ in self.ANGLE_OPTS])
         _a = cur.get("angle")
-        cur_ang = -1.0 if _a is None else float(_a)  # 0.0(水平)不再被误判
+        cur_ang = -1.0 if _a is None else float(_a)
         ang.set(dict((v, n) for n, v in self.ANGLE_OPTS).get(cur_ang, "自动（沿对角线）"))
         add_row("角度：", ang)
-        ToolTip(ang, "自动：沿页面对角线（充分利用页面宽度）。\n45°/30°：更常见的固定斜角。\n水平：不倾斜，正式感更强但遮挡正文更集中。")
+        ToolTip(ang, "自动：沿页面对角线（充分利用页面宽度）。\n45°/30°：更常见的固定斜角。\n"
+                     "水平：不倾斜，正式感更强但遮挡正文更集中。")
         self._wm_vars["angle"] = ang
 
         rep = ttk.Combobox(frm, state="readonly", width=18,
@@ -1990,14 +3729,10 @@ class App:
         ToolTip(rep, "单个：页面中央一条主水印（默认）。\n\n"
                      "三份（防裁剪）：沿对角线放 3 处（中间大、两侧小更淡）。"
                      "单个水印只占中央，对方若只截图/裁剪页面的边角区域，"
-                     "截图里可能一条水印都没有、无法溯源；三份让页面任何较大的局部"
-                     "都至少带上一处水印。\n\n"
-                     "平铺 2列×3行：整页 6 处，防裁剪最强、存在感也最强，"
-                     "建议配合较低不透明度（约 0.15）。\n\n"
-                     "提示：三种都防不住打印重扫或 P 图擦除——那是水印的普遍局限。")
+                     "截图里可能一条水印都没有、无法溯源。\n\n"
+                     "平铺 2列×3行：整页 6 处，防裁剪最强、存在感也最强。")
         self._wm_vars["repeat"] = rep
 
-        # 颜色 / 不透明度
         cbox = ttk.Frame(frm)
         color_var = tk.StringVar(value=cur.get("color") or "#737373")
 
@@ -2010,11 +3745,13 @@ class App:
 
         ttk.Entry(cbox, textvariable=color_var, width=10).pack(side="left")
         ttk.Button(cbox, text="选色…", command=pick_color, width=6).pack(side="left", padx=4)
-        add_row("颜色：", cbox); self._wm_vars["color"] = color_var
+        add_row("颜色：", cbox)
+        self._wm_vars["color"] = color_var
 
         opv = tk.DoubleVar(value=float(cur.get("opacity", 0.25)))
         op = ttk.Spinbox(frm, from_=0.05, to=0.50, increment=0.05, width=5, textvariable=opv)
-        add_row("不透明度：", op); self._wm_vars["opacity"] = opv
+        add_row("不透明度：", op)
+        self._wm_vars["opacity"] = opv
 
         def collect():
             return {
@@ -2027,7 +3764,6 @@ class App:
                 "opacity": float(opv.get()),
             }
 
-        # 预览区
         ttk.Separator(win).pack(fill="x", padx=10)
         pf = ttk.Frame(win)
         pf.pack(padx=10, pady=6, fill="both", expand=True)
@@ -2035,58 +3771,69 @@ class App:
         self._wm_preview_label.pack(side="left", fill="both", expand=True)
 
         def refresh_preview():
-            idx = self.selected_index()
-            text = (self.data["lps"][idx].get("wm") if idx is not None
-                    and self.data["lps"] else "新疆乌鲁木齐市红杉泓远智能科技有限公司")
+            text = "新疆乌鲁木齐市红杉泓远智能科技有限公司"
             try:
                 import io
                 from PIL import Image, ImageTk
                 doc = fitz.open()
-                page = doc.new_page()  # A4
+                page = doc.new_page()
                 wm.add_watermark(page, text, collect())
                 png = page.get_pixmap(dpi=72).tobytes("png")
+                doc.close()
                 img = Image.open(io.BytesIO(png))
                 w = 340
                 img = img.resize((w, int(img.height * w / img.width)))
                 self._wm_preview_img = ImageTk.PhotoImage(img)
                 self._wm_preview_label.configure(image=self._wm_preview_img, text="")
             except Exception as e:
-                self._wm_preview_label.configure(image="", text=f"预览失败：{e}")
+                self._wm_preview_label.configure(image="", text="预览失败：%s" % e)
 
-        ttk.Button(pf, text="刷新预览", command=refresh_preview).pack(side="left",
-                                                                      padx=8, anchor="n")
-
+        ttk.Button(pf, text="刷新预览", command=refresh_preview).pack(side="left", padx=8, anchor="n")
         btns = ttk.Frame(win)
         btns.pack(pady=8)
-        ttk.Button(btns, text="保存", command=lambda: save_and_close()).pack(
-            side="left", padx=8)
+        ttk.Button(btns, text="保存", command=lambda: save_and_close()).pack(side="left", padx=8)
 
         def save_and_close():
             cfg_now = collect()
-            import re as _re
-            if not _re.fullmatch(r"#[0-9a-fA-F]{6}", cfg_now.get("color", "")):
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", cfg_now.get("color", "")):
                 messagebox.showwarning("颜色", "颜色须为 #RRGGBB 六位十六进制（如 #737373）",
                                        parent=win)
                 return
             if not (0.03 <= cfg_now["opacity"] <= 0.60):
                 messagebox.showwarning("不透明度", "不透明度须在 0.03 ~ 0.60 之间", parent=win)
                 return
-            self.data["wm_settings"] = cfg_now
-            self.save_data()
-            self.update_wm_summary()
+            self.settings["wm_settings"] = cfg_now
+            self.store.save_settings(self.settings)
+            self._update_wm_summary()
             win.destroy()
 
         refresh_preview()
 
-    def _save_auto_upd(self):
-        self.data["auto_update"] = bool(self.auto_upd_var.get())
-        self.save_data()
+    # ================= 更新 / 队列 / 关闭 =================
+
+    def _ver_tuple(v):
+        nums = re.findall(r"\d+", str(v or ""))
+        return tuple(int(x) for x in nums[:3])
+
+    def check_latest(self, timeout=8):
+        """查询 GitHub 最新 Release。返回 dict 或 None（网络失败时静默）。"""
+        import urllib.request
+        url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+        req = urllib.request.Request(url, headers={"User-Agent": "doc-mailer"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        asset = next((a for a in d.get("assets", [])
+                      if a["name"].startswith("doc-mailer_") and a["name"].endswith("_portable.zip")), None)
+        return {"tag": d.get("tag_name", ""), "body": (d.get("body") or "")[:400],
+                "url": d.get("html_url", ""),
+                "asset_url": asset["browser_download_url"] if asset else None,
+                "asset_size": asset.get("size") if asset else None,
+                "asset_digest": asset.get("digest") if asset else None}
 
     def check_update(self, auto=False):
-        """后台线程查 GitHub 最新版；结果经消息队列回主线程弹窗。"""
         def work():
             try:
-                info = check_latest()
+                info = self.check_latest()
                 if info:
                     self._q.put(("update", (info, auto)))
             except Exception:
@@ -2097,15 +3844,14 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _show_update(self, info, auto):
-        remote = _ver_tuple(info["tag"])
-        local = _ver_tuple(APP_VERSION)
+        remote = self._ver_tuple(info["tag"])
+        local = self._ver_tuple(APP_VERSION)
         if remote <= local:
             if not auto:
-                messagebox.showinfo("检查更新",
-                                    f"当前已是最新版本（v{APP_VERSION}）。")
+                messagebox.showinfo("检查更新", "当前已是最新版本（v%s）。" % APP_VERSION)
             return
         frozen = getattr(sys, "frozen", False)
-        msg = (f"发现新版本：{info['tag']}（当前 v{APP_VERSION}）\n\n"
+        msg = ("发现新版本：%s（当前 v%s）\n\n" % (info["tag"], APP_VERSION)
                + info["body"].replace("\r", "")[:300] + "\n")
         if frozen or not info.get("asset_url"):
             msg += "\n点击「打开下载页」获取最新版本。"
@@ -2119,25 +3865,29 @@ class App:
 
     def _self_update(self, info):
         def work():
-            import zipfile, tempfile, hashlib
+            import zipfile
+            import hashlib
             staging = app_dir() / ".update_staging"
             zip_path = app_dir() / ".update_pkg.zip"
             try:
-                self._q.put(("log", f"[更新] 下载 {info['tag']}（约 {info['asset_size']//1048576}MB）…"))
+                self._q.put(("log", "[更新] 下载 %s（约 %dMB）…"
+                             % (info["tag"], (info.get("asset_size") or 0) // 1048576)))
                 last = [None]
 
                 def _prog(pct):
                     if pct != last[0] and pct % 20 == 0:
                         last[0] = pct
-                        self._q.put(("log", f"[更新] 下载进度 {pct}%"))
+                        self._q.put(("log", "[更新] 下载进度 %d%%" % pct))
 
-                _download_with_progress(info["asset_url"], zip_path, progress=_prog)
+                import urllib.request
+                urllib.request.urlretrieve(info["asset_url"], zip_path, reporthook=_prog)
                 raw = zip_path.read_bytes()
                 digest = (info.get("asset_digest") or "")
                 if digest.startswith("sha256:"):
                     got = "sha256:" + hashlib.sha256(raw).hexdigest()
                     if got != digest:
-                        raise RuntimeError(f"下载校验失败（期望 {digest[:20]}…，实际 {got[:20]}…）")
+                        raise RuntimeError("下载校验失败（期望 %s…，实际 %s…）"
+                                           % (digest[:20], got[:20]))
                     self._q.put(("log", "[更新] SHA256 校验通过"))
                 if staging.exists():
                     import shutil as _sh
@@ -2146,6 +3896,9 @@ class App:
                     z.extractall(staging)
                 src_dir = next((d for d in staging.iterdir() if d.is_dir()), staging)
                 # 更新脚本：等待程序退出 → 覆盖（保留用户数据）→ 重启
+                # 排除清单必须含 lp_data（v3 的用户数据目录）与旧版单文件，
+                # 否则 robocopy /MOVE 会把用户数据一起覆盖掉。
+                # 只能有**一条** robocopy：先复制再排除就已经晚了。
                 bat = app_dir() / "run_update.bat"
                 NLc = chr(10)
                 bat.write_text(
@@ -2155,7 +3908,8 @@ class App:
                     "ping -n 4 127.0.0.1 >nul" + NLc +
                     'robocopy ".update_staging' + chr(92) + str(src_dir.name) + '" "." /E /MOVE '
                     "/XF lp_data.json lp_run_log.csv lp_data.json.bak "
-                    "lp_data.json.tmp lp_data.example.json >nul" + NLc +
+                    "lp_data.json.tmp lp_data.example.json "
+                    "/XD lp_data >nul" + NLc +
                     'rd /s /q ".update_staging" 2>nul' + NLc +
                     'del ".update_pkg.zip" 2>nul' + NLc +
                     'start "" "%~dp0start.bat"' + NLc +
@@ -2163,15 +3917,13 @@ class App:
                 zip_path.unlink()
                 self._q.put(("update_ready", None))
             except Exception as e:
-                zip_path.unlink(missing_ok=True)
+                try:
+                    zip_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 self._q.put(("update_err",
-                             f"自动更新失败：{e}\n可手动到 Releases 页下载。"))
+                             "自动更新失败：%s\n可手动到 Releases 页下载。" % e))
         threading.Thread(target=work, daemon=True).start()
-
-    def _stop_batch(self):
-        if getattr(self, '_cancel', None):
-            self._cancel.set()
-            self.log('已请求停止，正在完成当前收件人…')
 
     def log(self, msg):
         # 后台线程只投递消息，主线程轮询写入（Tk 非线程安全）
@@ -2182,16 +3934,27 @@ class App:
             while True:
                 kind, payload = self._q.get_nowait()
                 if kind == "log":
-                    self.log_text.configure(state="normal")
-                    self.log_text.insert("end", payload + "\n")
-                    self.log_text.see("end")
-                    self.log_text.configure(state="disabled")
+                    self._wb_log(payload)
+                elif kind == "prog":
+                    try:
+                        self.wb_progress.configure(value=payload)
+                    except Exception:
+                        pass
+                elif kind == "run_done":
+                    self._wb_last_run = payload
+                    if payload is not None:
+                        st = payload.get("stats") or {}
+                        self.wb_status.configure(
+                            text="成功 %d · 失败 %d · 跳过 %d"
+                                 % (st.get("ok", 0), st.get("fail", 0), st.get("skip", 0)))
+                        try:
+                            # 回到「预览与生成」页
+                            self._wb_show_step(WB_STEP_RUN)
+                        except Exception:
+                            pass
                 elif kind == "summary":
-                    self.log_text.configure(state="normal")
-                    self.log_text.insert("end", payload + "\n")
-                    self.log_text.see("end")
-                    self.log_text.configure(state="disabled")
-                    self.root.after(300, lambda: messagebox.showinfo("批量结束", payload))
+                    self._wb_log(payload)
+                    self.root.after(300, lambda p=payload: messagebox.showinfo("批量结束", p))
                 elif kind == "update":
                     self._show_update(*payload)
                 elif kind == "update_err":
@@ -2201,204 +3964,53 @@ class App:
                             "更新就绪",
                             "新版已下载并通过校验。\n\n"
                             "现在退出并完成更新？（数据与清单保留，完成后自动重启）"):
-                        import os
                         os.startfile(str(app_dir() / "run_update.bat"))
                         self.root.destroy()
                 elif kind == "done":
                     self.running = False
-                    self.btn_files.state(["!disabled"])
-                    self.btn_draft.state(["!disabled"])
-                    if hasattr(self, "btn_stop"):
-                        self.btn_stop.state(["disabled"])
+                    self._wb_set_running(False)
         except Exception:
             pass
-        self.root.after(120, self._poll_queue)
+        self._poll_id = self.root.after(120, self._poll_queue)
 
-    def run_batch(self, make_drafts):
-        if self.running:
-            return
-        if not self.data["lps"]:
-            messagebox.showwarning("提示", "收件人清单为空，请先在①中导入")
-            return
-        if not self.pdfs and not make_drafts:
-            messagebox.showwarning("提示", "请先添加原件 PDF（或改用含 Outlook 草稿的模式）")
-            return
-        if make_drafts:
-            missing = [r["name"] for r in self.data["lps"] if not r.get("to")]
-            if missing:
-                messagebox.showwarning("缺少邮箱",
-                                       "以下收件人没有邮箱，将只生成文件、跳过草稿：\n\n"
-                                       + "\n".join(missing[:10])
-                                       + ("…" if len(missing) > 10 else ""))
-        lps = [dict(r) for r in self.data["lps"]]
-
-        # GP统一权限口令模式：所有文件 owner 口令一致，LP 打开口令不变
-        gp_mode = bool(self.gp_mode.get())
-        gp_pw = self.gp_pw_var.get().strip()
-        if gp_mode and not gp_pw:
-            gp_pw = gen_pw()
-            self.gp_pw_var.set(gp_pw)
-        self.data["gp_owner_mode"] = gp_mode
-        self.data["gp_owner_pw"] = gp_pw if gp_mode else ""
-        if gp_mode:
-            clash = [r["name"] for r in lps if r.get("open_pw") == gp_pw]
-            if clash:
-                messagebox.showerror(
-                    "统一口令冲突",
-                    "GP统一权限口令与以下收件人的打开口令相同（对方将获得全部权限），已取消："
-                    + chr(10) * 2 + "、".join(clash[:8]))
-                return
-
-        # P0-3/P1-2/P1-10：统一校验，发现即阻止整批
-        if gp_mode:
-            issues = [i for i in validate_records(lps) if "权限口令" not in i]
-        else:
-            issues = validate_records(lps)
-        if issues:
-            messagebox.showerror(
-                "清单校验未通过（已取消本次任务）",
-                "请先在①页修正以下问题：\n\n" + "\n".join(issues[:12])
-                + ("…" if len(issues) > 12 else "")
-                + "\n\n（编辑行可直接改口令；「补齐缺失口令」可自动生成缺失项）")
-            return
-
-        try:
-            subject, body = self.collect_template()
-            self.data["subject"], self.data["body"] = subject, body
-            pdfs = list(self.pdfs)
-            if not str(self.outdir_var.get()).strip():
-                raise ValueError("输出目录为空")
-            outdir = Path(self.outdir_var.get())
-            outdir.mkdir(parents=True, exist_ok=True)
-            self.data["outdir"] = str(outdir)
-            fname_tpl = self.fname_var.get().strip() or DEFAULT_FILENAME_TPL
-            self.data["filename_tpl"] = fname_tpl
-            self.save_data()
-            cfg = dict(self.data.get("wm_settings") or {})
-        except Exception as e:
-            messagebox.showerror("无法开始", f"准备阶段失败：{e}")
-            return
-
-        self.running = True
-        self._cancel = threading.Event()
-        self.btn_files.state(["disabled"])
-        self.btn_files.state(["disabled"])
-        if hasattr(self, "btn_stop"):
-            self.btn_stop.state(["!disabled"])
-        self.log(f"===== 开始：{len(lps)} 个收件人 × {len(pdfs)} 个文件，"
-                 f"{'含' if make_drafts else '不含'} Outlook 草稿 =====")
-
-        stats = {"ok": 0, "fail": 0, "skip": 0}
-        used_names = set()
-
-        def unique_out(base_name):
-            name, i = base_name, 2
-            while name in used_names or (outdir / (name + ".pdf")).exists():
-                name = f"{base_name}_{i}"
-                i += 1
-            used_names.add(name)
-            return outdir / (name + ".pdf")
-
-        def worker():
-            import pythoncom
-            pythoncom.CoInitialize()  # 新线程必须初始化 COM，否则第二批起全失败
+    def shutdown(self):
+        """停掉后台轮询并拆掉外壳（测试与异常退出用）。"""
+        if self._poll_id is not None:
             try:
-                # 合并发送组：同 merge_group 的 LP 共用一封邮件
-                processed_groups = set()
-                for rec in lps:
-                    if self._cancel.is_set():
-                        self.log("===== 已手动停止 =====")
-                        break
-                    mg = rec.get("merge_group", "")
-                    if mg and mg in processed_groups:
-                        continue  # 同组首条已处理
-                    if mg:
-                        processed_groups.add(mg)
-                        grp = [r for r in lps if r.get("merge_group") == mg]
-                        if len(grp) > 1:
-                            # 合并 To/CC/BCC
-                            rec = dict(rec)
-                            rec["to"] = ";".join(
-                                dict.fromkeys(
-                                    [m for r2 in grp for m in split_mails(r2.get("to", ""))]))
-                            rec["cc"] = ";".join(
-                                dict.fromkeys(
-                                    [m for r2 in grp for m in split_mails(r2.get("cc", ""))]))
-                            rec["bcc"] = ";".join(
-                                dict.fromkeys(
-                                    [m for r2 in grp for m in split_mails(r2.get("bcc", ""))]))
-                            self.log(f"[合并组] {mg}：{len(grp)} 个收件人合一封邮件")
-                    outs, extra = [], []
-                    for path in split_paths(rec.get("files", "")):
-                        if Path(path).exists():
-                            extra.append(Path(path))
-                        else:
-                            self.log(f"[附件缺失] {rec['name']}：{path}（草稿将不含此附件）")
-                    file_fail = False
-                    for src in pdfs:
-                        out = unique_out(render_filename(fname_tpl, src, rec))
-                        try:
-                            owner_use = gp_pw if gp_mode else rec["owner_pw"]
-                            info = wm.process_one(Path(src), out, rec["wm"],
-                                                  rec["open_pw"], owner_use,
-                                                  False, wm_cfg=cfg)
-                            outs.append(out)
-                            for w in info.get("warnings", []):
-                                self.log(f"[注意] {out.name}：{w}")
-                            self.log(f"[文件OK] {out.name}")
-                        except Exception as e:
-                            file_fail = True
-                            self.log(f"[文件失败] {rec['name']} <- {Path(src).name}: {e}")
-                    draft_state = "-"
-                    if make_drafts and rec.get("to"):
-                        if file_fail and not outs:
-                            draft_state = "跳过(文件失败)"
-                            stats["skip"] += 1
-                            self.log(f"[跳过草稿] {rec['name']}（加密文件未生成，不发出空附件邮件）")
-                        elif not outs and not extra and pdfs:
-                            draft_state = "跳过(无附件)"
-                            stats["skip"] += 1
-                        else:
-                            try:
-                                subj_tpl = rec.get("subject") or subject
-                                create_outlook_draft(rec, outs + extra, subj_tpl, body)
-                                draft_state = "OK"
-                                self.log(f"[草稿OK] {rec['name']} -> Outlook 草稿箱（未发送）")
-                            except Exception as e:
-                                draft_state = f"失败:{e}"[:40]
-                                stats["fail"] += 1
-                                self.log(f"[草稿失败] {rec['name']}: {e}")
-                    elif make_drafts and not rec.get("to"):
-                        draft_state = "跳过(无邮箱)"
-                        stats["skip"] += 1
-                        self.log(f"[跳过草稿] {rec['name']}（无邮箱）")
-                    if outs and not file_fail:
-                        stats["ok"] += 1
-                    elif file_fail:
-                        stats["fail"] += 1
-                    # 审计日志（口令只留指纹，不落明文）
-                    try:
-                        import csv as _csv
-                        with open(app_dir() / "lp_run_log.csv", "a", newline="",
-                                  encoding="utf-8-sig") as f:
-                            _csv.writer(f).writerow([
-                                date.today().strftime("%Y-%m-%d %H:%M:%S"),
-                                rec.get("name", ""), rec.get("to", ""),
-                                ";".join(o.name for o in outs),
-                                draft_state, pw_fingerprint(rec.get("open_pw", ""))])
-                    except Exception:
-                        pass
-                if not self._cancel.is_set():
-                    self.log("===== 全部完成 =====")
-                self._q.put(("summary",
-                             f"完成：成功 {stats['ok']}，失败 {stats['fail']}，"
-                             f"跳过 {stats['skip']}。详见上方日志。"))
-            finally:
-                pythoncom.CoUninitialize()
-                self._q.put(("done", None))
+                self.root.after_cancel(self._poll_id)
+            except Exception:
+                pass
+            self._poll_id = None
+        # 让常驻工作线程收工（它持有的 Word 引用也随之释放）
+        try:
+            self._jobs.put_nowait(None)
+        except Exception:
+            pass
+        for w in self._shell_widgets:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._shell_widgets = []
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _wb_log(self, msg):
+        """写日志到当前步骤的日志框（没有就写状态栏）。"""
+        box = getattr(self, "_wb_log_text", None)
+        if box is not None:
+            box.configure(state="normal")
+            box.insert("end", msg + "\n")
+            box.see("end")
+            box.configure(state="disabled")
+        else:
+            self.wb_status.configure(text=msg[:60])
 
+    def _wb_set_running(self, running):
+        self.running = running
+        for b in (self.btn_preflight, self.btn_generate, self.btn_rerun):
+            try:
+                b.state(["disabled"] if running else ["!disabled"])
+            except tk.TclError:
+                pass
 
     def on_close(self):
         if self.running and not messagebox.askyesno(
@@ -2407,11 +4019,14 @@ class App:
                 "已完成的草稿保留）"):
             return
         try:
-            self.data["subject"], self.data["body"] = self.collect_template()
+            if getattr(self, "body_text", None) is not None and self._wb_event:
+                mail = self._wb_event.setdefault("mail", {})
+                mail["subject"], mail["body"] = self._wb_collect_mail()
+                self.store.save_event(self._wb_event)
         except Exception:
-            pass  # 没进过邮件模板页时 subject_var 不存在，跳过
+            pass
         try:
-            self.save_data()
+            self.store.save_settings(self.settings)
         except Exception:
             pass
         self.root.destroy()
@@ -2420,6 +4035,7 @@ class App:
 def _install_excepthook():
     """无控制台形态下未捕获异常不再'点了没反应'：落盘 + 弹窗。"""
     import traceback
+
     def hook(typ, val, tb):
         try:
             logdir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "doc-mailer"
@@ -2431,11 +4047,10 @@ def _install_excepthook():
         try:
             import tkinter.messagebox as _mb
             _mb.showerror("程序出错",
-                          f"{typ.__name__}: {val}\n\n详情已写入 {logdir / 'error.log'}")
+                          "%s: %s\n\n详情已写入 %s" % (typ.__name__, val, logdir / "error.log"))
         except Exception:
             pass
     sys.excepthook = hook
-    import threading
     threading.excepthook = lambda a: hook(a.exc_type, a.exc_value, a.exc_traceback)
 
 

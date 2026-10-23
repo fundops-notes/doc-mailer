@@ -8,6 +8,7 @@ import argparse
 import glob
 import math
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -277,15 +278,10 @@ def generate_notice_pdf(template_path, output_path, replacements):
         doc = word.Documents.Open(str(Path(template_path).resolve()), ReadOnly=True)
 
         for find_text, replace_text in replacements.items():
-            find = doc.Content.Find
-            find.ClearFormatting()
-            find.Replacement.ClearFormatting()
-            find.Text = find_text
-            find.Replacement.Text = str(replace_text)
-            find.Forward = True
-            find.Wrap = 1  # wdFindContinue
-            find.MatchCase = False
-            find.Execute(Replace=2)  # wdReplaceAll
+            # 必须用位置参数：pywin32 动态调度会静默忽略 Replace=2 这种命名参数
+            doc.Content.Find.Execute(
+                find_text, False, False, False, False, False,
+                True, 1, False, str(replace_text), 2)   # Replace=2 → wdReplaceAll
 
         # SaveAs2 FileFormat=17 (wdFormatPDF)
         doc.SaveAs2(str(Path(output_path).resolve()), FileFormat=17)
@@ -294,7 +290,7 @@ def generate_notice_pdf(template_path, output_path, replacements):
     finally:
         if doc:
             try:
-                doc.Close(SaveChanges=0)
+                doc.Close(0)
             except Exception:
                 pass
         if word:
@@ -361,6 +357,280 @@ def generate_notice_pdfs(template_path, output_dir, lp_records):
 import re  # generate_notice_pdfs 里用到
 
 
+# ---------------- 流水线用的分步接口 ----------------
+#
+# 把「加水印」与「加密」从 process_one 里拆成两个独立函数，
+# 行为与原来完全一致（同样的水印算法、同样的权限位、同样的子集化），
+# 只是可以分步调用、可以只水印不加密、或只加密不水印。
+# v3.1 起上层用的是「产出条目」模型（generate / attach），
+# 这里仍是底层能力（条目内部的处理链按 转 PDF → 水印 → 加密 调用它们）。
+
+
+def _wm_config(repeat=1, opacity=0.25, wm_cfg=None):
+    cfg = dict(WM_DEFAULTS)
+    if repeat in (1, 3, "tile"):
+        cfg["repeat"] = repeat
+    if opacity:
+        cfg["opacity"] = opacity
+    if wm_cfg:
+        cfg.update(wm_cfg)
+    return cfg
+
+
+def watermark_pdf(src, out, text, wm_cfg=None):
+    """只加水印（不加密）。返回 {"warnings": [...]}。
+
+    水印旋转走「方形临时页 + show_pdf_page(rotate=)」，
+    绝不用 TextWriter.write_text(morph=...)（PyMuPDF 1.28 会静默丢字）。
+    """
+    cfg = dict(WM_DEFAULTS, **(wm_cfg or {}))
+    if not (text or "").strip():
+        raise ValueError("水印文字为空，拒绝生成无水印文件")
+    warnings = []
+    out = Path(out)
+    with fitz.open(src) as doc:
+        for page in doc:
+            add_watermark(page, text, cfg)
+        try:
+            doc.subset_fonts()
+        except Exception as e:
+            warnings.append(f"字体子集化失败（体积可能偏大）：{e}")
+        tmp_out = out.with_suffix(out.suffix + ".tmp")
+        doc.save(tmp_out, garbage=3, deflate=True)
+    os.replace(tmp_out, out)
+    return {"warnings": warnings}
+
+
+def permission_mask(permissions=None):
+    """权限勾选 → PyMuPDF 权限位掩码。
+
+    permissions: None 或空 → 默认「仅打印」（与既有铁律一致）。
+      "print" 允许打印
+      "edit"  允许编辑（修改内容）
+      "copy"  允许复制内容
+    """
+    if permissions is None:
+        permissions = ["print"]
+    if isinstance(permissions, str):
+        permissions = [permissions]
+    perms = list(permissions)
+    mask = 0
+    if "print" in perms:
+        mask |= fitz.PDF_PERM_PRINT | fitz.PDF_PERM_PRINT_HQ
+    if "edit" in perms:
+        mask |= fitz.PDF_PERM_MODIFY
+    if "copy" in perms:
+        mask |= fitz.PDF_PERM_COPY | fitz.PDF_PERM_ANNOTATE
+    if hasattr(fitz, "PDF_PERM_ACCESSIBILITY"):
+        mask |= fitz.PDF_PERM_ACCESSIBILITY
+    return mask
+
+
+def encrypt_pdf(src, out, open_pw, owner_pw, permissions=None):
+    """只加密（AES-256）。返回加密自检结果。
+
+    permissions: 可配置权限位，默认 ["print"]（仅打印）。
+      print=允许打印  edit=允许编辑  copy=允许复制内容
+    """
+    if not open_pw or not owner_pw:
+        raise ValueError("打开口令/权限口令不能为空")
+    if open_pw == owner_pw:
+        raise ValueError("权限口令不能与打开口令相同（否则收件人获得全部权限）")
+    perms = permission_mask(permissions)
+    warnings = []
+    out = Path(out)
+    with fitz.open(src) as doc:
+        try:
+            doc.subset_fonts()   # 保存前子集化，否则字体全量嵌入（0.1MB → 21MB）
+        except Exception as e:
+            warnings.append(f"字体子集化失败（体积可能偏大）：{e}")
+        tmp_out = out.with_suffix(out.suffix + ".tmp")
+        doc.save(tmp_out, encryption=fitz.PDF_ENCRYPT_AES_256,
+                 user_pw=open_pw, owner_pw=owner_pw,
+                 permissions=perms, garbage=3, deflate=True)
+    os.replace(tmp_out, out)
+
+    d = fitz.open(out)
+    try:
+        if not d.needs_pass:
+            raise RuntimeError("输出文件未加密！")
+        if d.authenticate(open_pw) < 2:
+            raise RuntimeError("打开口令验证失败")
+        perms_summary = _perm_summary(d)
+    finally:
+        d.close()
+    d2 = fitz.open(out)
+    try:
+        owner_ok = d2.authenticate(owner_pw) >= 4
+    finally:
+        d2.close()
+    if not owner_ok:
+        raise RuntimeError("权限口令验证失败")
+    return {"encrypted": True, "user_perms": perms_summary, "warnings": warnings}
+
+
+def detect_placeholders(docx_path):
+    """从 .docx 里提取占位符（{{字段}} 与 ?字段? 两种写法）。
+
+    直接读 word/document.xml，不依赖 Word：更快，也不会弹出窗口。
+    Word 常把一个占位符拆进多个 <w:t>，这里把文本节点原样拼回连续文本。
+    """
+    import zipfile
+    text = ""
+    try:
+        with zipfile.ZipFile(docx_path) as z:
+            names = [n for n in z.namelist()
+                     if n.startswith("word/") and n.endswith(".xml")
+                     and ("document" in n or "header" in n or "footer" in n
+                          or "footnotes" in n or "endnotes" in n)]
+            names.sort(key=lambda n: (0 if n == "word/document.xml" else 1, n))
+            for n in names:
+                raw = z.read(n).decode("utf-8", errors="replace")
+                parts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", raw, re.S)
+                text += "".join(parts)
+    except Exception as e:
+        raise RuntimeError(f"读取 Word 模板失败：{e}")
+    for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+                 ("&apos;", "'"), ("&amp;", "&")):
+        text = text.replace(a, b)
+    found = set(re.findall(r"\{\{[^}]+\}\}", text))
+    found |= set(re.findall(r"\?[^?\s]{2,30}\?", text))
+    return sorted(found)
+
+
+class WordBatch:
+    """批量处理时复用一个 Word 实例（每份文件启一次 Word 非常慢）。
+
+    两个必须知道的坑：
+    1) 用 DispatchEx 起**私有实例**：普通 Dispatch 会挂到用户已经开着的 Word 上，
+       收尾时会把用户的 Word 一起关掉。
+    2) 收尾**不能调 Word.Quit()**：Quit 之后 Word 的 COM 服务器就没了，
+       这时 Python 释放最后一个引用会收到 RPC_S_CALL_FAILED(0x800706be)，
+       那是 Windows 致命异常，会直接把整个进程干掉（应用会在跑一半时闪退）。
+       所以这里只释放引用，不 Quit——Word 实例随进程一起退出。
+    """
+
+    def __init__(self):
+        self._word = None
+        self._com = False
+
+    def _ensure(self):
+        if self._word is None:
+            import pythoncom
+            import win32com.client
+            pythoncom.CoInitialize()   # 新线程必须初始化 COM
+            self._com = True
+            # DispatchEx：私有实例，绝不碰用户自己开着的 Word
+            self._word = win32com.client.DispatchEx("Word.Application")
+            self._word.Visible = False
+            self._word.DisplayAlerts = 0
+        return self._word
+
+    def replace_and_save(self, template_path, out_path, replacements, fmt=16):
+        """按映射替换占位符后另存。fmt: 16=docx, 17=pdf。
+
+        替换用 Find.Execute 的**位置参数**形式（Replace=wdReplaceAll），
+        只改文字不重建文档，字体/字号/颜色/表格/页眉页脚/分页全部原样保留。
+
+        注意：不能用 find.Execute(Replace=2) 这种命名参数写法——pywin32 的动态
+        调度会静默忽略命名参数，结果是「一个字都没替换」还不报错。
+        """
+        word = self._ensure()
+        doc = word.Documents.Open(str(Path(template_path).resolve()), ReadOnly=True)
+        try:
+            for find_text, replace_text in (replacements or {}).items():
+                # Find.Execute(FindText, MatchCase, MatchWholeWord, MatchWildcards,
+                #   MatchSoundsLike, MatchAllWordForms, Forward, Wrap, Format,
+                #   ReplaceWith, Replace, ...)
+                doc.Content.Find.Execute(
+                    find_text, False, False, False, False, False,
+                    True, 1, False, str(replace_text), 2)
+            doc.SaveAs2(str(Path(out_path).resolve()), FileFormat=fmt)
+        finally:
+            try:
+                doc.Close(0)
+            except Exception:
+                pass
+
+    def convert(self, src_docx, out_pdf):
+        """docx → pdf（Word 导出，格式保持由 Word 保证）。"""
+        word = self._ensure()
+        doc = word.Documents.Open(str(Path(src_docx).resolve()), ReadOnly=True)
+        try:
+            doc.SaveAs2(str(Path(out_pdf).resolve()), FileFormat=17)
+        finally:
+            try:
+                doc.Close(0)
+            except Exception:
+                pass
+
+    def create_docx(self, path, text):
+        """新建一个 .docx（示例模板生成用）。"""
+        word = self._ensure()
+        doc = word.Documents.Add()
+        try:
+            doc.Content.Text = text
+            doc.SaveAs2(str(Path(path).resolve()), FileFormat=16)
+        finally:
+            try:
+                doc.Close(0)
+            except Exception:
+                pass
+
+    def close(self):
+        """释放 Word 引用（**不调 Quit**，理由见类注释）。
+
+        释放发生在 Word 还活着的时候，所以不会触发 RPC 致命异常；
+        残留的 Word 实例会在本进程结束时一并退出。
+        """
+        word = self._word
+        self._word = None
+        if word is not None:
+            del word
+            import gc
+            gc.collect()
+        if self._com:
+            import pythoncom
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            self._com = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+def generate_notice_docx(template_path, output_path, replacements, batch=None):
+    """从 Word 模板生成 .docx（占位符替换后，格式保持不变）。"""
+    own = batch is None
+    b = batch or WordBatch()
+    try:
+        b.replace_and_save(template_path, output_path, replacements, fmt=16)
+    except Exception as e:
+        raise RuntimeError(f"Word 模板处理失败：{e}")
+    finally:
+        if own:
+            b.close()
+
+
+def docx_to_pdf(src_docx, output_path, batch=None):
+    """docx → pdf（Word COM 导出）。"""
+    own = batch is None
+    b = batch or WordBatch()
+    try:
+        b.convert(src_docx, output_path)
+    except Exception as e:
+        raise RuntimeError(f"Word 转 PDF 失败：{e}")
+    finally:
+        if own:
+            b.close()
+
+
 # ---------------- CLI ----------------
 
 def main():
@@ -425,3 +695,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

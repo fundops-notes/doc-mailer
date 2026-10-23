@@ -61,21 +61,19 @@ def test_sanitize_and_filename():
     assert pw_fingerprint("x") and len(pw_fingerprint("x")) == 8
 
 
-def test_html_roundtrip_idempotent():
+def test_html_roundtrip_idempotent(tk_root):
     import tkinter as tk
     from lp_tool import load_html, text_to_html
-    root = tk.Tk(); root.withdraw()
-    try:
-        tw = tk.Text(root)
-        tw.insert("1.0", "第一段" + chr(10) * 2 + "第三段")
-        prev = text_to_html(tw)
-        for _ in range(3):
-            load_html(tw, prev)
-            prev = text_to_html(tw)
+    root = tk_root
+    tw = tk.Text(root)
+    tw.insert("1.0", "第一段" + chr(10) * 2 + "第三段")
+    prev = text_to_html(tw)
+    for _ in range(3):
         load_html(tw, prev)
-        assert tw.get("1.0", "end-1c") == "第一段" + chr(10) * 2 + "第三段"
-    finally:
-        root.destroy()
+        prev = text_to_html(tw)
+    load_html(tw, prev)
+    assert tw.get("1.0", "end-1c") == "第一段" + chr(10) * 2 + "第三段"
+    tw.destroy()
 
 
 def test_process_one_guards(tmp_path):

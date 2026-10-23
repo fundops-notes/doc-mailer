@@ -1,0 +1,2559 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+文档分发助手 v3.1 —— 数据层 / 流水线 / 执行引擎（纯逻辑，不含 GUI）
+
+本模块只依赖标准库 + watermark_encrypt，可在无 GUI 环境直接跑测试。
+三块内容：
+  1. 数据层：lp_data/ 目录化存储、事件/场景/收件人/附件/**产出条目**数据模型、v2 迁移
+  2. 流水线：**两种产出条目**（generate 生成文档 / attach 附加文件），
+     条目上的处理勾选（转 PDF / 加水印 / 加密，顺序固定）+ 产出粒度
+     （per_lp / per_group / all）+ **字段级来源**（每个占位符单独选来源）
+  3. 执行引擎：预检 → 条目执行 → 附件组装 → Outlook 草稿 → Run 记录
+
+铁律（不可违反，见 HANDOFF §4–§6）：
+  · 权限口令绝不进入邮件正文/标题/任何草稿字段
+  · 打开口令 ≠ 权限口令
+  · 只建草稿，绝不发送（全库唯一 Outlook 写操作是 mail.Save()）
+  · AES-256 加密，权限位仅打印
+  · 水印不截断
+  · 保存前 subset_fonts()
+  · 损坏数据绝不覆盖
+"""
+
+import json
+import os
+import re
+import secrets
+import shutil
+import sys
+import threading
+from datetime import date, datetime
+from pathlib import Path
+
+import fitz
+import watermark_encrypt as wm
+
+# ============================================================================
+# 基础工具
+# ============================================================================
+
+APP_VERSION = "3.1.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+
+DATA_DIR_NAME = "lp_data"
+LEGACY_DATA_FILE = "lp_data.json"
+SETTINGS_FILE = "settings.json"
+EVENTS_DIR = "events"
+SCENARIOS_DIR = "scenarios"
+RUNS_DIR = "runs"
+
+PW_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+
+# 附件路径分隔符：只按 ; ； 和换行（英文逗号是文件名的一部分，如 "X, L.P."）
+_PATH_SEPS = ["；", ";", "\n", "\r"]
+
+
+def default_base_dir() -> Path:
+    """程序所在目录（打包成 exe 后是 exe 所在目录）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def gen_pw(n=12):
+    """密码学安全随机（random 的梅森旋转可被预测）。"""
+    return "".join(secrets.choice(PW_CHARS) for _ in range(n))
+
+
+def sanitize_filename(s, maxlen=40):
+    """非法字符 < > : " / \\ | ? * 用 chr 构造避免字面量转义问题。"""
+    for c in map(chr, (60, 62, 58, 34, 47, 92, 124, 63, 42)):
+        s = s.replace(c, "_")
+    s = "".join(ch for ch in s if ord(ch) >= 32)  # 去控制字符
+    s = s.strip().rstrip(chr(46)).strip()          # 结尾的点/空格
+    return s[:maxlen] if s else "unnamed"
+
+
+def pw_fingerprint(pw):
+    """口令指纹：只留 8 位哈希，写进执行记录，绝不落明文。"""
+    import hashlib
+    return hashlib.sha256((pw or "").encode("utf-8")).hexdigest()[:8]
+
+
+def split_paths(s):
+    """拆分附件路径：仅按 ; ；和换行（逗号常出现在中文/英文文件名里，不是分隔符）。"""
+    for ch in _PATH_SEPS:
+        s = s.replace(ch, ";")
+    return [x.strip().strip('"') for x in s.split(";") if x.strip()]
+
+
+def split_mails(s):
+    """拆分邮箱列表。"""
+    for ch in ["；", ";", "，", ",", "\n", "\r", "\t"]:
+        s = s.replace(ch, ";")
+    if "<" not in s:  # 无显示名格式时才把空格当分隔符
+        s = s.replace(" ", ";")
+    return [x for x in s.split(";") if x]
+
+
+def read_spreadsheet(path):
+    """读 xlsx/csv 为二维列表（第一行是表头）。"""
+    p = Path(path)
+    if p.suffix.lower() == ".csv":
+        import csv
+        try:
+            with open(p, newline="", encoding="utf-8-sig") as f:
+                rows = [row for row in csv.reader(f)]
+        except UnicodeDecodeError:  # 中文 Excel 默认导出 GBK
+            with open(p, newline="", encoding="gbk", errors="replace") as f:
+                rows = [row for row in csv.reader(f)]
+        if rows and len(rows[0]) == 1 and ";" in rows[0][0]:  # 分号分隔
+            rows = [[c.strip() for c in r[0].split(";")] for r in rows if r]
+        return rows
+    import openpyxl
+    wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+    ws = wb.active
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        rows.append(list(row))
+        if len(rows) > 5000:
+            break
+    wb.close()
+    return rows
+
+
+def _cell_text(v):
+    """单元格取值转文本：整数的浮点不显示小数尾巴（200000.0 → 200000）。"""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def sheet_to_dicts(rows):
+    """二维列表 → [{列名: 值}]（跳过全空行）。"""
+    if not rows:
+        return []
+    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+    out = []
+    for row in rows[1:]:
+        rec = {}
+        empty = True
+        for i, h in enumerate(headers):
+            if not h:
+                continue
+            v = _cell_text(row[i]) if i < len(row) else ""
+            rec[h] = v
+            if v:
+                empty = False
+        if not empty:
+            out.append(rec)
+    return out
+
+
+HEADER_ALIASES = {
+    "name": {"lp名称", "收件人名称", "名称", "主体名称", "客户名称", "lp name", "name"},
+    "wm": {"水印名称", "水印"},
+    "to": {"收件人", "收件邮箱", "to", "邮箱", "email"},
+    "cc": {"抄送", "cc"},
+    "bcc": {"密送", "bcc"},
+    "files": {"附件路径", "附件", "额外附件", "attachments", "files"},
+    "subject": {"邮件标题", "标题", "主题", "subject"},
+    "open_pw": {"打开口令", "打开密码", "open pw"},   # 不收"密码/口令"这种歧义列名
+    "owner_pw": {"权限口令", "权限密码", "owner pw"},
+    "merge_group": {"合并组", "merge group", "merge_group", "group", "组"},
+    "from_addr": {"发件人", "代发地址", "from", "sent on behalf of"},
+}
+
+
+def parse_import_rows(rows):
+    """rows: 二维列表，第一行为表头。返回 (收件人记录列表, 未识别的列名列表)。
+
+    v2 兼容实现：口令留空时保留空串（导入合并时不清掉已有口令）。
+    """
+    if not rows:
+        return [], []
+    header = ["" if h is None else str(h).strip().lower() for h in rows[0]]
+    col_map = {}
+    unknown = []
+    for idx, h in enumerate(header):
+        hit = None
+        for key, aliases in HEADER_ALIASES.items():
+            if h in aliases:
+                hit = key
+                break
+        if hit:
+            col_map[hit] = idx
+        elif h:
+            unknown.append(str(rows[0][idx]))
+    lps = []
+    for row in rows[1:]:
+        def cell(key):
+            i = col_map.get(key)
+            if i is None or i >= len(row):
+                return ""
+            v = row[i]
+            return "" if v is None else str(v).strip()
+        if not cell("name") or cell("name").startswith("示例："):
+            continue  # 跳过空行与导入模板里的示例占位行
+        lps.append({
+            "name": cell("name"),
+            "wm": cell("wm") or cell("name"),
+            "to": cell("to"),
+            "cc": cell("cc"),
+            "bcc": cell("bcc"),
+            "subject": cell("subject"),
+            "files": cell("files"),
+            "open_pw": cell("open_pw"),
+            "owner_pw": cell("owner_pw"),
+            "merge_group": cell("merge_group"),
+            "from_addr": cell("from_addr"),
+        })
+    return lps, unknown
+
+
+def parse_import_rows_v3(rows):
+    """v3 收件人导入。
+
+    识别不了的列 → 收件人的自定义字段（供文档映射用）。
+    返回 (recipients, unknown_cols, field_cols)。
+    """
+    if not rows:
+        return [], [], []
+    header = ["" if h is None else str(h).strip() for h in rows[0]]
+    lower = [h.lower() for h in header]
+    col_map = {}
+    unknown = []
+    field_cols = []   # [(列下标, 原始列名)]
+    for idx, h in enumerate(lower):
+        hit = None
+        for key, aliases in HEADER_ALIASES.items():
+            if h in aliases:
+                hit = key
+                break
+        if hit:
+            col_map[hit] = idx
+        elif h:
+            unknown.append(header[idx])
+            field_cols.append((idx, header[idx]))
+    recips = []
+    for row in rows[1:]:
+        def cell(key):
+            i = col_map.get(key)
+            if i is None or i >= len(row):
+                return ""
+            v = row[i]
+            return "" if v is None else str(v).strip()
+        name = cell("name")
+        if not name or name.startswith("示例："):
+            continue
+        fields = {}
+        for idx, col in field_cols:
+            if idx < len(row):
+                v = row[idx]
+                if v is not None and str(v).strip():
+                    fields[col] = str(v).strip()
+        recips.append(normalize_recipient({
+            "name": name,
+            "wm": cell("wm") or name,
+            "to": cell("to"),
+            "cc": cell("cc"),
+            "bcc": cell("bcc"),
+            "subject": cell("subject"),
+            "files": cell("files"),
+            "open_pw": cell("open_pw"),
+            "owner_pw": cell("owner_pw"),
+            "merge_group": cell("merge_group"),
+            "from_addr": cell("from_addr"),
+            "fields": fields,
+        }))
+    return recips, unknown, [c for _i, c in field_cols]
+
+
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _stamp():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _new_id(prefix):
+    return "%s-%s-%s" % (prefix, _stamp(), secrets.token_hex(3))
+
+
+# ============================================================================
+# 数据模型
+# ============================================================================
+
+DEFAULT_FILENAME_TPL = "{{原件名}}_{{LP名称}}"
+
+# 演示数据（均为虚构，邮箱用保留域名，可直接跑通全流程）
+MOCK_LPS = [
+    ["苏州启衡科技有限公司", "", "ir@qiheng-demo.cn", "fin@qiheng-demo.cn", "", "", "", "", ""],
+    ["宁波晨曦汐诺供应链股份有限公司", "", "contact@chenxi-demo.cn", "", "", "", "", "Demo-Open-88", ""],
+    ["新疆乌鲁木齐市泓远红杉智能科技有限公司", "", "admin@hongyuan-demo.cn", "ir@hongyuan-demo.cn", "audit@hongyuan-demo.cn", "", "", "", ""],
+    ["上海临港科创一期产业投资有限公司", "", "lg@chuangxin-demo.cn", "", "", "临港科创2026年度交付文件", "", "", ""],
+    ["珠海横琴粤澳深谋咨询服务有限公司", "", "gp@henqin-demo.cn", "fin@henqin-demo.cn", "", "", "", "", "Demo-Owner-66"],
+    ["北京中关军融创启信息技术有限公司", "演示专用水印", "zg@rongchuang-demo.cn", "", "", "", "", "", ""],
+    ["深圳前海深港现代服务业合作区汇金聚富实业有限公司", "", "huijin@qianhai-demo.cn", "", "", "", "", "", ""],
+    ["杭州西湖区云栖数字经济研究院", "", "yunqi@xihu-demo.cn", "ir@xihu-demo.cn", "", "", "", "", ""],
+]
+MOCK_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密送", "邮件标题",
+                "附件路径", "打开口令", "权限口令"]
+
+# v3 默认邮件模板（与 v2 保持一致的措辞）
+DEFAULT_SUBJECT_V3 = "机密文件（{{收件人名称}} 专属）"
+DEFAULT_BODY_V3 = """<div style="font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
+<p><b>{{收件人名称}}</b> 您好：</p>
+<p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>
+<p style="padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;">
+<b>打开口令：{{打开口令}}</b></p>
+<p style="color:#888;font-size:12px;">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>
+<p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>
+</div>"""
+
+DEFAULT_RECIPIENT = {
+    "name": "", "to": "", "cc": "", "bcc": "",
+    "wm": "", "group": "", "subject": "",
+    "fields": {},
+    "open_pw": "", "owner_pw": "",
+    "attachments": [],
+}
+
+DEFAULT_ATTACHMENT = {
+    "name": "", "path": "", "scope": "all", "targets": [], "group": "",
+}
+
+DEFAULT_MAIL = {
+    "subject": "", "body": "", "from_addr": "", "cc_default": "", "bcc_default": "",
+}
+
+DEFAULT_OPTIONS = {
+    "merge_groups": True,
+    "send_mode": "per_group",   # 发送模式：per_lp 每人一份 / per_group 按组合并 / all 全部合并
+    "gp_owner_mode": False,
+    "gp_owner_pw": "",
+    "outdir": "",
+    "filename_tpl": DEFAULT_FILENAME_TPL,
+    "wm_settings": {},
+    "constants": {},
+}
+
+# ---------- 发送模式 ----------
+# 事件级开关：决定「几封邮件 / 几份文档」。
+#   per_lp    每人一份：每位收件人一封邮件、各自一份文档（最常见）
+#   per_group 按组合并：同一合并组的收件人共用一封邮件，附件包合并
+#   all       全部合并：所有收件人共用一封邮件、一份文档
+SEND_MODES = [
+    ("per_lp", "每人一份", "每位收件人各自一封邮件、各自一份文档"),
+    ("per_group", "按组合并", "同一合并组的收件人共用一封邮件，附件包合并"),
+    ("all", "全部合并", "所有收件人共用一封邮件、一份文档"),
+]
+SEND_MODE_KEYS = [k for k, _l, _d in SEND_MODES]
+SEND_MODE_LABELS = {k: l for k, l, _d in SEND_MODES}
+SEND_MODE_DESC = {k: d for k, _l, d in SEND_MODES}
+SEND_MODE_DEFAULT = "per_group"
+
+
+def send_mode_of(event):
+    """取事件的发送模式。
+
+    认 options.send_mode；没有就退回旧的 options.merge_groups 布尔（v2 迁移数据）。
+    """
+    opts = ((event or {}).get("options") or {})
+    m = str(opts.get("send_mode") or "").strip()
+    if m in SEND_MODE_KEYS:
+        return m
+    if "merge_groups" in opts:
+        return "per_group" if opts.get("merge_groups") else "per_lp"
+    return SEND_MODE_DEFAULT
+
+
+DEFAULT_SETTINGS = {
+    "version": 3,
+    "wm_settings": {},
+    "gp_owner_mode": False,
+    "gp_owner_pw": "",
+    "outdir": "",
+    "filename_tpl": DEFAULT_FILENAME_TPL,
+    "auto_update": True,
+    "field_templates": [
+        {"name": "催缴场景字段", "columns": ["Call_Amount", "Unfunded", "Due_Date"]},
+        {"name": "对账场景字段", "columns": ["Balance", "Paid_Amount", "Statement_Date"]},
+    ],
+    "mail_subject": "",
+    "mail_body": "",
+    "from_addr": "",
+}
+
+# ============================================================================
+# 产出条目（v3.1 重构）
+# ============================================================================
+# 流水线上每一行 = 一个要附上的东西，只有两种：
+#   generate 生成文档：Word 模板 → .docx →（可选）PDF →（可选）水印 →（可选）加密
+#   attach   附加文件：磁盘上已有的文件 →（可选，仅 PDF）水印 →（可选，仅 PDF）加密
+# 「转 PDF / 加水印 / 加密」是条目上的勾选项，不是独立步骤（顺序固定，用户不用排）。
+ITEM_KINDS = ("generate", "attach")
+
+ITEM_KIND_LABELS = {
+    "generate": "生成文档",
+    "attach": "附加文件",
+}
+
+ITEM_KIND_DESC = {
+    "generate": "用 Word 模板给每位收件人生成一份内容不同的文档",
+    "attach": "把磁盘上已有的文件放进附件包",
+}
+
+# 产出粒度：这一条产出几份文件
+GRANULARITIES = ("per_lp", "per_group", "all")
+
+GRANULARITY_LABELS = {
+    "per_lp": "每人一份",
+    "per_group": "每组合并一份",
+    "all": "全员共用一份",
+}
+
+GRANULARITY_DESC = {
+    "per_lp": "每位收件人各得一份，用他自己的字段、水印和口令",
+    "per_group": "同一合并组共用一份，用组内第一个人的字段",
+    "all": "所有收件人共用同一份（口令也共享）",
+}
+
+# PDF 权限位（v3.1 起可配置；默认仍为「仅打印」，保持既有铁律的默认行为）
+PERMISSIONS = ("print", "edit", "copy")
+
+PERMISSION_LABELS = {
+    "print": "允许打印",
+    "edit": "允许编辑",
+    "copy": "允许复制内容",
+}
+
+PERMISSION_DESC = {
+    "print": "收件人可以打印这份文件",
+    "edit": "收件人打开后可以修改内容",
+    "copy": "收件人可以复制里面的文字和图片",
+}
+
+DEFAULT_PERMISSIONS = ["print"]
+
+DEFAULT_ITEM = {
+    "id": "", "kind": "generate", "name": "", "enabled": True,
+    "params": {}, "granularity": "per_lp", "mapping": {}, "sheet": {},
+}
+
+# 占位符来源种类（**字段级**，不再是步骤级）
+SOURCE_RECIPIENT = "recipient"   # 收件人字段
+SOURCE_CONSTANT = "constant"     # 事件常量
+SOURCE_SHEET = "sheet"           # 外部 Excel
+
+
+def normalize_recipient(rec):
+    """把任意来源的收件人记录规范成 v3 结构（容错：坏数据不抛异常）。"""
+    out = dict(DEFAULT_RECIPIENT)
+    out["fields"] = {}
+    out["attachments"] = []
+    if not isinstance(rec, dict):
+        return out
+    for k in ("name", "to", "cc", "bcc", "open_pw", "owner_pw", "subject"):
+        v = rec.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    # 水印文字：v2 用 wm，v3 概念名 wm_text，两者都收，统一存 wm
+    for k in ("wm", "wm_text"):
+        v = rec.get(k)
+        if isinstance(v, str) and v:
+            out["wm"] = v
+            break
+    # 合并组：v2 用 merge_group，v3 用 group
+    for k in ("group", "merge_group"):
+        v = rec.get(k)
+        if isinstance(v, str) and v:
+            out["group"] = v
+            break
+    fields = rec.get("fields")
+    if isinstance(fields, dict):
+        for k, v in fields.items():
+            if v is None:
+                continue
+            out["fields"][str(k)] = str(v)
+    atts = rec.get("attachments")
+    if isinstance(atts, list):
+        out["attachments"] = [str(a).strip() for a in atts
+                              if isinstance(a, str) and a.strip()]
+    # v2 的 files 字段（分号分隔的附件路径）→ attachments
+    files = rec.get("files")
+    if isinstance(files, str) and files.strip():
+        out["attachments"] = out["attachments"] + split_paths(files)
+    return out
+
+
+def normalize_attachment(att):
+    out = dict(DEFAULT_ATTACHMENT)
+    out["targets"] = []
+    if not isinstance(att, dict):
+        return out
+    for k in ("name", "path", "group"):
+        v = att.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    scope = att.get("scope")
+    if scope in ("all", "specific", "group"):
+        out["scope"] = scope
+    targets = att.get("targets")
+    if isinstance(targets, list):
+        out["targets"] = [str(t) for t in targets if isinstance(t, str) and t.strip()]
+    elif isinstance(targets, str) and targets.strip():
+        out["targets"] = split_paths(targets)
+    return out
+
+
+def normalize_item(it):
+    """把任意来源的条目配置规范成 v3.1 结构（容错：坏数据不抛异常）。"""
+    out = {
+        "id": "", "kind": "generate", "name": "", "enabled": True,
+        "params": {}, "granularity": "per_lp", "mapping": {}, "sheet": {},
+    }
+    if not isinstance(it, dict):
+        it = {}
+    k = it.get("kind")
+    out["kind"] = k if k in ITEM_KINDS else "generate"
+    for k in ("id", "name"):
+        v = it.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    if not out["id"]:
+        out["id"] = _new_id("it")
+    en = it.get("enabled")
+    out["enabled"] = bool(en) if en is not None else True
+    g = it.get("granularity")
+    out["granularity"] = g if g in GRANULARITIES else "per_lp"
+
+    params = it.get("params")
+    params = params if isinstance(params, dict) else {}
+    p = {
+        "template_path": "",       # kind=generate
+        "files": [],               # kind=attach
+        "to_pdf": False,
+        "watermark": False,
+        "encrypt": False,
+        "permissions": list(DEFAULT_PERMISSIONS),
+    }
+    v = params.get("template_path")
+    if isinstance(v, str):
+        p["template_path"] = v
+    fl = params.get("files")
+    if isinstance(fl, list):
+        p["files"] = [str(x).strip() for x in fl
+                      if isinstance(x, (str, Path)) and str(x).strip()]
+    elif isinstance(fl, str) and fl.strip():
+        p["files"] = split_paths(fl)
+    for b in ("to_pdf", "watermark", "encrypt"):
+        if b in params:
+            p[b] = bool(params[b])
+    perms = params.get("permissions")
+    if isinstance(perms, list):
+        # 注意：用户主动清空权限位时保留空列表（= 只能打开查看）；
+        # 没配 permissions 键时才用默认的「仅打印」。
+        p["permissions"] = [x for x in perms if x in PERMISSIONS]
+    out["params"] = p
+
+    # 字段映射：{占位符: 来源键}，来源键见 field_source_options()
+    mp = it.get("mapping")
+    mp = mp if isinstance(mp, dict) else {}
+    mapping = {}
+    mf = mp.get("fields") if isinstance(mp.get("fields"), dict) else mp
+    for kk, vv in (mf or {}).items():
+        if isinstance(kk, str) and isinstance(vv, str):
+            mapping[kk] = vv
+    out["mapping"] = mapping
+
+    # 外部数据表（只有映射里用到 sheet. 来源时才需要）
+    sh = it.get("sheet")
+    sh = sh if isinstance(sh, dict) else {}
+    sheet = {"path": "", "key_col": "", "match_col": "name"}
+    for kk in ("path", "key_col", "match_col"):
+        if isinstance(sh.get(kk), str):
+            sheet[kk] = sh[kk]
+    out["sheet"] = sheet
+    return out
+
+
+def new_item(kind="generate", name=""):
+    """新建一个条目。"""
+    it = normalize_item({"kind": kind, "name": name})
+    if not it["name"]:
+        it["name"] = {"generate": "新生成文档",
+                       "attach": "新附加文件"}.get(kind, "新条目")
+    return it
+
+
+def item_uses_sheet(item):
+    """这条目的字段映射里是否用到了外部数据表。"""
+    mp = (item or {}).get("mapping") or {}
+    return any(str(v).startswith("sheet.") for v in mp.values())
+
+
+def normalize_mail(mail):
+    out = dict(DEFAULT_MAIL)
+    if not isinstance(mail, dict):
+        return out
+    for k in DEFAULT_MAIL:
+        v = mail.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def normalize_options(opts):
+    out = dict(DEFAULT_OPTIONS)
+    out["wm_settings"] = {}
+    out["constants"] = {}
+    if not isinstance(opts, dict):
+        return out
+    for k in ("merge_groups", "gp_owner_mode"):
+        if k in opts:
+            out[k] = bool(opts[k])
+    for k in ("gp_owner_pw", "outdir", "filename_tpl"):
+        v = opts.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    if not out["filename_tpl"]:
+        out["filename_tpl"] = DEFAULT_FILENAME_TPL
+    ws = opts.get("wm_settings")
+    if isinstance(ws, dict):
+        out["wm_settings"] = dict(ws)
+    consts = opts.get("constants")
+    if isinstance(consts, dict):
+        out["constants"] = {str(k): ("" if v is None else str(v))
+                            for k, v in consts.items()}
+    sm = str(opts.get("send_mode") or "").strip()
+    if sm in SEND_MODE_KEYS:
+        out["send_mode"] = sm
+        out["merge_groups"] = (sm != "per_lp")
+    elif "merge_groups" in opts:
+        out["send_mode"] = "per_group" if opts.get("merge_groups") else "per_lp"
+    return out
+
+
+def normalize_event(ev):
+    out = {
+        "id": "", "name": "", "biz_type": "", "due_date": "", "notes": "",
+        "created_at": "", "updated_at": "", "status": "",
+        "scenario_id": "", "scenario_name": "",
+        "recipients": [], "pipeline": [], "attachments": [],
+        "mail": dict(DEFAULT_MAIL), "options": dict(DEFAULT_OPTIONS),
+    }
+    if not isinstance(ev, dict):
+        return out
+    for k in ("id", "name", "biz_type", "due_date", "notes",
+              "created_at", "updated_at", "status", "scenario_id", "scenario_name"):
+        v = ev.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    if not out["id"]:
+        out["id"] = _new_id("evt")
+    recips = ev.get("recipients")
+    if isinstance(recips, list):
+        out["recipients"] = [normalize_recipient(r) for r in recips]
+    pipe = ev.get("pipeline")
+    if isinstance(pipe, list):
+        out["pipeline"] = [normalize_item(s) for s in pipe]
+    atts = ev.get("attachments")
+    if isinstance(atts, list):
+        out["attachments"] = [normalize_attachment(a) for a in atts]
+    out["mail"] = normalize_mail(ev.get("mail"))
+    out["options"] = normalize_options(ev.get("options"))
+    return out
+
+
+def normalize_scenario(sc):
+    out = {
+        "id": "", "name": "", "description": "",
+        "created_at": "", "updated_at": "",
+        "recipients": [], "pipeline": [], "attachments": [],
+        "mail": dict(DEFAULT_MAIL), "options": dict(DEFAULT_OPTIONS),
+    }
+    if not isinstance(sc, dict):
+        return out
+    for k in ("id", "name", "description", "created_at", "updated_at"):
+        v = sc.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    if not out["id"]:
+        out["id"] = _new_id("scn")
+    recips = sc.get("recipients")
+    if isinstance(recips, list):
+        out["recipients"] = [normalize_recipient(r) for r in recips]
+    pipe = sc.get("pipeline")
+    if isinstance(pipe, list):
+        out["pipeline"] = [normalize_item(s) for s in pipe]
+    atts = sc.get("attachments")
+    if isinstance(atts, list):
+        out["attachments"] = [normalize_attachment(a) for a in atts]
+    out["mail"] = normalize_mail(sc.get("mail"))
+    out["options"] = normalize_options(sc.get("options"))
+    return out
+
+
+def new_event(name="未命名事件", scenario=None):
+    """新建发送事件。若给了场景，则复制一份场景配置（复制式，改场景不影响已建事件）。"""
+    ev = normalize_event({
+        "name": name,
+        "created_at": _now_str(),
+        "updated_at": _now_str(),
+        "status": "草稿",
+    })
+    if scenario:
+        ev["scenario_id"] = scenario.get("id", "")
+        ev["scenario_name"] = scenario.get("name", "")
+        ev["recipients"] = [normalize_recipient(r) for r in scenario.get("recipients", [])]
+        ev["pipeline"] = [normalize_item(s) for s in scenario.get("pipeline", [])]
+        ev["attachments"] = [normalize_attachment(a) for a in scenario.get("attachments", [])]
+        ev["mail"] = normalize_mail(scenario.get("mail"))
+        ev["options"] = normalize_options(scenario.get("options"))
+    return ev
+
+
+def new_scenario(name="新建场景", description=""):
+    return normalize_scenario({
+        "name": name, "description": description,
+        "created_at": _now_str(), "updated_at": _now_str(),
+    })
+
+
+def clone_event(ev, new_name=None):
+    """复制事件（新 ID，收件人/流水线/附件深拷贝）。"""
+    data = json.loads(json.dumps(ev, ensure_ascii=False))
+    data["id"] = _new_id("evt")
+    data["name"] = new_name or (ev.get("name", "事件") + " 副本")
+    data["created_at"] = _now_str()
+    data["updated_at"] = _now_str()
+    data["status"] = "草稿"
+    data["runs"] = []
+    for st in data.get("pipeline", []):
+        st["id"] = _new_id("st")
+    return normalize_event(data)
+
+
+def sync_scenario_to_event(scenario, event):
+    """把场景配置同步进事件（复制式，用户显式触发）。
+
+    只同步「怎么做」：流水线/附件/邮件模板/选项/收件人模板。
+    收件人按名称合并：已存在的收件人保留其口令与自定义字段。
+    返回 (event, 变更说明列表)。
+    """
+    ev = normalize_event(json.loads(json.dumps(event, ensure_ascii=False)))
+    notes = []
+    ev["pipeline"] = [normalize_item(s) for s in scenario.get("pipeline", [])]
+    ev["attachments"] = [normalize_attachment(a) for a in scenario.get("attachments", [])]
+    ev["mail"] = normalize_mail(scenario.get("mail"))
+    ev["options"] = normalize_options(scenario.get("options"))
+    notes.append("流水线：%d 步" % len(ev["pipeline"]))
+    notes.append("附件：%d 个" % len(ev["attachments"]))
+    # 收件人：按名称合并，保留已有口令
+    existing = {r.get("name", ""): r for r in ev.get("recipients", [])}
+    added = 0
+    for rec in scenario.get("recipients", []):
+        src = normalize_recipient(rec)
+        name = src.get("name", "")
+        if not name:
+            continue
+        cur = existing.get(name)
+        if cur is None:
+            ev["recipients"].append(src)
+            added += 1
+        else:
+            # 只补空缺，不覆盖已有口令与自定义字段
+            for k in ("to", "cc", "bcc", "wm", "group"):
+                if not cur.get(k) and src.get(k):
+                    cur[k] = src[k]
+            for k, v in src.get("fields", {}).items():
+                cur.setdefault("fields", {}).setdefault(k, v)
+    notes.append("收件人：新增 %d 个，其余按名称合并（已有口令保留）" % added)
+    ev["updated_at"] = _now_str()
+    return ev, notes
+
+
+# ============================================================================
+# 数据层：目录化存储
+# ============================================================================
+
+def read_json_file(path):
+    """读 JSON。返回 (data, error)；error 非 None 表示文件存在但读不了。"""
+    p = Path(path)
+    if not p.exists():
+        return None, None
+    try:
+        raw = p.read_text(encoding="utf-8-sig")  # 容忍 BOM
+    except Exception as e:
+        return None, str(e)
+    if not raw.strip():
+        return None, "文件为空"
+    try:
+        return json.loads(raw), None
+    except Exception as e:
+        return None, str(e)
+
+
+def write_json_file(path, data):
+    """原子写：先写 .tmp 再替换；旧文件轮转 .bak。返回 (ok, error)。"""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    bak = p.with_name(p.name + ".bak")
+    try:
+        raw = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp.write_text(raw, encoding="utf-8")
+        if p.exists():
+            p.replace(bak)
+        os.replace(tmp, p)
+        return True, None
+    except Exception as e:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return False, str(e)
+
+
+class Store:
+    """lp_data/ 目录化存储。
+
+    结构：
+      lp_data/settings.json
+      lp_data/events/<event_id>.json
+      lp_data/scenarios/<scenario_id>.json
+      lp_data/runs/<event_id>-<ts>.json
+    """
+
+    def __init__(self, base_dir=None):
+        self.base = Path(base_dir) if base_dir else default_base_dir()
+        self.data_dir = self.base / DATA_DIR_NAME
+        self.settings_file = self.data_dir / SETTINGS_FILE
+        self.events_dir = self.data_dir / EVENTS_DIR
+        self.scenarios_dir = self.data_dir / SCENARIOS_DIR
+        self.runs_dir = self.data_dir / RUNS_DIR
+        self.legacy_file = self.base / LEGACY_DATA_FILE
+
+    # ----- 目录 -----
+
+    def ensure_dirs(self):
+        for d in (self.data_dir, self.events_dir, self.scenarios_dir, self.runs_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def exists(self):
+        return self.data_dir.exists()
+
+    # ----- 设置 -----
+
+    def load_settings(self):
+        data, err = read_json_file(self.settings_file)
+        if err is not None:
+            # 损坏：改名留证，绝不覆盖（防口令丢失）
+            bak = self._quarantine(self.settings_file, "settings.corrupt")
+            self.last_error = "settings.json 读取失败：%s%s" % (
+                err, ("（原文件已备份为 %s）" % bak.name) if bak else "")
+            return dict(DEFAULT_SETTINGS), self.last_error
+        if data is None:
+            return dict(DEFAULT_SETTINGS), None
+        out = dict(DEFAULT_SETTINGS)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                out[k] = v
+        out.setdefault("field_templates", list(DEFAULT_SETTINGS["field_templates"]))
+        return out, None
+
+    def save_settings(self, data):
+        self.ensure_dirs()
+        ok, err = write_json_file(self.settings_file, data)
+        return ok, err
+
+    def get_settings(self):
+        """读全局设置（出错时回落到默认值并记 last_error）。"""
+        data, err = self.load_settings()
+        if err:
+            self.last_error = err
+        return data
+
+    # ----- 事件 -----
+
+    def event_path(self, event_id):
+        return self.events_dir / ("%s.json" % sanitize_filename(event_id, 80))
+
+    def list_events(self):
+        """返回 [event dict]，按更新时间倒序。损坏文件跳过并记录。"""
+        out = []
+        if not self.events_dir.exists():
+            return out
+        for p in sorted(self.events_dir.glob("*.json")):
+            data, err = read_json_file(p)
+            if err is not None:
+                self._quarantine(p, "event.corrupt")
+                continue
+            if isinstance(data, dict):
+                out.append(normalize_event(data))
+        out.sort(key=lambda e: e.get("updated_at") or "", reverse=True)
+        return out
+
+    def load_event(self, event_id):
+        data, err = read_json_file(self.event_path(event_id))
+        if err is not None:
+            return None, err
+        if data is None:
+            return None, None
+        return normalize_event(data), None
+
+    def save_event(self, event):
+        event = normalize_event(event)
+        event["updated_at"] = _now_str()
+        self.ensure_dirs()
+        ok, err = write_json_file(self.event_path(event["id"]), event)
+        return ok, err
+
+    def delete_event(self, event_id):
+        p = self.event_path(event_id)
+        if p.exists():
+            try:
+                p.unlink()
+                return True, None
+            except OSError as e:
+                return False, str(e)
+        return False, "事件不存在"
+
+    # ----- 场景 -----
+
+    def scenario_path(self, scenario_id):
+        return self.scenarios_dir / ("%s.json" % sanitize_filename(scenario_id, 80))
+
+    def list_scenarios(self):
+        out = []
+        if not self.scenarios_dir.exists():
+            return out
+        for p in sorted(self.scenarios_dir.glob("*.json")):
+            data, err = read_json_file(p)
+            if err is not None:
+                self._quarantine(p, "scenario.corrupt")
+                continue
+            if isinstance(data, dict):
+                out.append(normalize_scenario(data))
+        out.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+        return out
+
+    def load_scenario(self, scenario_id):
+        data, err = read_json_file(self.scenario_path(scenario_id))
+        if err is not None:
+            return None, err
+        if data is None:
+            return None, None
+        return normalize_scenario(data), None
+
+    def save_scenario(self, sc):
+        sc = normalize_scenario(sc)
+        sc["updated_at"] = _now_str()
+        self.ensure_dirs()
+        ok, err = write_json_file(self.scenario_path(sc["id"]), sc)
+        return ok, err
+
+    def delete_scenario(self, scenario_id):
+        p = self.scenario_path(scenario_id)
+        if p.exists():
+            try:
+                p.unlink()
+                return True, None
+            except OSError as e:
+                return False, str(e)
+        return False, "场景不存在"
+
+    # ----- 执行记录 -----
+
+    def save_run(self, run):
+        self.ensure_dirs()
+        name = "%s-%s.json" % (sanitize_filename(run.get("event_id", "evt"), 60),
+                               run.get("id", _stamp()))
+        ok, err = write_json_file(self.runs_dir / name, run)
+        return ok, err
+
+    def list_runs(self, event_id=None):
+        out = []
+        if not self.runs_dir.exists():
+            return out
+        for p in sorted(self.runs_dir.glob("*.json")):
+            data, err = read_json_file(p)
+            if err is not None:
+                self._quarantine(p, "run.corrupt")
+                continue
+            if not isinstance(data, dict):
+                continue
+            if event_id and data.get("event_id") != event_id:
+                continue
+            out.append(data)
+        out.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+        return out
+
+    def load_last_run(self, event_id):
+        runs = self.list_runs(event_id)
+        return runs[0] if runs else None
+
+    # ----- 内部工具 -----
+
+    def _quarantine(self, path, prefix):
+        """损坏文件改名留证（不删除、不覆盖）。返回新路径或 None。"""
+        p = Path(path)
+        try:
+            bak = p.with_name("%s-%s%s" % (prefix, _stamp(), p.suffix))
+            p.replace(bak)
+            return bak
+        except OSError:
+            return None
+
+
+# ============================================================================
+# v2 → v3 迁移
+# ============================================================================
+
+def v2_to_v3_payload(legacy):
+    """把 v2 的 lp_data.json 内容转成 v3 的 settings / scenario / event 三件套。
+
+    返回 (settings, scenario, event, notes)。纯函数，便于测试。
+    """
+    notes = []
+    data = legacy if isinstance(legacy, dict) else {}
+
+    settings = dict(DEFAULT_SETTINGS)
+    settings["wm_settings"] = dict(data.get("wm_settings") or {})
+    settings["gp_owner_mode"] = bool(data.get("gp_owner_mode"))
+    settings["gp_owner_pw"] = data.get("gp_owner_pw") or ""
+    settings["outdir"] = data.get("outdir") or ""
+    settings["filename_tpl"] = data.get("filename_tpl") or DEFAULT_FILENAME_TPL
+    settings["auto_update"] = bool(data.get("auto_update", True))
+    settings["mail_subject"] = data.get("subject") or ""
+    settings["mail_body"] = data.get("body") or ""
+    settings["from_addr"] = data.get("from_addr") or ""
+
+    recips = [normalize_recipient(r) for r in (data.get("lps") or [])
+              if isinstance(r, dict)]
+
+    # 流水线：v2 有 Word 模板 → 变成一个「生成文档」条目（带转 PDF）
+    pipeline = []
+    tpl = data.get("word_template") or ""
+    if tpl:
+        pipeline.append(normalize_item({
+            "kind": "generate", "name": "Word 模板",
+            "params": {"template_path": tpl, "to_pdf": True},
+            "mapping": {},
+        }))
+        notes.append("Word 模板已转为流水线的一个「生成文档」条目：%s" % tpl)
+    else:
+        notes.append("v2 未记录原件 PDF 清单（该列表当时不落盘），"
+                     "请在流水线里用「源 PDF」步骤重新添加原件")
+    if data.get("wt_mappings"):
+        notes.append("v2 的外部数据表映射（%d 条占位符）已保留在事件的"
+                     " legacy_mappings 里；v2 没有保存那张 Excel 的路径，"
+                     "如仍需 from_sheet 请在步骤里重新选择数据表"
+                     % len(data.get("wt_mappings") or []))
+
+    mail = {
+        "subject": data.get("subject") or "",
+        "body": data.get("body") or "",
+        "from_addr": data.get("from_addr") or "",
+        "cc_default": "", "bcc_default": "",
+    }
+    options = normalize_options({
+        "merge_groups": True,
+        "gp_owner_mode": bool(data.get("gp_owner_mode")),
+        "gp_owner_pw": data.get("gp_owner_pw") or "",
+        "outdir": data.get("outdir") or "",
+        "filename_tpl": data.get("filename_tpl") or DEFAULT_FILENAME_TPL,
+        "wm_settings": dict(data.get("wm_settings") or {}),
+        "constants": {},
+    })
+
+    scenario = normalize_scenario({
+        "name": "默认场景",
+        "description": "由 v2 数据自动迁移生成（可改，不影响已创建的事件）",
+        "created_at": _now_str(), "updated_at": _now_str(),
+        "recipients": recips, "pipeline": pipeline, "attachments": [],
+        "mail": mail, "options": options,
+    })
+
+    event = new_event("未命名事件", scenario)
+    event["legacy_mappings"] = data.get("wt_mappings") or []
+    notes.append("已生成默认场景「默认场景」+ 事件「未命名事件」，"
+                 "收件人 %d 位" % len(recips))
+    return settings, scenario, event, notes
+
+
+def migrate_v2_to_v3(store, legacy_path=None):
+    """v2 lp_data.json → lp_data/ 目录。返回 (ok, notes, error)。
+
+    规则：原文件改名保留为 lp_data.json.bak，**不删除**。
+    """
+    legacy = Path(legacy_path) if legacy_path else store.legacy_file
+    if not legacy.exists():
+        return False, [], "没有找到 %s" % legacy.name
+    if store.data_dir.exists() and any(store.data_dir.iterdir()):
+        return False, [], "%s 已存在且非空，跳过迁移" % store.data_dir.name
+
+    data, err = read_json_file(legacy)
+    if err is not None:
+        # 损坏数据绝不覆盖：改名留证并中止
+        bak = store._quarantine(legacy, "lp_data.corrupt")
+        msg = "%s 读取失败：%s" % (legacy.name, err)
+        if bak:
+            msg += "（原文件已备份为 %s）" % bak.name
+        return False, [], msg
+    if not isinstance(data, dict) or not isinstance(data.get("lps"), list):
+        bak = store._quarantine(legacy, "lp_data.corrupt")
+        msg = "%s 数据结构不合法（缺少 lps 列表）" % legacy.name
+        if bak:
+            msg += "（原文件已备份为 %s）" % bak.name
+        return False, [], msg
+
+    settings, scenario, event, notes = v2_to_v3_payload(data)
+    store.ensure_dirs()
+    ok, e1 = store.save_settings(settings)
+    if not ok:
+        return False, notes, "写入 settings.json 失败：%s" % e1
+    ok, e2 = store.save_scenario(scenario)
+    if not ok:
+        return False, notes, "写入场景失败：%s" % e2
+    ok, e3 = store.save_event(event)
+    if not ok:
+        return False, notes, "写入事件失败：%s" % e3
+
+    # 原文件改名保留（不删除），保证可回退
+    try:
+        legacy.replace(legacy.with_name(legacy.name + ".bak"))
+        notes.append("原 %s 已改名保留为 %s.bak（未删除，可随时回退）"
+                     % (legacy.name, legacy.name))
+    except OSError as e:
+        notes.append("原 %s 改名保留失败（数据已迁移，不影响使用）：%s"
+                     % (legacy.name, e))
+    return True, notes, None
+
+
+def needs_migration(store):
+    """是否需要执行 v2 → v3 迁移。"""
+    if store.data_dir.exists() and any(store.data_dir.iterdir()):
+        return False
+    return store.legacy_file.exists()
+
+
+def seed_demo(store, example_path=None):
+    """首次启动播种示例数据（保留 v2「开箱就有演示数据」的体验）。
+
+    没有 lp_data/、也没有 lp_data.json 时调用。返回 (ok, notes)。
+    """
+    src = Path(example_path) if example_path else (store.base / "lp_data.example.json")
+    data, err = read_json_file(src)
+    if not isinstance(data, dict) or not data.get("lps"):
+        # 没有示例文件（或文件里没数据）→ 用内置演示数据兜底
+        rows, _unknown = parse_import_rows([MOCK_HEADERS] + [list(r) for r in MOCK_LPS])
+        data = {"lps": rows,
+                "subject": DEFAULT_SUBJECT_V3, "body": DEFAULT_BODY_V3}
+    settings, scenario, event, notes = v2_to_v3_payload(data)
+    # 示例数据没有 Word 模板路径，流水线留空（用户自己加步骤）
+    scenario["pipeline"] = []
+    event["pipeline"] = []
+    scenario["name"] = "示例场景"
+    scenario["description"] = "示例数据（虚构邮箱，可直接跑通全流程后自行替换）"
+    event["name"] = "示例事件"
+    filled = 0
+    for rec in list(scenario["recipients"]) + list(event["recipients"]):
+        if not rec.get("open_pw"):
+            rec["open_pw"] = gen_pw()
+            filled += 1
+        if not rec.get("owner_pw"):
+            rec["owner_pw"] = gen_pw()
+            filled += 1
+    store.ensure_dirs()
+    store.save_settings(settings)
+    store.save_scenario(scenario)
+    store.save_event(event)
+    notes.append("已生成示例场景「示例场景」+ 事件「示例事件」，"
+                 "收件人 %d 位%s"
+                 % (len(scenario["recipients"]),
+                    ("，自动补齐口令 %d 个" % filled) if filled else ""))
+    return True, notes
+
+
+# ============================================================================
+# 流水线：字段解析 / 产出单元 / 步骤执行
+# ============================================================================
+
+# 内置字段的别名（用户在模板里可能写成其中任何一种）
+BUILTIN_ALIASES = {
+    "name": ("name", "名称", "收件人名称", "lp名称", "lp_name", "lpname"),
+    "wm": ("wm", "水印", "水印名称", "wm_name"),
+    "open_pw": ("open_pw", "打开口令", "打开密码", "openpw"),
+    "date": ("date", "日期"),
+}
+
+# 绝对不能进邮件/文档的字段名（架构保证，不是靠自觉）
+FORBIDDEN_FIELD_KEYS = ("owner_pw", "owner_password", "ownerpw",
+                         "权限口令", "权限密码", "owner")
+
+
+def _is_forbidden_key(key):
+    k = str(key).strip().strip("{}").strip().lower()
+    return k in [x.lower() for x in FORBIDDEN_FIELD_KEYS]
+
+
+def build_field_map(recipient, event=None, sheet_row=None):
+    """返回 {占位符: 值}。
+
+    铁律：权限口令绝不进入映射（键名与值都不进）。
+    """
+    rec = recipient or {}
+    opts = (event or {}).get("options") or {}
+    consts = opts.get("constants") or {}
+    out = {}
+    name = rec.get("name", "")
+    base = {
+        "name": name,
+        "wm": rec.get("wm") or name,
+        "open_pw": rec.get("open_pw", ""),
+        "date": date.today().strftime("%Y年%m月%d日"),
+    }
+    for group, keys in BUILTIN_ALIASES.items():
+        for k in keys:
+            out["{{%s}}" % k] = base[group]
+    for k, v in (rec.get("fields") or {}).items():
+        if _is_forbidden_key(k):
+            continue          # 权限口令类的自定义列一律不映射
+        out["{{%s}}" % k] = "" if v is None else str(v)
+        out["{{fields.%s}}" % k] = "" if v is None else str(v)
+    for k, v in consts.items():
+        if _is_forbidden_key(k):
+            continue
+        out["{{%s}}" % k] = "" if v is None else str(v)
+        out["{{constants.%s}}" % k] = "" if v is None else str(v)
+    for k, v in (sheet_row or {}).items():
+        if _is_forbidden_key(k):
+            continue
+        out["{{%s}}" % k] = "" if v is None else str(v)
+        out["{{sheet.%s}}" % k] = "" if v is None else str(v)
+    return out
+
+
+def scrub_owner_password(text, owner_pw):
+    """兜底：把权限口令明文从任何将进入邮件/文档的文本里抹掉。"""
+    if not owner_pw:
+        return text
+    return text.replace(owner_pw, "【权限口令已屏蔽】")
+
+
+def render_with_fields(tpl, field_map, owner_pw="", escape=False):
+    """按字段映射渲染模板（支持 {{字段}} 与 ?字段? 两种写法）。"""
+    import html as _h
+    out = tpl or ""
+    repl = dict(field_map or {})
+    for key, val in list(repl.items()):
+        if key.startswith("{{") and key.endswith("}}"):
+            repl["?" + key[2:-2] + "?"] = val
+    for k in sorted(repl, key=len, reverse=True):
+        v = repl[k]
+        if v is None:
+            v = ""
+        if escape:
+            v = _h.escape(str(v), quote=True)
+        out = out.replace(k, str(v))
+    return scrub_owner_password(out, owner_pw)
+
+
+def source_options(event=None, recipient=None):
+    """可用的占位符来源（不含外部数据表列）。
+
+    v3.1 起请用 field_source_options()——外部数据表的列只在真的选它时才出现。
+    """
+    return field_source_options(event, recipient, None)
+
+
+def apply_mapping_overrides(field_map, mapping_fields, recipient=None, event=None,
+                            sheet_row=None):
+    """按步骤里显式配置的映射覆盖字段取值（占位符 → 来源键）。"""
+    if not mapping_fields:
+        return field_map
+    rec = recipient or {}
+    consts = ((event or {}).get("options") or {}).get("constants") or {}
+    fields = rec.get("fields") or {}
+    for ph, src in mapping_fields.items():
+        if not src or _is_forbidden_key(src):
+            continue
+        if src == "name":
+            val = rec.get("name", "")
+        elif src == "wm":
+            val = rec.get("wm") or rec.get("name", "")
+        elif src == "open_pw":
+            val = rec.get("open_pw", "")
+        elif src == "date":
+            val = date.today().strftime("%Y年%m月%d日")
+        elif src.startswith("fields."):
+            val = fields.get(src[7:], "")
+        elif src.startswith("constants."):
+            val = consts.get(src[11:], "")
+        elif src.startswith("sheet."):
+            val = (sheet_row or {}).get(src[6:], "")
+        else:
+            val = fields.get(src, consts.get(src, ""))
+        field_map[ph] = "" if val is None else str(val)
+    return field_map
+
+
+def placeholder_key(ph):
+    """把 {{X}} / ?X? 归一成 X。"""
+    s = str(ph or "").strip()
+    if s.startswith("{{") and s.endswith("}}"):
+        return s[2:-2].strip()
+    if s.startswith("?") and s.endswith("?"):
+        return s[1:-1].strip()
+    return s
+
+
+def auto_map_placeholder(ph, event=None, recipient=None):
+    """按名字自动猜一个来源。返回来源键（猜不到返回空串＝悬空占位符）。"""
+    key = placeholder_key(ph)
+    if not key:
+        return ""
+    low = key.lower()
+    for group, aliases in BUILTIN_ALIASES.items():
+        if low in [a.lower() for a in aliases]:
+            return group
+    if key in (recipient or {}).get("fields", {}):
+        return "fields." + key
+    consts = ((event or {}).get("options") or {}).get("constants") or {}
+    if key in consts:
+        return "constants." + key
+    return ""
+
+
+def item_placeholders(item, event=None, recipient=None, sheet_row=None):
+    """条目里已配置的占位符映射：[(占位符, 来源键, 预览值)]。"""
+    fields = (item or {}).get("mapping") or {}
+    fmap = build_field_map(recipient or {}, event, sheet_row)
+    out = []
+    for ph, src in fields.items():
+        val = fmap.get(ph, "")
+        if src and src.startswith("fields."):
+            val = (recipient or {}).get("fields", {}).get(src[7:], "")
+        elif src and src.startswith("constants."):
+            consts = ((event or {}).get("options") or {}).get("constants") or {}
+            val = consts.get(src[11:], "")
+        elif src and src.startswith("sheet."):
+            val = (sheet_row or {}).get(src[6:], "")
+        out.append((ph, src, val))
+    return out
+
+
+def field_source_options(event=None, recipient=None, sheet_cols=None):
+    """占位符可选来源：[(来源键, 类别, 显示名)]。
+
+    v3.1：来源是**字段级**的，每个占位符自己选一个具体来源；
+    外部数据表的列只有在真的要选它时才出现在列表里。
+    """
+    out = [("name", "内置", "收件人名称"),
+           ("wm", "内置", "水印名称"),
+           ("open_pw", "内置", "打开口令"),
+           ("date", "内置", "日期")]
+    for k in sorted((recipient or {}).get("fields", {})):
+        out.append(("fields." + k, "收件人字段", k))
+    consts = ((event or {}).get("options") or {}).get("constants") or {}
+    for k in sorted(consts):
+        out.append(("constants." + k, "事件常量", k))
+    for k in sorted(sheet_cols or []):
+        out.append(("sheet." + k, "外部数据表", k))
+    return out
+
+
+def group_key_of(recipient):
+    """合并组 key：没有组的收件人自成一组（§+名字，不会和真实组名撞）。"""
+    g = (recipient.get("group") or "").strip()
+    return g if g else "§" + (recipient.get("name") or "")
+
+
+def build_units(event, mode):
+    """按输出粒度列出产出单元。
+
+    返回 [(unit_key, info)]；info 含 recipients / rep / group_key / lp_name。
+    """
+    recips = event.get("recipients") or []
+    if mode == "all":
+        return [("__all__", {"recipients": recips, "rep": None,
+                             "group_key": "__all__", "lp_name": ""})]
+    if mode == "per_group":
+        groups, order = {}, []
+        for r in recips:
+            key = group_key_of(r)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+        out = []
+        for key in order:
+            members = groups[key]
+            out.append((key, {"recipients": members, "rep": members[0],
+                              "group_key": key,
+                              "lp_name": members[0].get("name", ""),
+                              "group": "" if key.startswith("§") else key}))
+        return out
+    out = []
+    for r in recips:
+        out.append((r.get("name") or "", {"recipients": [r], "rep": r,
+                                          "group_key": group_key_of(r),
+                                          "lp_name": r.get("name", ""),
+                                          "group": (r.get("group") or "").strip()}))
+    return out
+
+
+def item_output_name(event, unit, source_path, orig_name=None):
+    """产物文件名（不含扩展名）。
+
+    orig_name: 覆盖「原件名」占位符的取值。**生成文档条目用它自己的条目名**
+    （否则两个条目用同一个 Word 模板会产出同名文件，附件包里就撞名了）；
+    附加文件条目用源文件名（原件名本来就该是那个文件）。
+    """
+    opts = event.get("options") or {}
+    tpl = opts.get("filename_tpl") or DEFAULT_FILENAME_TPL
+    rec = unit.get("rep") or {}
+    fields = build_field_map(rec, event)
+    stem = Path(source_path).stem if source_path else ""
+    if orig_name is not None and str(orig_name).strip():
+        stem = sanitize_filename(str(orig_name).strip(), 60)
+    mapping = {
+        "{{原件名}}": stem,
+        "{{LP名称}}": sanitize_filename(rec.get("name", ""), 60),
+        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), 60),
+        "{{水印名称}}": sanitize_filename(rec.get("wm") or rec.get("name", ""), 60),
+        "{{日期}}": date.today().strftime("%Y%m%d"),
+    }
+    out = tpl
+    for k, v in mapping.items():
+        out = out.replace(k, v)
+    for k, v in fields.items():
+        if k.startswith("{{") and k.endswith("}}"):
+            inner = k[2:-2]
+            if inner in ("name", "名称", "收件人名称", "lp名称", "lp_name",
+                         "lpname", "wm", "水印", "水印名称", "wm_name"):
+                continue      # 已经用带清洗的版本替换过了
+            out = out.replace(k, sanitize_filename(str(v), 40))
+    out = sanitize_filename(out.strip(), 90)
+    return out or "output"
+
+
+def load_sheet_data(path, key_col=""):
+    """读外部 Excel 数据表。返回 (sheet_map, warnings)。
+
+    sheet_map = {key 列的值: {列名: 值}}
+    """
+    if not path or not str(path).strip():
+        return {}, ["from_sheet 步骤没有选择数据表"]
+    p = Path(str(path).strip())
+    if not p.exists():
+        return {}, ["外部数据表不存在：%s" % p]
+    try:
+        rows = sheet_to_dicts(read_spreadsheet(p))
+    except Exception as e:
+        return {}, ["读取外部数据表失败：%s" % e]
+    if not rows:
+        return {}, ["外部数据表是空的：%s" % p]
+    cols = list(rows[0].keys())
+    if not key_col:
+        key_col = cols[0]
+    if key_col not in cols:
+        return {}, ["外部数据表里没有匹配列「%s」（现有列：%s）"
+                   % (key_col, "、".join(cols))]
+    out = {}
+    for r in rows:
+        k = str(r.get(key_col, "")).strip()
+        if k:
+            out[k] = r
+    return out, []
+
+
+# ---------------------------------------------------------------------------
+# Word 实例复用（v3.1）
+# ---------------------------------------------------------------------------
+# 坑（实测）：WordBatch 用 DispatchEx 起**私有** Word 进程，close() 只释放引用、
+# 不调 Quit（Quit 之后再释放 COM 引用会触发 0x800706be 致命异常，直接杀进程）。
+# 于是「每次生成新建一个 WordBatch」= 每次生成残留一个 WINWORD.EXE（每个约
+# 170MB）；实测一个会话能堆到 71 个，机器被拖垮（空闲内存 7.6GB → 4.1GB）。
+# 所以按线程缓存一个共享实例：一个进程最多只留一个 Word 进程。
+_WORD_LOCAL = threading.local()
+
+
+def default_word_batch():
+    """当前线程共享的 Word 实例（整个进程最多一个 WINWORD）。"""
+    wb = getattr(_WORD_LOCAL, "wb", None)
+    if wb is None:
+        wb = wm.WordBatch()
+        _WORD_LOCAL.wb = wb
+    return wb
+
+
+class RunContext:
+    """一次流水线执行期的上下文。"""
+
+    def __init__(self, event, outdir, word=None):
+        self.event = event
+        self.outdir = Path(outdir)
+        self.word = word
+        self._sheet_cache = {}
+        self.warnings = []
+    def sheet_for(self, item, recipient):
+        """收件人对应的外部数据行。
+
+        只有这个条目的字段映射里用到了 sheet. 来源，才会去读那张外部表；
+        每个条目可以配自己的表，按 (路径, 匹配列) 缓存，避免重复读。
+        """
+        if not recipient or not item_uses_sheet(item):
+            return None
+        sh = item.get("sheet") or {}
+        path = str(sh.get("path") or "").strip()
+        if not path:
+            return None
+        key = (path, sh.get("key_col", ""))
+        if key not in self._sheet_cache:
+            m, w = load_sheet_data(path, sh.get("key_col", ""))
+            self._sheet_cache[key] = (m, w)
+            self.warnings += w
+        m, _w = self._sheet_cache[key]
+        match_field = sh.get("match_col") or "name"
+        if match_field == "name":
+            val = recipient.get("name", "")
+        else:
+            val = (recipient.get("fields") or {}).get(match_field, "")
+        return m.get(str(val).strip())
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+
+def _wm_text_for(unit, event):
+    """本单元的水印文字。"""
+    rep = unit.get("rep")
+    if rep:
+        return rep.get("wm") or rep.get("name") or ""
+    recips = unit.get("recipients") or []
+    if recips:
+        return recips[0].get("wm") or recips[0].get("name") or ""
+    return event.get("name", "")
+
+
+def _passwords_for(unit, event):
+    """本单元的 (打开口令, 权限口令)。GP 统一口令优先。"""
+    opts = event.get("options") or {}
+    rep = unit.get("rep") or {}
+    if not rep:
+        # 全员共用一份（rep 为空）→ 取第一位收件人的口令
+        recips = unit.get("recipients") or []
+        rep = recips[0] if recips else {}
+    open_pw = rep.get("open_pw", "")
+    owner_pw = rep.get("owner_pw", "")
+    if opts.get("gp_owner_mode") and opts.get("gp_owner_pw"):
+        owner_pw = opts["gp_owner_pw"]
+    return open_pw, owner_pw
+
+
+def _permission_mask(perms):
+    """权限勾选 → PyMuPDF 权限位掩码。
+
+    默认（未勾任何项）= 仅打印，与既有铁律一致。
+    """
+    perms = perms if isinstance(perms, (list, tuple)) else DEFAULT_PERMISSIONS
+    mask = 0
+    if "print" in perms:
+        mask |= fitz.PDF_PERM_PRINT | fitz.PDF_PERM_PRINT_HQ
+    if "edit" in perms:
+        mask |= fitz.PDF_PERM_MODIFY
+    if "copy" in perms:
+        mask |= fitz.PDF_PERM_COPY | fitz.PDF_PERM_ANNOTATE
+    if hasattr(fitz, "PDF_PERM_ACCESSIBILITY"):
+        mask |= fitz.PDF_PERM_ACCESSIBILITY
+    return mask
+
+
+def execute_item(item, unit, event, ctx):
+    """执行一个条目在某个产出单元上的处理。
+
+    kind=generate：Word 模板 → .docx →（可选）PDF →（可选）水印 →（可选）加密
+    kind=attach  ：磁盘文件 →（可选，仅 PDF）水印 →（可选，仅 PDF）加密
+
+    返回 (产物文件列表, 警告列表)。失败抛异常。
+    """
+    import shutil
+    kind = item.get("kind") or "generate"
+    params = item.get("params") or {}
+    item_id = item.get("id") or "item"
+    outdir = ctx.outdir / sanitize_filename(item_id, 40)
+    outdir.mkdir(parents=True, exist_ok=True)
+    warnings = []
+    opts = event.get("options") or {}
+
+    if kind == "generate":
+        tpl = str(params.get("template_path", "")).strip()
+        if not tpl:
+            raise RuntimeError("「生成文档」没有选择 Word 模板")
+        if not Path(tpl).exists():
+            raise RuntimeError("Word 模板不存在：%s" % tpl)
+        rep = unit.get("rep")
+        # 只有映射里用到了 sheet. 来源，才去查外部数据表行
+        sheet_row = ctx.sheet_for(item, rep)
+        fmap = build_field_map(rep or {}, event, sheet_row)
+        apply_mapping_overrides(fmap, item.get("mapping") or {},
+                                rep or {}, event, sheet_row)
+        base = item_output_name(event, unit, tpl,
+                                orig_name=(item.get("name") or "").strip() or None)
+        docx = outdir / (base + ".docx")
+        wm.generate_notice_docx(tpl, str(docx), fmap, batch=ctx.word)
+        cur = docx
+    else:
+        files = params.get("files") or []
+        if not files:
+            raise RuntimeError("「附加文件」没有选择任何文件")
+        cur = []
+        for src_path in files:
+            sp = str(src_path).strip()
+            if not sp:
+                continue
+            if not Path(sp).exists():
+                raise RuntimeError("文件不存在：%s" % sp)
+            base = item_output_name(event, unit, sp)
+            dst = outdir / (base + Path(sp).suffix)
+            shutil.copy2(sp, str(dst))
+            cur.append(dst)
+        if not cur:
+            raise RuntimeError("「附加文件」没有选择任何文件")
+
+    # ---- 处理链：转 PDF → 加水印 → 加密（顺序固定） ----
+    if kind == "generate" and params.get("to_pdf"):
+        docx = cur if isinstance(cur, Path) else cur[0]
+        out = outdir / (docx.stem + ".pdf")
+        wm.docx_to_pdf(str(docx), str(out), batch=ctx.word)
+        cur = out
+
+    if params.get("watermark"):
+        targets = [cur] if isinstance(cur, Path) else list(cur)
+        new_targets = []
+        for src in targets:
+            if Path(src).suffix.lower() != ".pdf":
+                # 非 PDF 不能加水印：原样保留（并提醒）
+                warnings.append("%s 不是 PDF，已跳过水印" % Path(src).name)
+                new_targets.append(src)
+                continue
+            text = _wm_text_for(unit, event)
+            if not (text or "").strip():
+                raise RuntimeError("水印文字为空（收件人的水印名称与名称都为空）")
+            out = outdir / (Path(src).stem + ".pdf")
+            info = wm.watermark_pdf(str(src), str(out), text, opts.get("wm_settings"))
+            warnings += info.get("warnings", [])
+            new_targets.append(out)
+        cur = new_targets[0] if len(new_targets) == 1 else new_targets
+
+    if params.get("encrypt"):
+        targets = [cur] if isinstance(cur, Path) else list(cur)
+        new_targets = []
+        open_pw, owner_pw = _passwords_for(unit, event)
+        for src in targets:
+            if Path(src).suffix.lower() != ".pdf":
+                warnings.append("%s 不是 PDF，已跳过加密" % Path(src).name)
+                new_targets.append(src)
+                continue
+            if not open_pw:
+                raise RuntimeError("收件人没有打开口令")
+            if not owner_pw:
+                raise RuntimeError("收件人没有权限口令")
+            out = outdir / (Path(src).stem + ".pdf")
+            info = wm.encrypt_pdf(str(src), str(out), open_pw, owner_pw,
+                                  permissions=params.get("permissions"))
+            warnings += info.get("warnings", [])
+            new_targets.append(out)
+        cur = new_targets[0] if len(new_targets) == 1 else new_targets
+
+    if isinstance(cur, Path):
+        return [cur], warnings
+    return list(cur), warnings
+
+
+def run_items(event, outdir, word=None, only_recips=None, log=None, progress=None):
+    """执行整个流水线，返回 (outputs, warnings, errors)。
+
+    outputs: {step_id: {unit_key: [文件路径]}}
+    errors:  [(unit_key, step_id, 错误信息)]
+    only_recips: 只跑这些收件人（按收件人名过滤，「只重跑失败项」用）
+    """
+    def _log(msg):
+        if log:
+            log(msg)
+
+    opts = event.get("options") or {}
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    items = [i for i in (event.get("pipeline") or []) if i.get("enabled", True)]
+    outputs = {}
+    errors = []
+    warnings = []
+    if not items:
+        return outputs, warnings, [("", "", "流水线为空，没有任何启用的条目")]
+
+    ctx = RunContext(event, outdir, word=word)
+    total = len(items)
+    for si, it in enumerate(items):
+        iid = it.get("id") or ("item%d" % si)
+        gran = it.get("granularity") or "per_lp"
+        units = build_units(event, gran)
+        cur = {}
+        for ukey, unit in units:
+            if only_recips is not None:
+                names = set(r.get("name", "") for r in unit.get("recipients") or [])
+                if not (names & set(only_recips)):
+                    continue
+            try:
+                files, warns = execute_item(it, unit, event, ctx)
+                cur[ukey] = files
+                warnings += warns
+                _log("[条目%d] %s · %s → %s"
+                     % (si + 1, it.get("name") or ITEM_KIND_LABELS.get(it.get("kind")),
+                        unit.get("lp_name") or unit.get("group_key"),
+                        files[0].name if files else ""))
+            except Exception as e:
+                errors.append((ukey, iid, str(e)))
+                _log("[条目%d 失败] %s：%s"
+                     % (si + 1, unit.get("lp_name") or unit.get("group_key"), e))
+        outputs[iid] = cur
+        if progress:
+            progress(int((si + 1) * 100 / total))
+    warnings += ctx.warnings
+    return outputs, warnings, errors
+
+
+# ============================================================================
+# 执行引擎：预检 / 附件组装 / 草稿 / 执行记录
+# ============================================================================
+
+def _attachment_matches(att, unit):
+    """静态附件是否属于这个收件人/合并组。"""
+    scope = att.get("scope", "all")
+    if scope == "all":
+        return True
+    names = set(r.get("name", "") for r in unit.get("recipients") or [])
+    if scope == "specific":
+        targets = set(att.get("targets") or [])
+        return bool(names & targets)
+    if scope == "group":
+        g = (att.get("group") or "").strip()
+        return bool(g) and g == (unit.get("group") or "").strip()
+    return False
+
+
+def assemble_attachments(event, unit, final_outputs):
+    """组装附件包。返回 (文件列表, 缺失文件列表)。
+
+    附件包 = 所有流水线条目的产物 + 事件级静态附件 + 收件人专属附件。
+    （每个条目返回的已经是最终产物——docx 已转 pdf、pdf 已加水印/加密。）
+    """
+    files, missing = [], []
+
+    def _add(p):
+        p = str(p or "").strip()
+        if not p:
+            return
+        if Path(p).exists():
+            files.append(Path(p))
+        else:
+            missing.append(p)
+
+    for p in final_outputs or []:
+        _add(p)
+    for a in event.get("attachments") or []:
+        if _attachment_matches(a, unit):
+            _add(a.get("path"))
+    for r in unit.get("recipients") or []:
+        for p in r.get("attachments") or []:
+            _add(p)
+    # 去重（保持顺序）
+    seen, out = set(), []
+    for p in files:
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out, missing
+
+
+def draft_units(event):
+    """草稿单元：按事件的发送模式决定「几封邮件」。
+
+    per_lp    每人一份 → 每位收件人一封
+    per_group 按组合并 → 同合并组一封（没有组的自成一组）
+    all       全部合并 → 所有人一封
+
+    返回 [(unit_key, unit)]。
+    """
+    mode = send_mode_of(event)
+    recips = event.get("recipients") or []
+    if mode == "all":
+        if not recips:
+            return []
+        return [("§all", {
+            "recipients": list(recips), "rep": recips[0],
+            "group_key": "§all",
+            "lp_name": recips[0].get("name", ""),
+            "group": ""})]
+    if mode == "per_lp":
+        out = []
+        for r in recips:
+            out.append((r.get("name", ""), {
+                "recipients": [r], "rep": r,
+                "group_key": group_key_of(r),
+                "lp_name": r.get("name", ""),
+                "group": (r.get("group") or "").strip()}))
+        return out
+    groups, order = {}, []
+    for r in recips:
+        key = group_key_of(r)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    out = []
+    for key in order:
+        members = groups[key]
+        out.append((key, {
+            "recipients": members, "rep": members[0],
+            "group_key": key,
+            "lp_name": members[0].get("name", ""),
+            "group": "" if key.startswith("§") else key}))
+    return out
+
+
+def _merge_addresses(members, key, extra=""):
+    """合并组内收件人的 To/CC/BCC（去重、保持顺序）。"""
+    out = []
+    for m in members:
+        for addr in split_mails(m.get(key, "") or ""):
+            if addr not in out:
+                out.append(addr)
+    for addr in split_mails(extra or ""):
+        if addr not in out:
+            out.append(addr)
+    return out
+
+
+def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None,
+                          owner_pw="", extra_cc="", extra_bcc=""):
+    """在 Outlook 草稿箱创建邮件（只 Save，绝不 Send）。
+
+    铁律：正文/标题里的权限口令会被 scrub 掉（架构 + 兜底双保险）。
+    """
+    import win32com.client as win32
+    ol = win32.Dispatch("Outlook.Application")
+    mail = ol.CreateItem(0)  # 0 = olMailItem
+    to = _merge_addresses([rec], "to")
+    cc = _merge_addresses([rec], "cc", extra_cc)
+    bcc = _merge_addresses([rec], "bcc", extra_bcc)
+    if to:
+        mail.To = ";".join(to)
+    if cc:
+        mail.CC = ";".join(cc)
+    if bcc:
+        mail.BCC = ";".join(bcc)
+    mail.Subject = render_with_fields(subject_tpl, field_map, owner_pw)
+    mail.HTMLBody = render_with_fields(body_tpl, field_map, owner_pw, escape=True)
+    from_addr = rec.get("from_addr", "")
+    if from_addr:
+        mail.SentOnBehalfOfName = from_addr
+    for f in attachments:
+        mail.Attachments.Add(str(Path(f).resolve()))  # Outlook 是独立进程，必须绝对路径
+    mail.Save()  # 只存草稿；不调用 Send
+    return mail
+
+
+def preflight(event, store=None):
+    """预检。返回 (errors, warnings, info)。
+
+    errors 会中止执行；warnings 只提示（缺失附件等会被跳过）。
+    """
+    errors, warnings = [], []
+    recips = event.get("recipients") or []
+    opts = event.get("options") or {}
+    steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
+
+    # --- 收件人 ---
+    if not recips:
+        errors.append("收件人清单为空")
+    seen_pw = {}
+    for r in recips:
+        tag = (r.get("name") or "?")[:18]
+        if not (r.get("name") or "").strip():
+            errors.append("%s：收件人名称为空" % tag)
+        if not r.get("to"):
+            warnings.append("%s：没有邮箱，将只生成文件、不建草稿" % tag)
+        else:
+            for m in split_mails(r.get("to", "")):
+                if "@" not in m or "." not in m.split("@")[-1]:
+                    warnings.append("%s：邮箱格式可疑：%s" % (tag, m))
+        if not r.get("open_pw"):
+            errors.append("%s：打开口令为空" % tag)
+        gp_on = bool(opts.get("gp_owner_mode")) and bool(opts.get("gp_owner_pw"))
+        if not r.get("owner_pw") and not gp_on:
+            errors.append("%s：权限口令为空（留档缺失将无法解除限制）" % tag)
+        elif r.get("open_pw") and r.get("open_pw") == r.get("owner_pw"):
+            errors.append("%s：权限口令与打开口令相同（收件人将获得全部权限）" % tag)
+        if r.get("open_pw"):
+            seen_pw.setdefault(r["open_pw"], []).append(tag)
+    for _pw, names in seen_pw.items():
+        if len(names) > 1:
+            errors.append("打开口令重复（%s）：同一口令可打开对方文件" % "、".join(names))
+
+    # --- GP 统一口令冲突 ---
+    gp = opts.get("gp_owner_pw") if opts.get("gp_owner_mode") else ""
+    if gp:
+        clash = [r.get("name", "") for r in recips if r.get("open_pw") == gp]
+        if clash:
+            errors.append("GP 统一权限口令与以下收件人的打开口令相同（对方将获得全部权限）：%s"
+                          % "、".join(clash[:8]))
+
+    # --- 合并组 ---
+    groups = {}
+    for r in recips:
+        g = (r.get("group") or "").strip()
+        if g:
+            groups.setdefault(g, []).append(r)
+    for g, members in groups.items():
+        if len(set(m.get("open_pw", "") for m in members)) > 1:
+            warnings.append("合并组「%s」内打开口令不同，正文只会写第一个人的口令，"
+                            "建议统一口令或拆开发送" % g)
+
+    # --- 附件存在性 ---
+    for a in event.get("attachments") or []:
+        p = (a.get("path") or "").strip()
+        if p and not Path(p).exists():
+            warnings.append("附件不存在（将被跳过）：%s" % p)
+    for r in recips:
+        for p in r.get("attachments") or []:
+            if not Path(p).exists():
+                warnings.append("%s：专属附件不存在（将被跳过）：%s"
+                                % (r.get("name", ""), p))
+
+    # --- 流水线条目 ---
+    if not steps:
+        errors.append("流水线为空，没有任何启用的条目")
+    for i, it in enumerate(steps):
+        label = "第%d条 %s" % (i + 1, it.get("name") or
+                               ITEM_KIND_LABELS.get(it.get("kind"), ""))
+        kind = it.get("kind") or "generate"
+        params = it.get("params") or {}
+        gran = it.get("granularity") or "per_lp"
+        if kind == "generate":
+            tp = (params.get("template_path") or "").strip()
+            if not tp:
+                errors.append("%s：没有选择 Word 模板" % label)
+            elif not Path(tp).exists():
+                errors.append("%s：Word 模板不存在：%s" % (label, tp))
+            else:
+                try:
+                    phs = wm.detect_placeholders(tp)
+                except Exception as e:
+                    warnings.append("%s：读取模板占位符失败：%s" % (label, e))
+                    phs = []
+                mapped = it.get("mapping") or {}
+                rec0 = recips[0] if recips else {}
+                for ph in phs:
+                    src = mapped.get(ph) or auto_map_placeholder(ph, event, rec0)
+                    if not src:
+                        errors.append("%s：占位符 %s 没有对应字段（悬空占位符）" % (label, ph))
+                    elif str(src).startswith("sheet."):
+                        sh = it.get("sheet") or {}
+                        sp = (sh.get("path") or "").strip()
+                        if not sp:
+                            errors.append("%s：占位符 %s 用了外部数据表，但还没选表" % (label, ph))
+                        elif not Path(sp).exists():
+                            errors.append("%s：外部数据表不存在：%s" % (label, sp))
+        else:
+            files = params.get("files") or []
+            if not files:
+                errors.append("%s：没有选择任何文件" % label)
+            for sp in files:
+                if not Path(str(sp)).exists():
+                    errors.append("%s：文件不存在：%s" % (label, sp))
+        if params.get("encrypt"):
+            if not params.get("watermark") and kind == "generate" \
+                    and not params.get("to_pdf"):
+                warnings.append("%s：只勾了加密，但产物是 .docx（加密只对 PDF 生效）"
+                                % label)
+        if gran == "all":
+            warnings.append("%s：全员共用一份，文件口令取第一位收件人的口令" % label)
+        if kind == "attach" and params.get("watermark"):
+            for sp in (params.get("files") or []):
+                if Path(str(sp)).suffix.lower() != ".pdf":
+                    warnings.append("%s：%s 不是 PDF，水印不会生效" % (label, Path(str(sp)).name))
+
+    info = {
+        "recipients": len(recips),
+        "steps": len(steps),
+        "attachments": len(event.get("attachments") or []),
+        "drafts": len(draft_units(event)),
+        "expected_files": len(steps) * len(draft_units(event)),
+    }
+    return errors, warnings, info
+
+
+def _item_units_for(item, unit):
+    """这个条目在某个草稿单元里对应的「产出单位」列表。
+
+    条目粒度与发送模式粒度可能不同，要桥接：
+      条目 per_lp    → 单元内每位收件人各一份
+      条目 per_group → 按收件人所在组各一份（组内第一个收件人当代表）
+      条目 all      → 全员共用一份
+    """
+    gran = (item or {}).get("granularity") or "per_lp"
+    recips = unit.get("recipients") or []
+    if gran == "all":
+        return [unit]
+    if gran == "per_group":
+        seen, out = set(), []
+        for r in recips:
+            k = group_key_of(r)
+            if k in seen:
+                continue
+            seen.add(k)
+            one = dict(unit)
+            one["rep"] = r
+            one["group_key"] = k
+            one["lp_name"] = r.get("name", "")
+            out.append(one)
+        return out
+    out = []
+    for r in recips:
+        one = dict(unit)
+        one["rep"] = r
+        one["lp_name"] = r.get("name", "")
+        one["group_key"] = group_key_of(r)
+        out.append(one)
+    return out
+
+
+def _item_output_key(item, one):
+    """产出单位在 outputs 字典里的 key（必须与 build_units 的 key 一致）。"""
+    gran = (item or {}).get("granularity") or "per_lp"
+    if gran == "all":
+        return "__all__"
+    if gran == "per_group":
+        return one.get("group_key") or ""
+    return one.get("lp_name") or ""
+
+
+def _item_preview_files(event, item, unit):
+    """这个条目在这个草稿单元里会产出的文件名（预览用，不执行）。"""
+    out = []
+    params = (item or {}).get("params") or {}
+    kind = (item or {}).get("kind") or "generate"
+    for one in _item_units_for(item, unit):
+        if kind == "attach":
+            for sp in params.get("files") or []:
+                base = item_output_name(event, one, str(sp))
+                out.append(base + Path(str(sp)).suffix)
+        else:
+            src = params.get("template_path", "")
+            base = item_output_name(event, one, src,
+                                    orig_name=(item.get("name") or "").strip() or None)
+            out.append(base + (".pdf" if params.get("to_pdf") else ".docx"))
+    return out
+
+
+def preview_plan(event):
+    """产出清单预览（不执行）。返回 [(草稿单元, 说明, [文件名...])]。
+
+    最后一步是「每人一份」时，合并组里每人各有一份，附件包是并起来的。
+    """
+    steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
+    out = []
+    if not steps:
+        return out
+    for key, unit in draft_units(event):
+        names = []
+        for it in steps:
+            names += _item_preview_files(event, it, unit)
+        for a in event.get("attachments") or []:
+            if _attachment_matches(a, unit):
+                names.append(Path(a.get("path", "")).name or a.get("path", ""))
+        for r in unit.get("recipients") or []:
+            for p in r.get("attachments") or []:
+                names.append(Path(p).name)
+        out.append((key, unit, names))
+    return out
+
+
+def run_event(store, event, only_recips=None, log=None, progress=None,
+              create_drafts=True, outdir=None, word=None):
+    """执行一个发送事件，返回执行记录（Run）。
+
+    只建草稿，绝不发送。执行记录写进 lp_data/runs/。
+    word: 可传入外部 WordBatch（GUI 的常驻工作线程用）；不给就用本线程的共享实例。
+    """
+    started = _now_str()
+    run = {
+        "id": _new_id("run"),
+        "event_id": event.get("id", ""),
+        "event_name": event.get("name", ""),
+        "started_at": started,
+        "finished_at": "",
+        "status": "",
+        "items": [],
+        "stats": {"ok": 0, "fail": 0, "skip": 0},
+        "errors": [],
+        "warnings": [],
+        "logs": [],
+    }
+
+    def _log(msg):
+        run["logs"].append(str(msg))
+        if log:
+            log(msg)
+
+    errors, warnings, info = preflight(event, store)
+    run["errors"] = errors
+    run["warnings"] = warnings
+    if errors:
+        run["status"] = "preflight_failed"
+        run["finished_at"] = _now_str()
+        _log("预检未通过，已中止（不生成半成品）：%d 个问题" % len(errors))
+        store.save_run(run)
+        return run
+
+    opts = event.get("options") or {}
+    base_out = Path(outdir or opts.get("outdir") or store.get_settings().get("outdir")
+                    or (Path.home() / "Documents" / "LP分发输出"))
+    base_out = base_out / sanitize_filename(event.get("name", "事件"), 60)
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    # Word 实例按线程复用：每次新建都会残留一个 WINWORD.EXE（见 default_word_batch 注释）
+    word = word or default_word_batch()
+    outputs, pw, perr = run_items(event, base_out, word=word,
+                                 only_recips=only_recips, log=_log,
+                                 progress=progress)
+    run["warnings"] = list(warnings) + list(pw)
+    for ukey, sid, msg in perr:
+        run["errors"].append("[%s] %s" % (sid, msg))
+
+    # 收集产物：所有条目的产物都进附件包（每个条目内部已把中间产物处理掉，
+# 返回的就是最终产物——docx 已转 pdf、pdf 已加水印/加密）
+    steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
+
+    def _outputs_of(item, unit):
+        """某条目在某个收件人/合并组下的产物文件。
+
+        条目粒度与发送模式粒度可能不同：
+          条目 per_lp + 发送按组合并 → 组内每人各一份，附件包要并起来
+          条目 per_group + 发送每人一份 → 取该收件人所在组的那份
+        """
+        iid = item.get("id")
+        cur = outputs.get(iid) or {}
+        files = []
+        for one in _item_units_for(item, unit):
+            files += list(cur.get(_item_output_key(item, one)) or [])
+        return files
+
+    def _final_for(unit):
+        files = []
+        for it in steps:
+            files += _outputs_of(it, unit)
+        return files
+
+    mail = event.get("mail") or {}
+    subject_tpl = mail.get("subject") or DEFAULT_SUBJECT_V3
+    body_tpl = mail.get("body") or DEFAULT_BODY_V3
+
+    for key, unit in draft_units(event):
+        names = [r.get("name", "") for r in unit.get("recipients") or []]
+        if only_recips is not None and not (set(names) & set(only_recips)):
+            continue
+        rep = unit.get("rep") or {}
+        final_files = _final_for(unit)
+        files, missing = assemble_attachments(event, unit, final_files)
+        item = {
+            "key": key,
+            "kind": "group" if unit.get("group") else "lp",
+            "name": (unit.get("group") or names[0] if names else key),
+            "members": names,
+            "group": unit.get("group", ""),
+            "files": [str(p) for p in files],
+            "missing": missing,
+            "draft": "",
+            "error": "",
+            "open_pw_fp": pw_fingerprint(rep.get("open_pw", "")),
+        }
+        # 本单元的流水线错误
+        unit_errors = [msg for ukey, sid, msg in perr
+                       if ukey in (key,) or ukey in names]
+        if unit_errors:
+            item["error"] = "；".join(unit_errors[:3])
+        if missing:
+            item["draft"] = "跳过(附件缺失)"
+            run["stats"]["skip"] += 1
+            _log("[附件缺失] %s：%s" % (item["name"], "、".join(missing[:3])))
+        elif not files:
+            item["draft"] = "跳过(无附件)"
+            run["stats"]["skip"] += 1
+        elif not unit.get("rep", {}).get("to") and len(names) == 1:
+            item["draft"] = "跳过(无邮箱)"
+            run["stats"]["skip"] += 1
+        else:
+            if not create_drafts:
+                item["draft"] = "仅生成文件"
+                run["stats"]["ok"] += 1
+            else:
+                try:
+                    fmap = build_field_map(rep, event)
+                    rec = dict(rep)
+                    rec["to"] = ";".join(_merge_addresses(unit["recipients"], "to"))
+                    rec["cc"] = ";".join(_merge_addresses(unit["recipients"], "cc",
+                                                          mail.get("cc_default", "")))
+                    rec["bcc"] = ";".join(_merge_addresses(unit["recipients"], "bcc",
+                                                           mail.get("bcc_default", "")))
+                    owner_pw = rep.get("owner_pw", "")
+                    if opts.get("gp_owner_mode") and opts.get("gp_owner_pw"):
+                        owner_pw = opts["gp_owner_pw"]
+                    create_outlook_draft(rec, files, subject_tpl, body_tpl,
+                                         fmap, owner_pw)
+                    item["draft"] = "ok"
+                    run["stats"]["ok"] += 1
+                    _log("[草稿OK] %s -> Outlook 草稿箱（未发送）" % item["name"])
+                except Exception as e:
+                    item["draft"] = "失败:%s" % str(e)[:60]
+                    item["error"] = str(e)
+                    run["stats"]["fail"] += 1
+                    _log("[草稿失败] %s：%s" % (item["name"], e))
+        if item["error"] and not item["draft"].startswith("失败"):
+            run["stats"]["fail"] += 1
+        run["items"].append(item)
+
+    if run["stats"]["fail"]:
+        run["status"] = "partial"
+    elif run["stats"]["skip"]:
+        run["status"] = "ok_with_skips"
+    else:
+        run["status"] = "ok"
+    run["finished_at"] = _now_str()
+    run["info"] = info
+    store.save_run(run)
+    _log("===== 完成：成功 %d，失败 %d，跳过 %d ====="
+         % (run["stats"]["ok"], run["stats"]["fail"], run["stats"]["skip"]))
+    return run
+
+
+def failed_recipients(run):
+    """从执行记录里取出需要重跑的收件人名。"""
+    names = set()
+    for item in (run or {}).get("items") or []:
+        status = item.get("draft") or ""
+        if status.startswith("失败") or item.get("error"):
+            names.update(item.get("members") or [])
+    return names
+
+
+# ============================================================================
+# 流程图 / 导入校验 / 导出备份
+# ============================================================================
+
+
+def item_label(item):
+    """条目的中文显示名（名称 + 类型 + 关键来源）。"""
+    kind = (item or {}).get("kind") or "generate"
+    name = (item or {}).get("name") or ITEM_KIND_LABELS.get(kind, "条目")
+    params = (item or {}).get("params") or {}
+    if kind == "generate":
+        tp = params.get("template_path")
+        if tp:
+            name += "（%s）" % Path(str(tp)).name
+    else:
+        fl = params.get("files") or []
+        if fl:
+            name += "（%d 个文件）" % len(fl)
+    return name
+
+
+def flow_nodes(event):
+    """把事件配置解析成流程图节点序列（纯逻辑，GUI 只负责画）。
+
+    返回 [{kind, key, title, sub, enabled, granularity}]：
+      kind = source(收件人) / step(流水线步骤) / output(最终产物) / draft(Outlook 草稿)
+    """
+    ev = event or {}
+    recips = ev.get("recipients") or []
+    mode = send_mode_of(ev)
+    nodes = []
+    nodes.append({
+        "kind": "source", "key": "recipients",
+        "title": "收件人",
+        "sub": "%d 位 · %s" % (len(recips), SEND_MODE_LABELS.get(mode, mode)),
+        "enabled": True, "granularity": mode,
+    })
+    steps = ev.get("pipeline") or []
+    enabled_steps = [s for s in steps if s.get("enabled", True)]
+    for i, st in enumerate(steps):
+        params = st.get("params") or {}
+        gran = st.get("granularity") or "per_lp"
+        procs = []
+        if params.get("to_pdf"):
+            procs.append("PDF")
+        if params.get("watermark"):
+            procs.append("水印")
+        if params.get("encrypt"):
+            procs.append("加密")
+        sub = " · ".join(procs) if procs else "原样"
+        sub += " · " + GRANULARITY_LABELS.get(gran, gran)
+        nodes.append({
+            "kind": "step",
+            "key": st.get("id") or ("item-%d" % i),
+            "title": st.get("name") or ITEM_KIND_LABELS.get(st.get("kind"), "条目"),
+            "sub": sub,
+            "enabled": bool(st.get("enabled", True)),
+            "granularity": gran,
+            "index": i,
+        })
+    nodes.append({
+        "kind": "output", "key": "__output__",
+        "title": "附件包",
+        "sub": ("%d 个条目产出" % len(enabled_steps)) if enabled_steps else "无条目",
+        "enabled": bool(enabled_steps),
+        "granularity": "",
+    })
+    try:
+        nunits = len(draft_units(ev))
+    except Exception:
+        nunits = 0
+    nodes.append({
+        "kind": "draft", "key": "__draft__",
+        "title": "Outlook 草稿",
+        "sub": "%d 封 · 只存草稿不发送" % nunits,
+        "enabled": nunits > 0,
+        "granularity": "",
+    })
+    return nodes
+
+
+# ---------- 导入校验 ----------
+
+_EMAIL_RE = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+$")
+
+
+def _split_addr_list(text):
+    """邮箱列表拆分：分号 / 逗号 / 空格 / 换行都算分隔。"""
+    parts = re.split(r"[;,\s]+", str(text or "").strip())
+    return [p for p in parts if p]
+
+
+def validate_recipient_rows(rows, existing_names=None, check_files=True):
+    """校验导入的收件人数据。
+
+    返回 {
+      "ok": bool,                # 有没有致命错误（缺表头列等）
+      "fatal": [str],           # 整表级别的错误
+      "items": [{               # 每行一条
+         "no": 行号(从 2 开始，1 是表头),
+         "name": 名称,
+         "status": "ok" / "error" / "warning",
+         "errors": [str],
+         "warnings": [str],
+         "record": 解析出的收件人 dict,
+      }],
+      "error_count": int, "warning_count": int,
+      "unknown_cols": [str],    # 未识别列（会变成自定义字段）
+      "field_cols": [str],
+      "missing_cols": [str],    # 缺失的关键列
+      "duplicate_names": [str],
+    }
+    """
+    res = {
+        "ok": True, "fatal": [], "items": [], "notes": [],
+        "error_count": 0, "warning_count": 0,
+        "unknown_cols": [], "field_cols": [],
+        "missing_cols": [], "duplicate_names": [],
+    }
+    if not rows:
+        res["ok"] = False
+        res["fatal"].append("文件是空的（读不到任何行）")
+        return res
+
+    header = ["" if h is None else str(h).strip() for h in rows[0]]
+    lower = [h.lower() for h in header]
+    known = set()
+    for aliases in HEADER_ALIASES.values():
+        known |= {a.lower() for a in aliases}
+    for i, h in enumerate(lower):
+        if h and h not in known:
+            res["unknown_cols"].append(header[i])
+    if not any(h in known for h in lower if h):
+        res["ok"] = False
+        res["fatal"].append(
+            "表头里没有识别到任何已知列。至少要有「收件人名称」列；"
+            "可识别的列名：%s" % "、".join(sorted(known)))
+        return res
+    if not any(h in HEADER_ALIASES["name"] for h in lower if h):
+        res["ok"] = False
+        res["missing_cols"].append("收件人名称")
+        res["fatal"].append("缺少「收件人名称」列，无法识别每一行是哪位收件人")
+        return res
+
+    recips, _unknown, field_cols = parse_import_rows_v3(rows)
+    res["unknown_cols"] = _unknown
+    res["field_cols"] = field_cols
+
+    existing = set(existing_names or [])
+    seen = {}
+    has_owner_pw = False
+    for idx, rec in enumerate(recips):
+        no = idx + 2          # 表格里的实际行号（1 是表头）
+        errors, warnings = [], []
+        name = rec.get("name", "")
+        if not name:
+            errors.append("名称为空")
+        if name in seen:
+            errors.append("与本表第 %d 行重名" % seen[name])
+            res["duplicate_names"].append(name)
+        else:
+            seen[name] = no
+        if name and name in existing:
+            warnings.append("与已有收件人同名，导入后会覆盖更新")
+
+        to = rec.get("to", "")
+        if not to:
+            errors.append("收件人邮箱为空")
+        else:
+            for addr in _split_addr_list(to):
+                if not _EMAIL_RE.match(addr):
+                    errors.append("收件人邮箱格式不对：%s" % addr)
+        for key, label in (("cc", "抄送"), ("bcc", "密送")):
+            val = rec.get(key, "")
+            if val:
+                for addr in _split_addr_list(val):
+                    if not _EMAIL_RE.match(addr):
+                        errors.append("%s邮箱格式不对：%s" % (label, addr))
+
+        ow = rec.get("open_pw", "")
+        op = rec.get("owner_pw", "")
+        if ow and op and ow == op:
+            errors.append("打开口令与权限口令相同（违反铁律，必须是两个不同的口令）")
+        if op:
+            has_owner_pw = True
+        if ow and len(ow) < 6:
+            warnings.append("打开口令少于 6 位，建议改长")
+
+        files = rec.get("attachments") or []
+        if check_files:
+            for p in files:
+                if not Path(str(p)).exists():
+                    warnings.append("附件文件不存在：%s" % p)
+        if rec.get("group"):
+            warnings.append("已指定合并组「%s」：只有发送模式为「按组合并」时才生效"
+                            % rec.get("group"))
+
+        if errors:
+            status = "error"
+        elif warnings:
+            status = "warning"
+        else:
+            status = "ok"
+        res["error_count"] += len(errors)
+        res["warning_count"] += len(warnings)
+        res["items"].append({
+            "no": no, "name": name, "status": status,
+            "errors": errors, "warnings": warnings, "record": rec,
+        })
+
+    if has_owner_pw:
+        res["notes"].append(
+            "文件里填写了权限口令：只用于文件权限控制，不会进入邮件正文或标题。")
+    if not res["items"]:
+        res["ok"] = False
+        res["fatal"].append("没有解析到任何收件人记录（表头下全是空行）")
+    return res
+
+
+# ---------- 导出 ----------
+
+EXPORT_BASE_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密送",
+                       "邮件标题", "附件路径", "合并组", "打开口令", "权限口令"]
+
+
+def recipients_to_rows(recipients, include_passwords=True):
+    """收件人列表 → 二维列表（可直接写成 Excel）。
+
+    自定义字段列并到末尾，列名取所有收件人的字段键的并集（按首次出现顺序）。
+    权限口令默认导出（这是备份用途），调用方可以传 include_passwords=False 抹掉。
+    """
+    recips = recipients or []
+    extra = []
+    for r in recips:
+        for k in (r.get("fields") or {}):
+            if k not in extra:
+                extra.append(k)
+    headers = list(EXPORT_BASE_HEADERS) + extra
+    rows = [headers]
+    for r in recips:
+        row = [
+            r.get("name", ""), r.get("wm", ""), r.get("to", ""),
+            r.get("cc", ""), r.get("bcc", ""), r.get("subject", ""),
+            ";".join(str(a.get("path", "")) for a in (r.get("attachments") or [])),
+            r.get("group", ""),
+            r.get("open_pw", "") if include_passwords else "",
+            r.get("owner_pw", "") if include_passwords else "",
+        ]
+        fields = r.get("fields") or {}
+        for k in extra:
+            row.append(fields.get(k, ""))
+        rows.append(row)
+    return rows
+
+
+def event_export_payload(event):
+    """事件导出（备份用）。"""
+    return {
+        "format": "doc-mailer.event",
+        "format_version": 1,
+        "exported_at": _now_str(),
+        "app_version": APP_VERSION,
+        "event": event or {},
+    }
+
+
+def event_import_payload(payload):
+    """解析事件备份文件。返回 (ok, event, error)。"""
+    if not isinstance(payload, dict):
+        return False, None, "文件内容不是有效的 JSON 对象"
+    ev = payload.get("event")
+    if not isinstance(ev, dict):
+        return False, None, "文件里没有 event 字段（不是本程序导出的事件备份）"
+    if not ev.get("name"):
+        return False, None, "事件缺少名称"
+    return True, normalize_event(ev), ""
+
+
+def backup_payload(store, include_runs=True):
+    """整库备份内容（不含 runs 时只备设置/事件/场景）。"""
+    data = {
+        "format": "doc-mailer.backup",
+        "format_version": 1,
+        "exported_at": _now_str(),
+        "app_version": APP_VERSION,
+        "settings": store.load_settings()[0] or {},
+        "events": [],
+        "scenarios": [],
+        "runs": [],
+    }
+    for ev in store.list_events():
+        data["events"].append(ev)
+    for sc in store.list_scenarios():
+        data["scenarios"].append(sc)
+    if include_runs:
+        for r in store.list_runs():
+            data["runs"].append(r)
+    return data
+
