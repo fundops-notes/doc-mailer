@@ -56,9 +56,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.1.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.1.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -1132,6 +1132,12 @@ class App:
             "         · 附加文件：把磁盘上已有的文件放进附件包\n"
             "         每一行还能勾选「转 PDF / 加水印 / 加密」，并单独设「产出粒度」\n"
             "    ③ 邮件模板 —— 主题与正文，{{字段}} 按每位收件人替换\n\n"
+            "每个人的附件从哪来（三处，作用不同）：\n"
+            "    · 收件人页「附件路径」列 —— 这一位专属要附的文件，\n"
+            "      导入模板里的同名列会进这里；它自动进这个人的附件包\n"
+            "    · 流水线的「附加文件」条目 —— 可以选「路径来源」：\n"
+            "      手填路径 / 收件人清单的附件路径 / 收件人字段 / 外部数据表列\n"
+            "    · 附件页 —— 事件级静态文件（全部 / 指定收件人 / 按组）\n\n"
             "两个「模式」别搞混：\n"
             "    发送模式（事件级）→ 决定几封邮件：每人一份 / 按组合并 / 全部合并\n"
             "    产出粒度（条目级）→ 决定这一条产出几份文件：每人一份 / 每组合并一份 / 全员共用一份\n\n"
@@ -1370,8 +1376,9 @@ class App:
             b.pack(side="left", padx=2)
             ToolTip(b, tip)
 
-        cols = ["name", "to", "cc", "bcc", "wm", "group"] + fcols + ["open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组"] + fcols + \
+        cols = ["name", "to", "cc", "bcc", "wm", "group", "atts"] + fcols + \
+            ["open_pw", "owner_pw"]
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "附件路径"] + fcols + \
                 ["打开口令", "权限口令(勿发)"]
         # 注意：Treeview 必须建在 frame 里。之前建在 parent 里、却 pack 进 frame，
         # 结果它被排到了 frame 下面，表格被挤成右下角一小块。
@@ -1380,7 +1387,8 @@ class App:
         tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
-            tree.column(c, width=150 if c in ("to", "cc", "bcc") else 100)
+            tree.column(c, width=150 if c in ("to", "cc", "bcc")
+                        else (200 if c == "atts" else 100))
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -1391,8 +1399,13 @@ class App:
         self._wb_rec_tree = tree
 
         for r in ev.get("recipients", []):
+            atts = [str(p) for p in (r.get("attachments") or []) if str(p).strip()]
+            # 不存在的文件在名字前加 ⚠（只标这一格，不整行标红）
+            att_txt = "；".join(
+                (Path(p).name if Path(p).exists() else "⚠ " + Path(p).name)
+                for p in atts)
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
-                    r.get("bcc", ""), r.get("wm", ""), r.get("group", "")]
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""), att_txt]
             vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
             vals += [r.get("open_pw", ""),
                      "••••" if r.get("owner_pw") else ""]
@@ -1451,7 +1464,13 @@ class App:
         if not recips:
             messagebox.showinfo("提示", "这个事件还没有收件人")
             return
-        rows = lp_v3.recipients_to_rows(recips)
+        try:
+            rows = lp_v3.recipients_to_rows(recips)
+        except Exception as e:
+            # 之前这里没有兜底：异常被 tkinter 吞掉，exe 是 --noconsole 构建的，
+            # 用户点「导出」后什么都不会发生（连报错都看不到）。
+            messagebox.showerror("导出失败", "导出收件人清单时出错：\n%s" % e)
+            return
         self._write_xlsx_sheets(
             "收件人清单_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 40),
             [("收件人清单", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
@@ -1789,10 +1808,13 @@ class App:
 
     def _wb_export_template(self):
         """下载收件人清单导入模板（含填写说明页）。"""
-        headers = list(MOCK_HEADERS) + ["Call_Amount", "Unfunded", "Due_Date"]
+        # 表头顺序与导出的收件人清单（EXPORT_BASE_HEADERS）保持一致，
+        # 这样「导入 → 导出」能原样往返，不会少列。
+        headers = list(lp_v3.EXPORT_BASE_HEADERS) + ["Call_Amount", "Unfunded", "Due_Date"]
         row = ["示例：苏州某某科技有限公司", "（留空=同收件人名称）", "a@x.com;b@x.com",
                "cc@x.com", "bcc@x.com", "（留空=用邮件模板）",
-               "C:\\Document\\补充说明.pdf（多个用;分隔，可留空）",
+               "C:\\Document\\补充说明.pdf（每人专属；多个用;分隔，可留空）",
+               "（留空=不合并）",
                "（留空=自动生成）", "（留空=自动生成，勿发给LP）",
                "200,000", "800,000", "2026-11-15"]
         guide = [
@@ -1802,7 +1824,8 @@ class App:
             ["收件人", "是", "收件邮箱；多个用 ; 分隔（英文逗号是文件名的一部分，不做分隔）"],
             ["抄送 / 密送", "否", "邮箱；多个用 ; 分隔"],
             ["邮件标题", "否", "留空 = 用邮件模板里的主题"],
-            ["附件路径", "否", "本地文件路径；多个用 ; 分隔"],
+            ["附件路径", "否", "这一位收件人专属要附的文件（本地路径，多个用 ; 分隔）；"
+                              "会自动进这个人的附件包"],
             ["打开口令", "否", "留空 = 自动生成随机口令（收件人打开文件用）"],
             ["权限口令", "否", "留空 = 自动生成（控制打印权限，绝不会进入邮件）"],
             ["合并组", "否", "仅「按组合并」发送模式生效；同组共用一封邮件、附件包合并"],
@@ -1810,12 +1833,14 @@ class App:
         ]
         self._write_xlsx_sheets(
             "收件人清单导入模板.xlsx",
-            [("收件人清单", [headers, row], [36, 20, 28, 16, 16, 22, 34, 14, 24, 14, 14, 14]),
+            [("收件人清单", [headers, row], [36, 20, 28, 16, 16, 22, 34, 14, 14, 14, 14, 14, 14]),
              ("填写说明", guide, [18, 8, 78])],
             "模板已导出",
             "把模板发给业务方填写，填完再导回来。\n"
             "表头列名即识别依据；未识别的列会作为自定义字段收进来，"
             "可在流水线里映射到 Word 占位符。\n"
+            "「附件路径」是这一位收件人专属要附的文件，"
+            "会自动进这个人的附件包。\n"
             "口令列留空会自动生成随机口令。")
 
     def _write_xlsx(self, default_name, rows, ok_title, ok_msg):
@@ -1877,7 +1902,7 @@ class App:
                 ("收件人To（多人用;分隔）", "to"), ("抄送CC（可空）", "cc"),
                 ("密送BCC（可空）", "bcc"),
                 ("合并发送组（同名=一封邮件，可空）", "group"),
-                ("专属附件（多个用;分隔，可空）", "attachments"),
+                ("附件路径（每人专属，多个用;分隔，可空）", "attachments"),
                 ("邮件标题（空=用模板）", "subject"),
                 ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw")]
         entries = {}
@@ -2036,6 +2061,10 @@ class App:
         if (item.get("kind") or "generate") == "generate":
             tp = (params.get("template_path") or "").strip()
             return Path(tp).name if tp else "（未选模板）"
+        # 附加文件：按「路径来源」显示，不是按手填清单显示
+        src = str(params.get("path_source") or lp_v3.PATH_SOURCE_MANUAL)
+        if src != lp_v3.PATH_SOURCE_MANUAL:
+            return "按" + lp_v3.path_source_label(src)
         files = params.get("files") or []
         if not files:
             return "（未选文件）"
@@ -2430,6 +2459,34 @@ class App:
             ttk.Label(box, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
                       foreground="#888").pack(anchor="w", padx=8, pady=(0, 4))
         else:
+            # --- 路径来源：手填路径 / 按收件人取（每人一份不同的文件）---
+            recips = (self._wb_event or {}).get("recipients") or []
+            rec0 = recips[0] if recips else {}
+            src_opts = lp_v3.path_source_options(self._wb_event, rec0,
+                                                 self._wb_sheet_cols(item))
+            src_keys = [k for k, _g, _l in src_opts]
+            src_labels = [l for _k, _g, l in src_opts]
+            cur_src = str(params.get("path_source") or lp_v3.PATH_SOURCE_MANUAL)
+            if cur_src not in src_keys:
+                cur_src = lp_v3.PATH_SOURCE_MANUAL
+            r0b = ttk.Frame(box)
+            r0b.pack(fill="x", padx=8, pady=(4, 2))
+            ttk.Label(r0b, text="路径来源：").pack(side="left")
+            src_var = self._wb_keep_var(
+                tk.StringVar(value=lp_v3.path_source_label(cur_src)))
+            src_cb = ttk.Combobox(r0b, textvariable=src_var, state="readonly",
+                                  width=30, values=src_labels)
+            src_cb.pack(side="left", padx=4)
+            src_cb.bind("<<ComboboxSelected>>",
+                        lambda _e: self._wb_set_item_path_source(item, src_var.get(),
+                                                                 src_opts))
+            ToolTip(src_cb, "「手填路径」= 下面这份清单，所有人一样。\n"
+                            "「收件人清单的附件路径」= 收件人表里「附件路径」列，"
+                            "每人取自己的。\n"
+                            "「收件人字段」/「外部数据表」= 从对应的那一列取值。")
+            ttk.Label(r0b, foreground="#888", text=self._wb_path_preview(item, rec0)
+                      ).pack(side="left", padx=8)
+
             r1 = ttk.Frame(box)
             r1.pack(fill="x", padx=8, pady=4)
             ttk.Label(r1, text="文件（每行一个路径）：").pack(side="left", anchor="n")
@@ -2439,16 +2496,31 @@ class App:
                 files_text.insert("end", str(p) + "\n")
             btns = ttk.Frame(r1)
             btns.pack(side="left", anchor="n", padx=4)
-            ttk.Button(btns, text="添加文件…", width=12,
-                       command=lambda: self._wb_add_attach_files(item, files_text)).pack(side="left")
-            ttk.Button(btns, text="从 Excel 导入路径…", width=18,
-                       command=lambda: self._wb_import_attach_paths(item, files_text)).pack(side="left", pady=4)
-            ttk.Button(btns, text="保存", width=6,
-                       command=lambda: self._wb_save_attach_files(item, files_text)).pack(side="left")
+            b_add = ttk.Button(btns, text="添加文件…", width=12,
+                               command=lambda: self._wb_add_attach_files(item, files_text))
+            b_add.pack(side="left")
+            b_imp = ttk.Button(btns, text="从 Excel 导入路径…", width=18,
+                               command=lambda: self._wb_import_attach_paths(item, files_text))
+            b_imp.pack(side="left", pady=4)
+            b_save = ttk.Button(btns, text="保存", width=6,
+                                command=lambda: self._wb_save_attach_files(item, files_text))
+            b_save.pack(side="left")
+            if cur_src != lp_v3.PATH_SOURCE_MANUAL:
+                # 文本框禁用后 insert 会抛 TclError，所以这几个按钮也要一起禁用
+                files_text.config(state="disabled")
+                for b in (b_add, b_imp, b_save):
+                    b.config(state="disabled")
+                ttk.Label(box, text=(
+                    "当前按「%s」取路径，下面的手填清单不生效（切回「手填路径」才会用）。"
+                    % lp_v3.path_source_label(cur_src)),
+                    foreground="#b8860b", wraplength=880, justify="left").pack(
+                        anchor="w", padx=8, pady=(0, 4))
             ttk.Label(box, text=(
                 "同一个文件会被复制进附件包；内容相同、文件名相同则所有收件人共用一份"
                 "（把「产出粒度」改成「每人一份」可让每人的文件名带上自己的名字）。"),
                 foreground="#888", wraplength=880, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+            if cur_src.startswith(lp_v3.PATH_SOURCE_SHEET_PREFIX):
+                self._wb_sheet_panel(parent, item)
 
         # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
         r2 = ttk.Frame(box)
@@ -2590,35 +2662,42 @@ class App:
 
         # 外部数据表：只有在真的选了「外部数据表」来源时才出现
         if any(str(v).startswith("sheet.") for v in mapping.values()):
-            sh = item.setdefault("sheet", {"path": "", "key_col": "", "match_col": "name"})
-            sbox = ttk.LabelFrame(parent, text=" 外部数据表 ", style="Card.TLabelframe")
-            sbox.pack(fill="x", padx=8, pady=(0, 4))
-            s1 = ttk.Frame(sbox)
-            s1.pack(fill="x", padx=8, pady=4)
-            ttk.Label(s1, text="数据表：").pack(side="left")
-            path_var = self._wb_keep_var(tk.StringVar(value=sh.get("path", "")))
-            ttk.Entry(s1, textvariable=path_var, width=44).pack(side="left", padx=4)
-            ttk.Button(s1, text="选择…", width=6,
-                       command=lambda: self._wb_pick_sheet(item)).pack(side="left")
-            ttk.Label(s1, text="   匹配列（表内）：").pack(side="left", padx=(10, 0))
-            key_var = self._wb_keep_var(tk.StringVar(value=sh.get("key_col", "")))
-            ttk.Entry(s1, textvariable=key_var, width=16).pack(side="left", padx=4)
-            ttk.Label(s1, text="   收件人匹配字段：").pack(side="left", padx=(10, 0))
-            match_var = self._wb_keep_var(tk.StringVar(value=sh.get("match_col", "name")))
-            ttk.Entry(s1, textvariable=match_var, width=16).pack(side="left", padx=4)
-            ttk.Label(s1, foreground="#888", text="（默认 name = 收件人名称）").pack(side="left", padx=6)
-            s2 = ttk.Frame(sbox)
-            s2.pack(fill="x", padx=8, pady=(0, 4))
-            ttk.Button(s2, text="保存数据表配置", width=14, command=lambda: self._wb_save_sheet_cfg(
-                item, path_var.get(), key_var.get(), match_var.get())).pack(side="left")
-            ttk.Button(s2, text="下载数据表模板", width=14,
-                       command=self._wb_export_sheet_template).pack(side="left", padx=4)
-            ttk.Button(s2, text="校验数据表", width=12,
-                       command=lambda: self._wb_check_sheet(item)).pack(side="left")
-            ttk.Label(s2, foreground="#666", text=(
-                "第一列默认当匹配列；导入时会校验「列是否存在 / key 是否重复 / "
-                "有多少收件人匹配不上」。")
-            ).pack(side="left", padx=8)
+            self._wb_sheet_panel(parent, item)
+
+    def _wb_sheet_panel(self, parent, item):
+        """外部数据表配置面板。
+
+        生成文档条目选了 sheet. 来源、附加文件条目选了外部数据表列来源时共用。
+        """
+        sh = item.setdefault("sheet", {"path": "", "key_col": "", "match_col": "name"})
+        sbox = ttk.LabelFrame(parent, text=" 外部数据表 ", style="Card.TLabelframe")
+        sbox.pack(fill="x", padx=8, pady=(0, 4))
+        s1 = ttk.Frame(sbox)
+        s1.pack(fill="x", padx=8, pady=4)
+        ttk.Label(s1, text="数据表：").pack(side="left")
+        path_var = self._wb_keep_var(tk.StringVar(value=sh.get("path", "")))
+        ttk.Entry(s1, textvariable=path_var, width=44).pack(side="left", padx=4)
+        ttk.Button(s1, text="选择…", width=6,
+                   command=lambda: self._wb_pick_sheet(item)).pack(side="left")
+        ttk.Label(s1, text="   匹配列（表内）：").pack(side="left", padx=(10, 0))
+        key_var = self._wb_keep_var(tk.StringVar(value=sh.get("key_col", "")))
+        ttk.Entry(s1, textvariable=key_var, width=16).pack(side="left", padx=4)
+        ttk.Label(s1, text="   收件人匹配字段：").pack(side="left", padx=(10, 0))
+        match_var = self._wb_keep_var(tk.StringVar(value=sh.get("match_col", "name")))
+        ttk.Entry(s1, textvariable=match_var, width=16).pack(side="left", padx=4)
+        ttk.Label(s1, foreground="#888", text="（默认 name = 收件人名称）").pack(side="left", padx=6)
+        s2 = ttk.Frame(sbox)
+        s2.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(s2, text="保存数据表配置", width=14, command=lambda: self._wb_save_sheet_cfg(
+            item, path_var.get(), key_var.get(), match_var.get())).pack(side="left")
+        ttk.Button(s2, text="下载数据表模板", width=14,
+                   command=self._wb_export_sheet_template).pack(side="left", padx=4)
+        ttk.Button(s2, text="校验数据表", width=12,
+                   command=lambda: self._wb_check_sheet(item)).pack(side="left")
+        ttk.Label(s2, foreground="#666", text=(
+            "第一列默认当匹配列；导入时会校验「列是否存在 / key 是否重复 / "
+            "有多少收件人匹配不上」。")
+        ).pack(side="left", padx=8)
 
     def _wb_add_mapping(self, item):
         mapping = item.setdefault("mapping", {})
@@ -2770,6 +2849,39 @@ class App:
             if p not in cur:
                 cur.append(p)
         self._wb_write_attach_files(item, cur, tw)
+
+    def _wb_path_preview(self, item, rec):
+        """路径来源预览：告诉用户「以第一位收件人为例会取到什么」。"""
+        src = str((item.get("params") or {}).get("path_source") or lp_v3.PATH_SOURCE_MANUAL)
+        who = (rec or {}).get("name") or "第一位收件人"
+        if src == lp_v3.PATH_SOURCE_MANUAL:
+            files = (item.get("params") or {}).get("files") or []
+            if not files:
+                return "（当前：手填路径，尚未添加文件）"
+            return "（当前：手填 %d 个路径，所有收件人一样）" % len(files)
+        if src == lp_v3.PATH_SOURCE_RECIPIENT:
+            atts = (rec or {}).get("attachments") or []
+            if not atts:
+                return "（以「%s」为例：该收件人还没填附件路径）" % who
+            return "（以「%s」为例：%s）" % (who, "、".join(Path(p).name for p in atts))
+        if src.startswith(lp_v3.PATH_SOURCE_FIELD_PREFIX):
+            k = src[len(lp_v3.PATH_SOURCE_FIELD_PREFIX):]
+            v = ((rec or {}).get("fields") or {}).get(k, "")
+            return "（以「%s」为例：字段「%s」= %s）" % (who, k, v or "（空）")
+        if src.startswith(lp_v3.PATH_SOURCE_SHEET_PREFIX):
+            col = src[len(lp_v3.PATH_SOURCE_SHEET_PREFIX):]
+            return "（外部数据表「%s」列，需在下方配置数据表）" % col
+        return ""
+
+    def _wb_set_item_path_source(self, item, label, opts):
+        """切换附加文件条目的路径来源。"""
+        for k, _g, l in opts:
+            if l == label:
+                params = item.setdefault("params", {})
+                params["path_source"] = k
+                self._wb_save()
+                self._wb_render_params(item)
+                return
 
     def _wb_save_attach_files(self, item, tw):
         self._wb_write_attach_files(item, self._wb_attach_files_from_text(tw), tw)

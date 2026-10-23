@@ -1,33 +1,33 @@
 # HANDOFF：文档分发助手 v3.1（v3.0 重构 → v3.1 流水线重构）
 
 > 交接文档。给接手实现的 agent / 同事。
-> **文件名沿用 `HANDOFF_v3.0.md`（历史沿革，改名会打断各处引用），内容已覆盖到 v3.1。**
-> 最后更新：2026-10-23 夜（**v3.1 流水线重构已实施完毕并验证通过**，见 §14。发版未执行）
+> **文件名沿用 `HANDOFF_v3.0.md`（历史沿革，改名会打断各处引用），内容已覆盖到 v3.1.1。**
+> 最后更新：2026-10-23 深夜（**v3.1.0 已发版；v3.1.1 修复版已实施完毕并验证通过**，见 §14、§15）
 >
-> **当前待发布版本：`3.1.0`**（`APP_VERSION = "3.1.0"`，`lp_tool.py` 与 `lp_v3.py` 两处一致）。
-> 已发布的线上版本仍是 **v2.2.0**；3.0.0 与 3.1.0 **都从未发布过**（仓库 tag 最高为 v2.2.0），
-> 所以对外的第一个 3.x 版本直接叫 3.1.0，与设计稿、界面、交接文档口径一致。
+> **当前版本：`3.1.1`**（`APP_VERSION = "3.1.1"`，`lp_tool.py` 与 `lp_v3.py` 两处一致）。
+> 已发布：**v2.2.0**（旧）、**v3.1.0**（2026-10-23，含导出崩溃等缺陷，见 §15）、
+> **v3.1.1**（修复版，附件路径链路 + 导出崩溃）。3.0.0 从未发布过。
 
 ---
 
 ## 0. 一句话现状
 
-桌面工具"文档分发助手"当前**已发布**版本 **v2.2.0**（可用、功能正常）。
-**v3.1 流水线重构已实现完毕并通过全量验证**（132 条 pytest 全绿 + 界面截图验收），
+桌面工具"文档分发助手"当前**已发布**版本 **v3.1.1**（v3.1.0 的修复版，见 §15）。
+**v3.1 流水线重构 + v3.1.1 修复均已实现完毕并通过全量验证**（152 条 pytest 全绿 + 界面截图验收），
 代码在 `lp_tool.py` + **新增 `lp_v3.py`** + `watermark_encrypt.py`。
-**尚未打包发版**（zip / 签名 / git tag / Release 上传均未执行，等用户明确指示）。
-接手者的下一步 = 按 §7 发版流程发布 **v3.1.0**；P4（收件人库界面、执行历史查看界面）可延后。
+打包 / 签名 / git tag / Release 上传**均已执行**（v3.1.0 与 v3.1.1）。
+下一步 = P4（收件人库界面、执行历史查看界面）可延后。
 
 ---
 
 ## 0.1 源码坐标（v3.1 后已变）
 
-| 项 | v2.2.0 | v3.1（当前） |
+| 项 | v2.2.0 | v3.1.1（当前） |
 |---|---|---|
-| 主程序 | `lp_tool.py` 2450 行 | `lp_tool.py`（GUI，`APP_VERSION = "3.1.0"`） |
+| 主程序 | `lp_tool.py` 2450 行 | `lp_tool.py`（GUI，`APP_VERSION = "3.1.1"`） |
 | 核心模块 | `watermark_encrypt.py` 427 行 | `watermark_encrypt.py` + **新增 `lp_v3.py`**（纯逻辑核心，不依赖 tkinter） |
 | 数据存储 | 单文件 `lp_data.json` | 目录 `lp_data/{settings.json, events/, scenarios/, runs/}` |
-| 回归测试 | `tests/test_core.py` 9 条 | `tests/` **132 条**（`test_core` + `test_v3_data` + `test_v3_pipeline` + `test_v3_engine` + `test_v3_gui` + `test_v3_import_export`） |
+| 回归测试 | `tests/test_core.py` 9 条 | `tests/` **152 条**（`test_core` + `test_v3_data` + `test_v3_pipeline` + `test_v3_engine` + `test_v3_gui` + `test_v3_import_export` + **`test_v3_attach_paths`**） |
 
 > ⚠️ `lp_v3.py` 是**新增的第三个源文件**。PyInstaller 跟随 import 会自动带上（已验证进包）；
 > 便携包按目录整体打包，`app/` 下三个 .py 必须齐。
@@ -125,7 +125,7 @@ v3.0 引入 **场景 Scenario**（可复用模板，"怎么做"）+ **发送事�
   ```python
   with zipfile.ZipFile(out) as z:
       src = z.read('app/lp_tool.py').decode('utf-8')
-      assert 'APP_VERSION = "3.1.0"' in src
+      assert 'APP_VERSION = "3.1.1"' in src
   ```
 
 **功能类**：
@@ -267,11 +267,12 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 
 发版流程照 §7，**不要自创**。发版前注意：
 
-- `lp-doc-mailer/.gitignore` 已忽略 `build/`、`dist/`、`*.spec`、`lp_data.json`、`out_wm/`；`src/lp_v3.py` 与 `tests/` 下 6 个新文件**需要 `git add`**（当前为未跟踪状态）。
-- 打包 zip 后**必须**读 zip 内 `app/lp_tool.py` 断言 `APP_VERSION = "3.1.0"` 与关键函数存在再上传。
-- 绿色版目录里打包前记得清 `__pycache__/`。
-- 下载包命名必须是 `doc-mailer_v3.1.0_portable.zip`（自动更新按此前缀匹配）。
-- git tag `v3.1.0` 会触发 CI 自动构建。
+- `lp-doc-mailer/.gitignore` 已忽略 `build/`、`dist/`、`*.spec`、`lp_data.json`、`out_wm/`；
+  新增的 `src/lp_v3.py` 与 `tests/` 下的新测试文件**需要 `git add`**。
+- 打包 zip 后**必须**读 zip 内 `app/lp_tool.py` 断言 `APP_VERSION = "3.1.1"` 与关键函数存在再上传。
+- 绿色版目录里打包前记得清 `__pycache__/`（打包脚本已排除 `lp_data/` 与 `__pycache__/`）。
+- 下载包命名必须是 `doc-mailer_v3.1.1_portable.zip`（自动更新按此前缀匹配）。
+- git tag `v3.1.1` 会触发 CI 自动构建。
 - **P4（收件人库界面、执行历史查看界面）尚未做**，发版说明里要写清。
 
 ---
@@ -490,10 +491,13 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 
 - `python -m pytest lp-doc-mailer/tests -q` → **132 passed，EXITCODE=0**（v3.0 时 115；
   新增 17 条覆盖条目模型、字段级来源、权限位可配、粒度、Word 复用、GC 变量保活、撞名修复等）。
+  **v3.1.1 修复后 → 152 passed**（再新增 20 条 `test_v3_attach_paths.py`）。
 - `sync_release.py` → 同步 + 校验通过（`APP_VERSION` = **3.1.0**，三处源码一致）。
-  **版本号决定**：用户明确指出「不是 3.1.0 吗」——本轮就是 v3.1，设计稿/界面/交接文档
+  **版本号决定（v3.1.0 当时）**：用户明确指出「不是 3.1.0 吗」——本轮就是 v3.1，设计稿/界面/交接文档
   口径都叫 v3.1，且 3.0.0 与 3.1.0 **都从未发布过**（仓库 tag 最高 v2.2.0），
   所以对外的第一个 3.x 版本直接叫 **3.1.0**，不用再跳一个小版本。
+  **后续**：v3.1.0 发布后用户实测发现缺陷（§15），按用户决定 **保留 v3.1.0 不动**，
+  修复版另发 **v3.1.1**（`APP_VERSION` 六处同步为 3.1.1）。
 - 视觉验收：`v31_library.png` / `v31_pipeline.png` / `v31_overview.png`
   （截图用 Win32 `PrintWindow(PW_RENDERFULLCONTENT)` 抓窗口，不依赖桌面可见——
   本机当前整屏 `ImageGrab` 抓出来是纯黑，会话不可见时整屏截图不可用）。
@@ -521,7 +525,85 @@ git tag vX.Y.Z && git push origin vX.Y.Z
   `_rename_step*.py` 等）因本会话回收站仅限工作区内路径而无法删除，可随手删。
   （v3.1 的 `shot_v31.py` + `win_grab.py` 是有意保留的：可复现界面验收。）
 - **P4（收件人库界面、执行历史查看界面）仍未做**，发版说明要写清。
-- 打包 zip / 签名 / git tag / Release 上传 **一律未执行**（会写远端，需用户明确指示）。
+- v3.1.0 的打包 / 签名 / git tag / Release 上传 **已执行**（2026-10-23 晚，见 §15.3）。
 - 仓库状态（`lp-doc-mailer/`，branch=main，remote=github.com/fundops-notes/doc-mailer）：
-  `src/lp_tool.py` / `src/watermark_encrypt.py` / `tests/test_core.py` 已修改未提交；
-  `src/lp_v3.py` 与 `tests/` 下 6 个新文件仍未跟踪，发版前需要 `git add`。
+  v3.1.0 已 push（main = `0c7d139`，tag `v3.1.0`）；v3.1.1 的改动见 §15.4。
+
+---
+
+## 15. v3.1.1 修复版：「附件路径」链路（2026-10-23 深夜）
+
+### 15.1 触发原因
+
+用户在 v3.1.0 实测后反馈：**导入模板里有「附件路径」列，但界面上没有维护的地方，
+流水线里也看不到每个收件人的文件地址配置。**
+
+排查后确认是**三个问题叠在一起**（不是单纯"界面没做"）：
+
+| # | 问题 | 位置 | 后果 |
+|---|---|---|---|
+| ① | 收件人表**没有「附件路径」列** | `lp_tool.py` 收件人表格列写死 | 路径其实导进来了（`HEADER_ALIASES["files"]` → `rec["attachments"]`），但用户在表格上看不见、也没法在表格上维护；编辑框里又叫「专属附件」，与模板列名对不上号 |
+| ② | 流水线**没有 per-recipient 路径这一层** | `execute_item()` 的 attach 分支只读 `params["files"]` | 附加文件条目只能手填一份固定清单，所有人拿一样的；per-recipient 路径只在最后组装附件包时被悄悄并进去，流水线里既配不了也看不见 |
+| ③ | **配了附件路径就点「导出收件人清单」必崩** | `lp_v3.recipients_to_rows()` | `attachments` 是**路径字符串列表**，代码却按 dict 用（`a.get("path")`）→ `AttributeError`；exe 是 `--noconsole` 打包的，异常被 tkinter 吞掉 → **用户点按钮后连报错都看不到，什么都不会发生** |
+
+### 15.2 改了什么
+
+**`lp_v3.py`**
+- `recipients_to_rows()`：attachments 兼容「字符串 / dict」两种形态，不再崩。
+- `normalize_recipient()`：v2 的 `files` 与 v3 的 `attachments` 合并后去重。
+- 新增**附加文件条目的「路径来源」**（与占位符的字段来源同一套口径）：
+  - `manual`（默认，行为与旧版完全一致）/ `recipient.attachments`（收件人清单的「附件路径」列）
+    / `fields.<列名>`（收件人自定义字段）/ `sheet.<列名>`（外部数据表列）
+  - `path_source_options()` 列出可选项，`path_source_label()` 出人话，`resolve_item_paths()` 解析取值。
+- `execute_item()` attach 分支：按来源取路径。按人取时某人没填/文件不存在 → **warning 跳过**，不让整条失败；
+  手填路径不存在仍然报错（配置错误要暴露）。
+- `event_uses_recipient_paths()`：若流水线已有条目按「收件人清单附件路径」取，
+  `assemble_attachments()` 就不再原样重复附加收件人那列路径 —— **否则同一个人会收到两份同样的文件**
+  （一份是条目产物、一份是原始路径）。
+- `item_uses_sheet()`：路径来源是 `sheet.` 时也算"用到外部数据表"（否则不会去读那张表）。
+
+**`lp_tool.py`**
+- 收件人表新增「附件路径」列，显示每人各自的路径（文件名）；**文件不存在时那个名字前加 `⚠`**。
+- 编辑收件人对话框的标签由「专属附件」改为「**附件路径**」，与导入模板列名一致。
+- 附加文件条目参数区新增「**路径来源**」下拉 + 预览（"以第一位收件人为例会取到什么"）；
+  选中非手填来源时，手填文本框与三个按钮一起禁用（disabled 的 Text 再 insert 会抛 TclError）。
+- 流水线表格的「来源 / 模板」列按路径来源显示（不再显示手填清单）。
+- **导出收件人清单加了异常兜底**：出错弹「导出失败」框，不再静默失败。
+- 帮助页写清三处附件来源的区别。
+
+**模板 / 文档**
+- 导入模板表头改为与 `EXPORT_BASE_HEADERS` 一致（**补上「合并组」列** —— 导出表头本来有、
+  模板没有，说明页却写着它）；「附件路径」说明写清"每人专属、会进这个人的附件包"。
+- `examples/收件人清单导入模板.xlsx` 重生成（含「填写说明」页），
+  `examples/收件人清单示例（演示数据）.xlsx` 补「合并组」列。
+- 两份《使用说明.txt》补充「路径来源」与三处附件来源说明。
+
+### 15.3 验证
+
+- `pytest lp-doc-mailer/tests -q` → **152 passed**（新增 `test_v3_attach_paths.py` 20 条），
+  `LP_SKIP_WORD_TESTS=1` 模拟 CI → **143 passed + 9 skipped**，EXITCODE=0。
+- 实机验证脚本 `shot_attach_paths.py`（可复现）：收件人页「附件路径」列显示各自路径 + 缺失标 ⚠；
+  流水线参数区「路径来源」下拉含「收件人清单的『附件路径』列」；导出表第 7 列正确写出路径。
+  截图 `v31_recipients.png` / `v31_pathsource.png`。
+- 打包：`doc-mailer_v3.1.1_portable.zip`（44.2 MB / 2550 文件，zip 内断言 `APP_VERSION = "3.1.1"`）；
+  `doc-mailer_win64.zip`（44.7 MB，用**本地已签名** exe，zip 内 exe 签名 Valid、PYZ 里版本 3.1.1）。
+
+### 15.4 版本策略（用户拍板）
+
+v3.1.0 的 tag 与 Release 在修复前已由 CI 建出（`v3.1.0` → `0c7d139`，
+Release id=421973099，资产是 CI 打的**未签名** win64.zip）。
+用户选择：**保留 v3.1.0 不动**，修复版另发 **v3.1.1**（`APP_VERSION` 六处同步为 3.1.1）。
+→ v3.1.0 的 Release 说明里加一句指向 3.1.1 的提示。
+
+### 15.5 本轮踩到的新坑
+
+- ⚠️ **PyInstaller onefile 会派生子进程**：`verify_exe_boot.py` 里 `proc.terminate()` 只杀父进程，
+  子进程继续活着并**锁住 `dist/LP_Tool.exe`** → 下次打包 `PermissionError: [WinError 5]`。
+  已在 `verify_exe_boot.py` 里改成"按可执行文件路径"用 PowerShell 一并清残留。
+- ⚠️ **exe 体积**：本机 PyInstaller 会把 `PIL.Image` 里函数体内的 `import pyarrow/numpy` 也算进依赖，
+  于是 pandas/pyarrow/numpy/scipy 全被打进 exe（**115 MB**）。CI 是干净 venv 所以只有 44 MB。
+  已在构建命令里加 `--exclude-module pandas pyarrow numpy scipy IPython matplotlib polars win32com.test`，
+  exe 回到 **45.1 MB**。依据：本项目源码无 numpy 直接依赖、`openpyxl` 那边是 try/except、
+  便携版 runtime 本来就没装 numpy（一直跑得好好的）。
+- ⚠️ **exe 字节码里搜不到版本号字符串**是正常的（PYZ 是 zlib 压缩的）；
+  要验证包里版本号得用 `PyInstaller.archive.readers` 取出模块字节码看常量。

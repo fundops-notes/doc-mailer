@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.1.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.1.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -441,6 +441,20 @@ PERMISSION_DESC = {
 
 DEFAULT_PERMISSIONS = ["print"]
 
+# ---------------------------------------------------------------------------
+# 附加文件条目的「路径来源」
+# ---------------------------------------------------------------------------
+# 以前附加文件条目只能手填一串固定路径 → 每个人拿到的都一样。
+# 现在可以按收件人取路径，让「每人一份不同的文件」在流水线上就能配置：
+#   manual              手填路径（默认，行为与旧版一致）
+#   recipient.attachments 收件人清单的「附件路径」列（导入/手填的那一列）
+#   fields.<列名>        收件人自定义字段里的某一列
+#   sheet.<列名>         外部数据表里的某一列
+PATH_SOURCE_MANUAL = "manual"
+PATH_SOURCE_RECIPIENT = "recipient.attachments"
+PATH_SOURCE_FIELD_PREFIX = "fields."
+PATH_SOURCE_SHEET_PREFIX = "sheet."
+
 DEFAULT_ITEM = {
     "id": "", "kind": "generate", "name": "", "enabled": True,
     "params": {}, "granularity": "per_lp", "mapping": {}, "sheet": {},
@@ -488,7 +502,9 @@ def normalize_recipient(rec):
     # v2 的 files 字段（分号分隔的附件路径）→ attachments
     files = rec.get("files")
     if isinstance(files, str) and files.strip():
-        out["attachments"] = out["attachments"] + split_paths(files)
+        for p in split_paths(files):
+            if p not in out["attachments"]:
+                out["attachments"].append(p)
     return out
 
 
@@ -538,6 +554,7 @@ def normalize_item(it):
     p = {
         "template_path": "",       # kind=generate
         "files": [],               # kind=attach
+        "path_source": PATH_SOURCE_MANUAL,   # kind=attach：路径从哪来
         "to_pdf": False,
         "watermark": False,
         "encrypt": False,
@@ -546,6 +563,9 @@ def normalize_item(it):
     v = params.get("template_path")
     if isinstance(v, str):
         p["template_path"] = v
+    ps = params.get("path_source")
+    if isinstance(ps, str) and ps.strip():
+        p["path_source"] = ps.strip()
     fl = params.get("files")
     if isinstance(fl, list):
         p["files"] = [str(x).strip() for x in fl
@@ -593,9 +613,12 @@ def new_item(kind="generate", name=""):
 
 
 def item_uses_sheet(item):
-    """这条目的字段映射里是否用到了外部数据表。"""
+    """这条目的字段映射（或路径来源）里是否用到了外部数据表。"""
     mp = (item or {}).get("mapping") or {}
-    return any(str(v).startswith("sheet.") for v in mp.values())
+    if any(str(v).startswith("sheet.") for v in mp.values()):
+        return True
+    ps = str(((item or {}).get("params") or {}).get("path_source") or "")
+    return ps.startswith(PATH_SOURCE_SHEET_PREFIX)
 
 
 def normalize_mail(mail):
@@ -1371,6 +1394,73 @@ def field_source_options(event=None, recipient=None, sheet_cols=None):
     return out
 
 
+def path_source_options(event=None, recipient=None, sheet_cols=None):
+    """附加文件条目可选的路径来源：[(来源键, 类别, 显示名)]。
+
+    与占位符的「字段来源」同一套口径，方便用户理解：
+    手填路径 / 收件人清单的附件路径 / 收件人自定义字段 / 外部数据表列。
+    """
+    out = [(PATH_SOURCE_MANUAL, "固定路径", "手填路径（下面这份清单）"),
+           (PATH_SOURCE_RECIPIENT, "收件人", "收件人清单的「附件路径」列")]
+    for k in sorted((recipient or {}).get("fields", {})):
+        out.append((PATH_SOURCE_FIELD_PREFIX + k, "收件人字段", k))
+    for k in sorted(sheet_cols or []):
+        out.append((PATH_SOURCE_SHEET_PREFIX + k, "外部数据表", k))
+    return out
+
+
+def path_source_label(src):
+    """来源键 → 人话（给提示框/日志用）。"""
+    src = str(src or PATH_SOURCE_MANUAL)
+    if src == PATH_SOURCE_MANUAL:
+        return "手填路径"
+    if src == PATH_SOURCE_RECIPIENT:
+        return "收件人清单的「附件路径」列"
+    if src.startswith(PATH_SOURCE_FIELD_PREFIX):
+        return "收件人字段「%s」" % src[len(PATH_SOURCE_FIELD_PREFIX):]
+    if src.startswith(PATH_SOURCE_SHEET_PREFIX):
+        return "外部数据表「%s」列" % src[len(PATH_SOURCE_SHEET_PREFIX):]
+    return src
+
+
+def resolve_item_paths(item, unit, event, ctx=None):
+    """这个附加文件条目在这个产出单元上要附加哪些文件路径。
+
+    返回 (路径列表, 来源说明)。列表里的路径已按 ; 拆开、去空、去重。
+    手填路径返回 params["files"]；其余来源按收件人取值，
+    取到的值本身也可以再用 ; 分隔多个路径。
+    """
+    params = (item or {}).get("params") or {}
+    src = str(params.get("path_source") or PATH_SOURCE_MANUAL)
+    if src == PATH_SOURCE_MANUAL:
+        paths = [str(x).strip() for x in (params.get("files") or []) if str(x).strip()]
+        return paths, path_source_label(src)
+
+    rec = (unit or {}).get("rep") or {}
+    if not rec:
+        members = (unit or {}).get("recipients") or []
+        rec = members[0] if members else {}
+    raw = ""
+    if src == PATH_SOURCE_RECIPIENT:
+        raw = ";".join(str(p) for p in (rec.get("attachments") or []))
+    elif src.startswith(PATH_SOURCE_FIELD_PREFIX):
+        raw = str((rec.get("fields") or {}).get(src[len(PATH_SOURCE_FIELD_PREFIX):], "") or "")
+    elif src.startswith(PATH_SOURCE_SHEET_PREFIX):
+        col = src[len(PATH_SOURCE_SHEET_PREFIX):]
+        row = None
+        if ctx is not None:
+            row = ctx.sheet_for(item, rec)
+        raw = str((row or {}).get(col, "") or "")
+    paths = split_paths(raw)
+    out, seen = [], set()
+    for p in paths:
+        k = p.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out, path_source_label(src)
+
+
 def group_key_of(recipient):
     """合并组 key：没有组的收件人自成一组（§+名字，不会和真实组名撞）。"""
     g = (recipient.get("group") or "").strip()
@@ -1613,21 +1703,35 @@ def execute_item(item, unit, event, ctx):
         wm.generate_notice_docx(tpl, str(docx), fmap, batch=ctx.word)
         cur = docx
     else:
-        files = params.get("files") or []
+        files, src_label = resolve_item_paths(item, unit, event, ctx)
+        per_recipient = str(params.get("path_source") or PATH_SOURCE_MANUAL) != PATH_SOURCE_MANUAL
         if not files:
+            if per_recipient:
+                # 按收件人取路径时，某个人没填是正常的：跳过并提醒，不算失败
+                who = (unit.get("rep") or {}).get("name", "") or unit.get("lp_name", "")
+                warnings.append("%s：按「%s」没取到文件路径，已跳过"
+                                % (who or "该收件人", src_label))
+                return [], warnings
             raise RuntimeError("「附加文件」没有选择任何文件")
+        if per_recipient and not (unit.get("rep") or {}):
+            warnings.append("产出粒度是「全员共用一份」，按收件人取路径将以第一位收件人的路径为准")
         cur = []
         for src_path in files:
             sp = str(src_path).strip()
             if not sp:
                 continue
             if not Path(sp).exists():
+                if per_recipient:
+                    warnings.append("文件不存在，已跳过：%s" % sp)
+                    continue
                 raise RuntimeError("文件不存在：%s" % sp)
             base = item_output_name(event, unit, sp)
             dst = outdir / (base + Path(sp).suffix)
             shutil.copy2(sp, str(dst))
             cur.append(dst)
         if not cur:
+            if per_recipient:
+                return [], warnings
             raise RuntimeError("「附加文件」没有选择任何文件")
 
     # ---- 处理链：转 PDF → 加水印 → 加密（顺序固定） ----
@@ -1751,6 +1855,23 @@ def _attachment_matches(att, unit):
     return False
 
 
+def event_uses_recipient_paths(event):
+    """流水线上是否已有条目按「收件人清单的附件路径」取路径。
+
+    有的话，收件人页那一列路径已经由条目产出（会按产出粒度重命名/加密），
+    就不再原样重复附加一次，避免收件人收到两份同样的文件。
+    """
+    for it in (event or {}).get("pipeline") or []:
+        if not it.get("enabled", True):
+            continue
+        if (it.get("kind") or "generate") != "attach":
+            continue
+        src = str(((it.get("params") or {}).get("path_source") or PATH_SOURCE_MANUAL))
+        if src == PATH_SOURCE_RECIPIENT:
+            return True
+    return False
+
+
 def assemble_attachments(event, unit, final_outputs):
     """组装附件包。返回 (文件列表, 缺失文件列表)。
 
@@ -1775,6 +1896,8 @@ def assemble_attachments(event, unit, final_outputs):
             _add(a.get("path"))
     for r in unit.get("recipients") or []:
         for p in r.get("attachments") or []:
+            if event_uses_recipient_paths(event):
+                break          # 已由流水线条目按路径来源产出，不重复附加
             _add(p)
     # 去重（保持顺序）
     seen, out = set(), []
@@ -2498,10 +2621,18 @@ def recipients_to_rows(recipients, include_passwords=True):
     headers = list(EXPORT_BASE_HEADERS) + extra
     rows = [headers]
     for r in recips:
+        # attachments 是**路径字符串列表**（不是 dict 列表）——这里必须按字符串取，
+        # 写成 a.get("path") 会 AttributeError，导出按钮会静默失败。
+        att_cells = []
+        for a in (r.get("attachments") or []):
+            if isinstance(a, str):
+                att_cells.append(a)
+            elif isinstance(a, dict):
+                att_cells.append(str(a.get("path", "")))
         row = [
             r.get("name", ""), r.get("wm", ""), r.get("to", ""),
             r.get("cc", ""), r.get("bcc", ""), r.get("subject", ""),
-            ";".join(str(a.get("path", "")) for a in (r.get("attachments") or [])),
+            ";".join(x for x in att_cells if x),
             r.get("group", ""),
             r.get("open_pw", "") if include_passwords else "",
             r.get("owner_pw", "") if include_passwords else "",
