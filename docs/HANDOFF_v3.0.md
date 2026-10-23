@@ -744,6 +744,25 @@ P0–P3 已铺好数据底座（`lp_data/runs/` 有 Run 记录），但**一直�
 
 ---
 
+### 16.10 v3.2.0 发版结果（2026-10-24）
+
+- 发版前校验全绿：`sync_release.py` [OK] / `pytest tests -q` **191 passed** / `pack_portable.py` 读回断言全部 [OK]。
+- exe：`--exclude-module`（pandas/pyarrow/numpy/scipy/IPython/matplotlib/polars/win32com.test）→ **45.1 MB**（目标区间内），签名 **Valid**。
+- win64 包：3 项在根（与 v3.1.1 布局一致），zip 内 exe 签名 Valid、`lp_data.example.json` 含 `pool` 段（读回断言通过）。
+- tag `v3.2.0` → `1764a73` 已推远端（**本轮 github.com 直连可达，未动 FlClash**）；
+  远端 main 同为 `1764a73`。
+- CI run `39989823347` **success**，自动创建 Release id=**422091489** 并上传未签名 win64.zip。
+- `release_tool.py upload 3.2.0`：先删 CI 的同名未签名资产再上传两个本地资产（win64 为已签名版顶替）。
+- 终态验证：Release 非草稿非预发布；资产 2 个
+  （`doc-mailer_v3.2.0_portable.zip` 46,392,519 字节 + `doc-mailer_win64.zip` 46,845,800 字节）；
+  匿名 HEAD 均 302；说明正文为 v3.2.0 版、无旧包名残留。
+- ⚠️ 本轮网络注意：FlClash mixed-port 已关（7890 无监听），但**注册表系统代理仍指向 127.0.0.1:7890 且 ProxyEnable=1**
+  → Python urllib 会捡到死代理而 `connection refused`。绕行：命令前加 `no_proxy="*"`（不动用户系统设置）。
+  curl 不读注册表代理，直连正常。此状态与 §17 描述略有差异（§17 是 github.com 被屏、API 通；
+  本轮是 github.com 也通了，但系统代理残留导致 urllib 全挂）。
+
+---
+
 ## 17. 网络环境坑：github.com 被 IP 级屏蔽（2026-10-24 实测）
 
 ### 17.1 症状
