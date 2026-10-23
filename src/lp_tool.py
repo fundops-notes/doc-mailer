@@ -175,6 +175,8 @@ HEADER_ALIASES = {
     "subject": {"邮件标题", "标题", "主题", "subject"},
     "open_pw": {"打开口令", "打开密码", "open pw"},   # 不收"密码/口令"这种歧义列名
     "owner_pw": {"权限口令", "权限密码", "owner pw"},
+    "merge_group": {"合并组", "merge group", "merge_group"},
+    "from_addr": {"发件人", "代发地址", "from", "sent on behalf of"},
 }
 
 
@@ -216,6 +218,8 @@ def parse_import_rows(rows):
             "files": cell("files"),
             "open_pw": cell("open_pw"),
             "owner_pw": cell("owner_pw"),
+            "merge_group": cell("merge_group"),
+            "from_addr": cell("from_addr"),
         })
     return lps, unknown
 
@@ -528,6 +532,9 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl):
         mail.BCC = ";".join(bcc)
     mail.Subject = render_template(subject_tpl, rec, escape=False)
     mail.HTMLBody = render_template(body_tpl, rec)
+    from_addr = rec.get("from_addr", "")
+    if from_addr:
+        mail.SentOnBehalfOfName = from_addr
     for f in attachments:
         mail.Attachments.Add(str(Path(f).resolve()))  # Outlook 是独立进程，必须绝对路径
     mail.Save()  # 只存草稿；不调用 Send
@@ -551,7 +558,8 @@ def _load_data_file(path):
             drop += 1
             continue
         base = {"name": "", "wm": "", "to": "", "cc": "", "bcc": "",
-                "files": "", "subject": "", "open_pw": "", "owner_pw": ""}
+                "files": "", "subject": "", "open_pw": "", "owner_pw": "",
+                "merge_group": ""}
         base.update({k: v for k, v in rec.items() if isinstance(v, str)})
         norm.append(base)
     d["lps"] = norm
@@ -660,22 +668,29 @@ class App:
         self._after_id = None
         self._preview_img = None
 
-        nb = ttk.Notebook(root)
-        nb.pack(fill="both", expand=True, padx=6, pady=6)
-        self.nb = nb
-        self.tab_lp = ttk.Frame(nb)
-        self.tab_tpl = ttk.Frame(nb)
-        self.tab_run = ttk.Frame(nb)
-        nb.add(self.tab_lp, text=" ① 收件人管理 ")
-        nb.add(self.tab_tpl, text=" ② 邮件模板 ")
-        nb.add(self.tab_run, text=" ③ 生成文件 / Outlook 草稿 ")
+        # 单页布局：上方收件人表格，下方设置/生成/日志
+        main = ttk.Frame(root)
+        main.pack(fill="both", expand=True, padx=4, pady=4)
 
+        # 上半区：收件人管理（固定占约40%高度）
+        lp_frame = ttk.LabelFrame(main, text=" 收件人清单 ")
+        lp_frame.pack(fill="both", expand=True, pady=(0, 3))
+        self.tab_lp = lp_frame
         self.build_tab_lp()
+
+        # 下半区：左右分栏（左=邮件模板，右=生成设置+日志）
+        bottom = ttk.PanedWindow(main, orient="horizontal")
+        bottom.pack(fill="both", expand=True, pady=(3, 0))
+
+        tpl_frame = ttk.LabelFrame(bottom, text=" 邮件模板 ")
+        self.tab_tpl = tpl_frame
         self.build_tab_tpl()
+        bottom.add(tpl_frame, weight=1)
+
+        run_frame = ttk.LabelFrame(bottom, text=" 生成 / Outlook 草稿 ")
+        self.tab_run = run_frame
         self.build_tab_run()
-        nb.bind("<<NotebookTabChanged>>",
-                lambda e: self.refresh_preview()
-                if nb.index(nb.select()) == 1 and hasattr(self, "preview_label") else None)
+        bottom.add(run_frame, weight=1)
         if getattr(self, "_boot_error", None):
             self.root.after(200, lambda: messagebox.showerror("数据文件损坏", self._boot_error))
         self.root.after(150, self._poll_queue)
@@ -897,7 +912,8 @@ class App:
                 ("密送BCC（可空）", "bcc"),
                 ("附件路径（多个用;分隔，可空）", "files"),
                 ("邮件标题（空=用模板）", "subject"),
-                ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw")]
+                ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw"),
+                ("合并发送组（同名=一封邮件，可空）", "merge_group")]
         for i, (label, key) in enumerate(rows):
             ttk.Label(win, text=label).grid(row=i, column=0, sticky="e", padx=6, pady=4)
             e = ttk.Entry(win, width=52, show="*" if key == "owner_pw" else "")
@@ -1295,6 +1311,36 @@ class App:
         ttk.Label(grow, foreground="#888",
                   text="开启=权限口令统一（GP一个口令开全部文件）；留空自动生成").pack(side="left", padx=4)
 
+        # Word 模板行
+        wrow = ttk.Frame(f)
+        wrow.pack(fill="x", padx=8, pady=2)
+        ttk.Label(wrow, text="Word通知模板：").pack(side="left")
+        self.word_tpl_var = tk.StringVar(value=self.data.get("word_template") or "")
+        e_wt = ttk.Entry(wrow, textvariable=self.word_tpl_var, width=40)
+        e_wt.pack(side="left", padx=4)
+        ToolTip(e_wt, "Word .docx 模板路径。模板中的 {{字段}} 或 ?LP_Name? 会被替换。"
+                      "留空则使用上方 PDF 原件 + 水印模式。")
+        ttk.Button(wrow, text="选择…", command=self.add_word_template).pack(side="left", padx=2)
+        self.word_encrypt_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wrow, text="生成后加密", variable=self.word_encrypt_var).pack(side="left", padx=6)
+        ttk.Button(wrow, text="从Word模板生成PDF", command=self.generate_from_word
+                   ).pack(side="left", padx=6)
+        ToolTip(wrow.winfo_children()[-1],
+                "从 Word 模板逐收件人生成 PDF（替换占位符后导出）。"
+                "需本机安装 Word。可勾选生成后自动加密。")
+
+        # 发件人（SentOnBehalfOfName）
+        frow2 = ttk.Frame(f)
+        frow2.pack(fill="x", padx=8, pady=2)
+        ttk.Label(frow2, text="发件人（代发地址）：").pack(side="left")
+        self.from_addr_var = tk.StringVar(value=self.data.get("from_addr") or "")
+        e_fa = ttk.Entry(frow2, textvariable=self.from_addr_var, width=30)
+        e_fa.pack(side="left", padx=4)
+        ToolTip(e_fa, "SentOnBehalfOfName：以该地址的名义发送。"
+                      "留空用当前 Outlook 账户。需邮箱已授权代理发送。")
+        ttk.Label(frow2, foreground="#888",
+                  text="留空=默认账户。需要 Exchange/代理发送权限。").pack(side="left", padx=4)
+
         runbar = ttk.Frame(f)
         runbar.pack(fill="x", padx=8, pady=6)
         self.btn_files = ttk.Button(runbar, text="仅生成加密文件",
@@ -1334,6 +1380,85 @@ class App:
             if fp not in self.pdfs:
                 self.pdfs.append(fp)
                 self.pdf_list.insert("end", fp)
+
+    def add_word_template(self):
+        path = filedialog.askopenfilename(title="选择 Word 通知模板",
+                                          filetypes=[("Word 模板", "*.docx;*.doc")])
+        if path:
+            self.word_tpl_var.set(path)
+            self.data["word_template"] = path
+            self.save_data()
+
+    def generate_from_word(self):
+        """从 Word 模板逐收件人生成 PDF，可选加密"""
+        tpl = self.word_tpl_var.get().strip()
+        if not tpl or not Path(tpl).exists():
+            messagebox.showwarning("Word 模板", "请先选择有效的 .docx 模板文件")
+            return
+        if not self.data["lps"]:
+            messagebox.showwarning("Word 模板", "收件人清单为空")
+            return
+        outdir = Path(self.outdir_var.get())
+        outdir.mkdir(parents=True, exist_ok=True)
+        self.log(f"===== Word 模板模式：{Path(tpl).name} → {len(self.data[chr(39)+chr(108)+chr(112)+chr(115)+chr(39)])} 份 PDF =====")
+        self.running = True
+        self._cancel = threading.Event()
+        self.btn_files.state(["disabled"])
+        self.btn_draft.state(["disabled"])
+        if hasattr(self, "btn_stop"):
+            self.btn_stop.state(["!disabled"])
+
+        lps = self.data["lps"]
+        gp_mode = bool(self.gp_mode.get())
+        gp_pw = self.gp_pw_var.get().strip()
+        if gp_mode and not gp_pw:
+            gp_pw = gen_pw()
+            self.gp_pw_var.set(gp_pw)
+        encrypt = self.word_encrypt_var.get()
+
+        def worker():
+            import pythoncom
+            pythoncom.CoInitialize()
+            try:
+                for rec in lps:
+                    if self._cancel.is_set():
+                        break
+                    try:
+                        replacements = {
+                            "{{name}}": rec.get("name", ""),
+                            "{{收件人名称}}": rec.get("name", ""),
+                            "{{LP名称}}": rec.get("name", ""),
+                            "?LP_Name?": rec.get("name", ""),
+                            "?LP_Name_?": rec.get("name", ""),
+                        }
+                        for k, v in rec.items():
+                            if isinstance(v, str) and v and k != "name":
+                                replacements["{{" + k + "}}"] = v
+                        fname = sanitize_filename(rec.get("name", ""))
+                        pdf_path = outdir / (fname + ".pdf")
+                        wm.generate_notice_pdf(tpl, str(pdf_path), replacements)
+                        self.log(f"[Word→PDF OK] {pdf_path.name}")
+                        if encrypt:
+                            owner_use = gp_pw if gp_mode else rec.get("owner_pw", gen_pw())
+                            enc_out = outdir / (fname + "_enc.pdf")
+                            import fitz as _fz
+                            d = _fz.open(pdf_path)
+                            d.save(enc_out, encryption=_fz.PDF_ENCRYPT_AES_256,
+                                   user_pw=rec.get("open_pw", gen_pw()),
+                                   owner_pw=owner_use,
+                                   permissions=_fz.PDF_PERM_PRINT | _fz.PDF_PERM_ACCESSIBILITY)
+                            d.close()
+                            pdf_path.unlink()
+                            pdf_path = enc_out
+                            self.log(f"[加密OK] {enc_out.name}")
+                    except Exception as e:
+                        self.log(f"[Word→PDF 失败] {rec.get(chr(39)+chr(110)+chr(97)+chr(109)+chr(101)+chr(39), chr(39)+chr(63)+chr(39))}: {e}")
+                self.log("===== Word 模板生成完成 =====")
+                self._q.put(("summary", f"Word 模板模式完成。输出目录：{outdir}"))
+            finally:
+                pythoncom.CoUninitialize()
+                self._q.put(("done", None))
+        threading.Thread(target=worker, daemon=True).start()
 
     def remove_pdf(self):
         for i in reversed(self.pdf_list.curselection()):
@@ -1741,10 +1866,31 @@ class App:
             import pythoncom
             pythoncom.CoInitialize()  # 新线程必须初始化 COM，否则第二批起全失败
             try:
+                # 合并发送组：同 merge_group 的 LP 共用一封邮件
+                processed_groups = set()
                 for rec in lps:
                     if self._cancel.is_set():
                         self.log("===== 已手动停止 =====")
                         break
+                    mg = rec.get("merge_group", "")
+                    if mg and mg in processed_groups:
+                        continue  # 同组首条已处理
+                    if mg:
+                        processed_groups.add(mg)
+                        grp = [r for r in lps if r.get("merge_group") == mg]
+                        if len(grp) > 1:
+                            # 合并 To/CC/BCC
+                            rec = dict(rec)
+                            rec["to"] = ";".join(
+                                dict.fromkeys(
+                                    [m for r2 in grp for m in split_mails(r2.get("to", ""))]))
+                            rec["cc"] = ";".join(
+                                dict.fromkeys(
+                                    [m for r2 in grp for m in split_mails(r2.get("cc", ""))]))
+                            rec["bcc"] = ";".join(
+                                dict.fromkeys(
+                                    [m for r2 in grp for m in split_mails(r2.get("bcc", ""))]))
+                            self.log(f"[合并组] {mg}：{len(grp)} 个收件人合一封邮件")
                     outs, extra = [], []
                     for path in split_paths(rec.get("files", "")):
                         if Path(path).exists():

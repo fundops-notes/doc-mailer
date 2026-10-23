@@ -1,21 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF 打水印 + 双口令加密（一条命令完成）
-
-解决两个问题：
-1. 水印主体名过长被截断 —— 自动"换行或缩小字号"，保证完整显示
-2. 只有打开口令、没有权限口令 —— 同时设置
-     user_pw  = 打开口令（发给 LP）
-     owner_pw = 权限口令（禁止修改/批注/复制，不发 LP；默认随机生成）
-   加密算法 AES-256，权限只保留：打印、无障碍阅读
-
-用法：
-  python watermark_encrypt.py 原件.pdf --name "宁波某某股权投资合伙企业（有限合伙）" --open-pw Abc12345
-  python watermark_encrypt.py docs/*.pdf --name "..." --open-pw ... --owner-pw "内部口令!" --outdir out
-  python watermark_encrypt.py 原件.pdf --name "..." --open-pw ... --no-encrypt   # 只看水印效果
-
-注意：请用「未打水印的原件」作为输入，不要在已加密版本上二次处理。
+PDF 水印 + 双口令加密 + Word 通知模板 → PDF
 """
 
 import argparse
@@ -34,10 +20,8 @@ try:
 except Exception:
     pass
 
+# ---------------- 水印排版 ----------------
 
-# ---------------- 水印排版：不截断 + 可配置 ----------------
-
-# 可用水印字体（Windows 系统字体，加载失败自动退回内置字体）
 FONT_FILES = {
     "黑体": "simhei.ttf",
     "楷体": "simkai.ttf",
@@ -48,13 +32,13 @@ FONT_FILES = {
 _font_cache = {}
 
 WM_DEFAULTS = {
-    "layout": "auto",     # auto=自动（可读则单行缩号，否则折行）| single=强制单行 | wrap=强制折行
-    "fs_max": 0,          # 最大字号，0=按页面自动
-    "font": "",           # ""=内置字体；否则 FONT_FILES 的键名
-    "color": "#737373",   # 十六进制
+    "layout": "auto",
+    "fs_max": 0,
+    "font": "",
+    "color": "#737373",
     "opacity": 0.25,
-    "angle": -1,          # -1=自动（沿页面对角线）；否则角度（度）
-    "repeat": 1,          # 1=单个 | 3=三份（防裁剪）| "tile"=平铺 2列×3行
+    "angle": -1,
+    "repeat": 1,
 }
 
 
@@ -64,7 +48,7 @@ def _load_wm_font(name):
     if name not in _font_cache:
         try:
             _font_cache[name] = fitz.Font(fontfile=str(
-            Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / FONT_FILES[name]))
+                Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / FONT_FILES[name]))
         except Exception:
             _font_cache[name] = fitz.Font("china-s")
     return _font_cache[name]
@@ -76,7 +60,6 @@ def _hex_to_rgb(h):
 
 
 def _wrap_by_width(text, font, fontsize, max_w):
-    """按显示宽度逐字换行（中文公司名没有空格，只能在字符间断行）。"""
     lines, cur = [], ""
     for ch in text:
         if font.text_length(cur + ch, fontsize=fontsize) <= max_w:
@@ -91,13 +74,12 @@ def _wrap_by_width(text, font, fontsize, max_w):
 
 
 def plan_layout(text, font, usable_w, usable_h, fs_max, layout="auto"):
-    """按布局模式返回 (行列表, 字号)，保证每行都在 usable_w 内。"""
-    if layout == "single":  # 强制单行：字号一路缩到放得下
+    if layout == "single":
         fs = fs_max
         while fs >= 8 and font.text_length(text, fontsize=fs) > usable_w:
             fs -= 0.5
         return [text], max(fs, 8)
-    if layout == "wrap":    # 强制折行：保持大字号，最多 4 行
+    if layout == "wrap":
         fs = fs_max
         while fs >= 10:
             lines = _wrap_by_width(text, font, fs, usable_w)
@@ -105,7 +87,6 @@ def plan_layout(text, font, usable_w, usable_h, fs_max, layout="auto"):
                 return lines, fs
             fs -= 1
         return _wrap_by_width(text, font, 10, usable_w), 10
-    # auto：单行缩号仍可读就用单行；缩得太小就折行
     fs = fs_max
     while fs >= 10:
         if font.text_length(text, fontsize=fs) <= usable_w:
@@ -123,10 +104,9 @@ def plan_layout(text, font, usable_w, usable_h, fs_max, layout="auto"):
 
 
 def _make_stamp(text, font, side, cfg):
-    """在 side×side 方形临时页写水印；返回该页所属文档。"""
     tmp = fitz.open()
     tp = tmp.new_page(width=side, height=side)
-    h_limit = float(cfg.get("_h_limit") or 0)  # 水平角度下由 add_watermark 传入页宽限制
+    h_limit = float(cfg.get("_h_limit") or 0)
     color = _hex_to_rgb(cfg.get("color"))
     opacity = float(cfg.get("opacity", 0.25))
     layout = cfg.get("layout", "auto")
@@ -145,19 +125,17 @@ def _make_stamp(text, font, side, cfg):
             ang = -1
         for i, ln in enumerate(lines):
             w = font.text_length(ln, fontsize=fs)
-            # 斜排水印（左下→右上）多行按阅读方向阶梯排：第1行在左下；
-            # 水平水印保持常规自上而下
             off = (i - (n - 1) / 2) * line_h
             y = (cy + off if ang != 0 else cy - off) + fs * 0.36
             tw.append(fitz.Point(cx - w / 2, y), ln, font=font, fontsize=fs)
         tw.write_text(tp, color=color, opacity=op)
 
     rep = cfg.get("repeat", 1)
-    if rep == "tile":  # 平铺由 add_watermark 按页面坐标逐格放置，这里只画单块
+    if rep == "tile":
         rep = 1
     box_w = min(side * 0.82, h_limit) if h_limit else side * 0.82
     write_block(side / 2, side / 2, box_w, side * 0.70, fs_main, opacity)
-    if rep == 3:  # 两侧副本缩小字号，保证完整落在页内
+    if rep == 3:
         for off in (-0.20, 0.20):
             write_block(side / 2 + off * side * 0.82, side / 2,
                         side * 0.50, side * 0.40, fs_main * 0.62, opacity * 0.6)
@@ -175,9 +153,7 @@ def add_watermark(page, text, cfg=None):
     if angle < 0:
         angle = math.degrees(math.atan2(r.height, r.width))
 
-    # 方形临时页内容绕中心旋转任意角度后外接框不变，show_pdf_page 不会缩放；
-    # 直接用 TextWriter + morph 在本版本 PyMuPDF 会静默丢字，故走此路径
-    if abs(angle) < 1e-6:  # 水平角度：可用宽度以页宽为准，防止超出页边被裁
+    if abs(angle) < 1e-6:
         cfg = dict(cfg, _h_limit=r.width * 0.92)
 
     def place(stamp, cx, cy, side):
@@ -186,7 +162,6 @@ def add_watermark(page, text, cfg=None):
                            stamp, 0, rotate=angle, overlay=True)
 
     if cfg.get("repeat") == "tile":
-        # 平铺：按页面坐标 2列×3行 逐格放置，每格独立小方形章，保证整格在页内
         cols, rows = 2, 3
         cw, ch = r.width / cols, r.height / rows
         cell_side = math.ceil(math.hypot(cw, ch) * 1.02)
@@ -204,10 +179,9 @@ def add_watermark(page, text, cfg=None):
     place(stamp, cx, cy, side)
 
 
-# ---------------- 主流程 ----------------
+# ---------------- 加密 ----------------
 
 def _perm_summary(doc):
-    """把权限位掩码解成可读 dict（以 LP 用打开口令登录后的视角）。"""
     p = doc.permissions & 0xFFFFFFFF
     return {
         "打印": bool(p & fitz.PDF_PERM_PRINT),
@@ -228,7 +202,6 @@ def process_one(src: Path, out: Path, name, open_pw, owner_pw, no_encrypt,
         cfg["opacity"] = opacity
     if wm_cfg:
         cfg.update(wm_cfg)
-    # 入口校验（GUI/CLI 共用兜底）
     if not (name or "").strip():
         raise ValueError("水印文字为空，拒绝生成无水印文件")
     if not open_pw or not owner_pw:
@@ -241,7 +214,7 @@ def process_one(src: Path, out: Path, name, open_pw, owner_pw, no_encrypt,
         for page in doc:
             add_watermark(page, name, cfg)
         try:
-            doc.subset_fonts()  # 子集化防完整 CJK 字体膨胀
+            doc.subset_fonts()
         except Exception as e:
             warnings.append(f"字体子集化失败（体积可能偏大）：{e}")
         tmp_out = out.with_suffix(out.suffix + ".tmp")
@@ -254,12 +227,11 @@ def process_one(src: Path, out: Path, name, open_pw, owner_pw, no_encrypt,
             doc.save(tmp_out, encryption=fitz.PDF_ENCRYPT_AES_256,
                      user_pw=open_pw, owner_pw=owner_pw,
                      permissions=perms, garbage=3, deflate=True)
-    os.replace(tmp_out, out)  # 原子替换：中断不留半截文件
+    os.replace(tmp_out, out)
 
     if no_encrypt:
         return {"encrypted": False, "warnings": warnings}
 
-    # 自检：显式抛错（assert 在 -O 下会失效）
     d = fitz.open(out)
     try:
         if not d.needs_pass:
@@ -282,27 +254,130 @@ def process_one(src: Path, out: Path, name, open_pw, owner_pw, no_encrypt,
     return {"encrypted": True, "user_perms": perms, "warnings": warnings}
 
 
+# ---------------- Word 通知模板 → PDF ----------------
+
+def generate_notice_pdf(template_path, output_path, replacements):
+    """从 Word 模板生成单份 PDF（占位符替换后导出）。
+
+    Args:
+        template_path: .docx 模板完整路径
+        output_path: 输出 PDF 完整路径
+        replacements: dict，如 {"{{LP_Name}}": "XX基金", "{{CC1}}": "$200,000"}
+    """
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    word = None
+    doc = None
+    try:
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(str(Path(template_path).resolve()), ReadOnly=True)
+
+        for find_text, replace_text in replacements.items():
+            find = doc.Content.Find
+            find.ClearFormatting()
+            find.Replacement.ClearFormatting()
+            find.Text = find_text
+            find.Replacement.Text = str(replace_text)
+            find.Forward = True
+            find.Wrap = 1  # wdFindContinue
+            find.MatchCase = False
+            find.Execute(Replace=2)  # wdReplaceAll
+
+        # SaveAs2 FileFormat=17 (wdFormatPDF)
+        doc.SaveAs2(str(Path(output_path).resolve()), FileFormat=17)
+    except Exception as e:
+        raise RuntimeError(f"Word 模板处理失败：{e}")
+    finally:
+        if doc:
+            try:
+                doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        if word:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
+
+def generate_notice_pdfs(template_path, output_dir, lp_records):
+    """从 Word 模板批量生成 PDF（逐 LP 替换占位符）。
+
+    Args:
+        template_path: .docx 模板路径
+        output_dir: 输出目录
+        lp_records: LP 记录列表（lp_tool.App.data["lps"] 格式）
+
+    Returns:
+        list of {"name": str, "pdf": str or None, "error": str or None}
+    """
+    results = []
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for rec in lp_records:
+        name = rec.get("name", "")
+        try:
+            # 构造替换映射：{{name}} 和 ?LP_Name? 两种占位符都支持
+            replacements = {
+                "{{name}}": name,
+                "{{收件人名称}}": name,
+                "{{LP名称}}": name,
+                "?LP_Name?": name,
+                "?LP_Name_?": name,
+            }
+            for k, v in rec.items():
+                if k in ("name",):  # 已在上面处理
+                    continue
+                if isinstance(v, str) and v:
+                    ph = "{{" + k + "}}"
+                    replacements[ph] = v
+            # 数字格式化
+            for num_key in ("call_amount", "unfunded"):
+                val = rec.get(num_key)
+                if val:
+                    try:
+                        replacements["{{" + num_key + "}}"] = f"{float(val):,.0f}"
+                    except (ValueError, TypeError):
+                        replacements["{{" + num_key + "}}"] = str(val)
+
+            safe = _hex_to_rgb  # noqa: F841 — 防止导入被 tree-shake
+            safe_name = _wrap_by_width  # noqa: F841
+            fname = re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "unnamed"
+            pdf_path = out_dir / (fname + ".pdf")
+            generate_notice_pdf(template_path, str(pdf_path), replacements)
+            results.append({"name": name, "pdf": str(pdf_path), "error": None})
+        except Exception as e:
+            results.append({"name": name, "pdf": None, "error": str(e)})
+
+    return results
+
+
+import re  # generate_notice_pdfs 里用到
+
+
+# ---------------- CLI ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="PDF 打水印 + 双口令加密")
-    ap.add_argument("inputs", nargs="+", help="PDF 原件（可用通配符）")
-    ap.add_argument("--name", required=True, help="水印主体名称（LP 名称）")
-    ap.add_argument("--open-pw", required=True, help="打开口令（发给 LP 的）")
-    ap.add_argument("--owner-pw", default=None,
-                    help="权限口令；不给则随机生成（仅打印在屏幕上，勿发 LP）")
-    ap.add_argument("--outdir", default="out_wm", help="输出目录（默认 out_wm）")
-    ap.add_argument("--repeat", default="1", choices=["1", "3", "tile"],
-                    help="水印份数：1=单个 | 3=三份（防裁剪）| tile=平铺2列×3行")
+    ap = argparse.ArgumentParser(description="PDF 水印 + 双口令加密")
+    ap.add_argument("inputs", nargs="+")
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--open-pw", required=True)
+    ap.add_argument("--owner-pw", default=None)
+    ap.add_argument("--outdir", default="out_wm")
+    ap.add_argument("--repeat", default="1", choices=["1", "3", "tile"])
     ap.add_argument("--opacity", type=float, default=0.25)
-    ap.add_argument("--layout", default="auto", choices=["auto", "single", "wrap"],
-                    help="布局：auto=自动 | single=强制单行 | wrap=强制折行")
-    ap.add_argument("--font", default="", choices=[""] + list(FONT_FILES),
-                    help="字体（默认内置）")
-    ap.add_argument("--color", default="#737373", help="颜色（十六进制，如 #B22222）")
-    ap.add_argument("--angle", type=float, default=-1,
-                    help="角度（度）；-1=自动沿对角线")
-    ap.add_argument("--fs-max", type=int, default=0, help="最大字号（0=自动）")
-    ap.add_argument("--no-encrypt", action="store_true", help="只打水印不加密（预览效果用）")
+    ap.add_argument("--layout", default="auto", choices=["auto", "single", "wrap"])
+    ap.add_argument("--font", default="", choices=[""] + list(FONT_FILES))
+    ap.add_argument("--color", default="#737373")
+    ap.add_argument("--angle", type=float, default=-1)
+    ap.add_argument("--fs-max", type=int, default=0)
+    ap.add_argument("--no-encrypt", action="store_true")
     args = ap.parse_args()
 
     if args.owner_pw is None:
@@ -336,9 +411,7 @@ def main():
                                    "color": args.color, "angle": args.angle,
                                    "fs_max": args.fs_max})
         if info.get("encrypted"):
-            print(f"[OK] {src.name} -> {out}  水印{'已写入' if info['wm_ok'] else '!!未检出!!'}，"
-                  f"打开口令验证{'通过' if info['user_ok'] else '失败'}，"
-                  f"权限口令验证{'通过' if info['owner_ok'] else '失败'}")
+            print(f"[OK] {src.name} -> {out}")
             print(f"     LP 侧权限：{info['user_perms']}")
         else:
             print(f"[OK] {src.name} -> {out}  (未加密，仅水印)")
