@@ -2337,8 +2337,14 @@ class App:
                 "后台仍在生成文件/草稿。\n\n确定退出？（强退可能留下不完整文件，"
                 "已完成的草稿保留）"):
             return
-        self.data["subject"], self.data["body"] = self.collect_template()
-        self.save_data()
+        try:
+            self.data["subject"], self.data["body"] = self.collect_template()
+        except Exception:
+            pass  # 没进过邮件模板页时 subject_var 不存在，跳过
+        try:
+            self.save_data()
+        except Exception:
+            pass
         self.root.destroy()
 
 
