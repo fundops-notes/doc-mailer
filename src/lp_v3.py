@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.1.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.2.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -46,6 +46,7 @@ SETTINGS_FILE = "settings.json"
 EVENTS_DIR = "events"
 SCENARIOS_DIR = "scenarios"
 RUNS_DIR = "runs"
+RECIPIENTS_DIR = "recipients"   # 收件人库（P4 跨事件复用）
 
 PW_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
 
@@ -803,6 +804,110 @@ def sync_scenario_to_event(scenario, event):
 
 
 # ============================================================================
+# 收件人库（P4：跨事件复用）
+# ============================================================================
+#
+# 收件人库是一份**独立的常用收件人清单**，用来在多个事件之间复用同一批收件人。
+# 它不替代事件里的收件人：事件仍是「这一批发给谁」的唯一真相来源；
+# 库只是「常用的那批人」，靠显式的「存入 / 添加」按钮流动，避免意外改动已发批次。
+#
+# 铁律：合并时**绝不覆盖目标已有的打开口令与权限口令**（见 merge_recipient_into_list）。
+
+
+def normalize_pool_recipient(rec):
+    """收件人库记录规范化：收件人结构 + id + updated_at。"""
+    out = dict(normalize_recipient(rec))
+    out["id"] = ""
+    out["updated_at"] = ""
+    if isinstance(rec, dict):
+        for k in ("id", "updated_at"):
+            v = rec.get(k)
+            if isinstance(v, str):
+                out[k] = v
+    if not out["id"]:
+        out["id"] = _new_id("rcp")
+    return out
+
+
+def new_pool_recipient(rec=None):
+    """新建一条收件人库记录。"""
+    out = normalize_pool_recipient(rec or {})
+    out["id"] = _new_id("rcp")
+    out["updated_at"] = _now_str()
+    return out
+
+
+def merge_recipient_into_list(recipients, rec):
+    """把 rec 并入 recipients 列表（按收件人名称匹配）。
+
+    返回 (recipients, added, updated)：
+      · 没有同名 → 追加，added+1
+      · 有同名   → **只补空缺**：邮箱/抄送/密送/水印/组/标题/附件路径/自定义字段的空值；
+                   **绝不覆盖目标已有的打开口令与权限口令**（口径与场景同步一致）。
+
+    为什么要这样：口令是一次性发出的凭据，库里那份可能是旧值；
+    若覆盖，等于把已经发出去的批次的口令改掉。
+    """
+    recipients = recipients if isinstance(recipients, list) else []
+    src = normalize_recipient(rec)
+    name = src.get("name", "")
+    if not name:
+        return recipients, 0, 0
+    cur = None
+    for r in recipients:
+        if (r or {}).get("name", "") == name:
+            cur = r
+            break
+    if cur is None:
+        recipients.append(src)
+        return recipients, 1, 0
+    for k in ("to", "cc", "bcc", "wm", "group", "subject"):
+        if not cur.get(k) and src.get(k):
+            cur[k] = src[k]
+    for k, v in src.get("fields", {}).items():
+        cur.setdefault("fields", {}).setdefault(k, v)
+    for p in src.get("attachments") or []:
+        cur.setdefault("attachments", [])
+        if p not in cur["attachments"]:
+            cur["attachments"].append(p)
+    return recipients, 0, 1
+
+
+def pool_merge_recipient(pool, rec):
+    """按名称把一条收件人并入库。
+
+    返回 (pool, 新增的那条 or None, 是否是更新)。
+    调用方拿到"新增的那条"才需要落盘 —— 更新已有条目时**不动它原有的口令**。
+    """
+    pool = pool if isinstance(pool, list) else []
+    src = normalize_pool_recipient(rec)
+    name = src.get("name", "")
+    if not name:
+        return pool, None, False
+    for r in pool:
+        if (r or {}).get("name", "") == name:
+            merged, _a, _u = merge_recipient_into_list(pool, src)
+            return merged, None, True
+    pool.append(src)
+    return pool, src, False
+
+
+def merge_recipients_into_event(event, records):
+    """把若干收件人并入事件（按名称合并，保留目标已有口令）。
+
+    返回 (event, 新增数, 更新数)。
+    """
+    ev = normalize_event(event)
+    added = updated = 0
+    for rec in records or []:
+        ev["recipients"], a, u = merge_recipient_into_list(ev["recipients"], rec)
+        added += a
+        updated += u
+    ev["updated_at"] = _now_str()
+    return ev, added, updated
+
+
+# ============================================================================
 # 数据层：目录化存储
 # ============================================================================
 
@@ -862,12 +967,14 @@ class Store:
         self.events_dir = self.data_dir / EVENTS_DIR
         self.scenarios_dir = self.data_dir / SCENARIOS_DIR
         self.runs_dir = self.data_dir / RUNS_DIR
+        self.recipients_dir = self.data_dir / RECIPIENTS_DIR
         self.legacy_file = self.base / LEGACY_DATA_FILE
 
     # ----- 目录 -----
 
     def ensure_dirs(self):
-        for d in (self.data_dir, self.events_dir, self.scenarios_dir, self.runs_dir):
+        for d in (self.data_dir, self.events_dir, self.scenarios_dir,
+                  self.runs_dir, self.recipients_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     def exists(self):
@@ -997,8 +1104,10 @@ class Store:
 
     def save_run(self, run):
         self.ensure_dirs()
+        # ⚠️ id 也要清洗：run id 里若带 : / \ 等 Windows 文件名非法字符，
+        #    写文件会失败，而调用方若忽略返回值 → 执行记录静默丢失。
         name = "%s-%s.json" % (sanitize_filename(run.get("event_id", "evt"), 60),
-                               run.get("id", _stamp()))
+                               sanitize_filename(run.get("id") or _stamp(), 60))
         ok, err = write_json_file(self.runs_dir / name, run)
         return ok, err
 
@@ -1022,6 +1131,46 @@ class Store:
     def load_last_run(self, event_id):
         runs = self.list_runs(event_id)
         return runs[0] if runs else None
+
+    # ----- 收件人库（P4：跨事件复用） -----
+
+    def pool_path(self, rid):
+        return self.recipients_dir / ("%s.json" % sanitize_filename(rid, 80))
+
+    def list_pool(self):
+        """收件人库全部记录，按名称排序。损坏文件改名留证后跳过。"""
+        out = []
+        if not self.recipients_dir.exists():
+            return out
+        for p in sorted(self.recipients_dir.glob("*.json")):
+            data, err = read_json_file(p)
+            if err is not None:
+                self._quarantine(p, "recipient.corrupt")
+                continue
+            if isinstance(data, dict):
+                out.append(normalize_pool_recipient(data))
+        out.sort(key=lambda r: (r.get("name") or "", r.get("updated_at") or ""))
+        return out
+
+    def save_pool_recipient(self, rec):
+        """存一条收件人库记录。返回 (ok, error, record)。"""
+        rec = normalize_pool_recipient(rec)
+        if not rec.get("id"):
+            rec["id"] = _new_id("rcp")
+        rec["updated_at"] = _now_str()
+        self.ensure_dirs()
+        ok, err = write_json_file(self.pool_path(rec["id"]), rec)
+        return ok, err, rec
+
+    def delete_pool_recipient(self, rid):
+        p = self.pool_path(rid)
+        if p.exists():
+            try:
+                p.unlink()
+                return True, None
+            except OSError as e:
+                return False, str(e)
+        return False, "收件人不存在"
 
     # ----- 内部工具 -----
 
@@ -1181,11 +1330,14 @@ def seed_demo(store, example_path=None):
         data = {"lps": rows,
                 "subject": DEFAULT_SUBJECT_V3, "body": DEFAULT_BODY_V3}
     settings, scenario, event, notes = v2_to_v3_payload(data)
-    # 示例数据没有 Word 模板路径，流水线留空（用户自己加步骤）
-    scenario["pipeline"] = []
+    # 示例数据没有 Word 模板路径，**事件**的流水线留空（用户自己加条目）。
+    # 两种产出条目的示例放在**场景模板**里 —— 场景不参与预检，
+    # 放禁用条目不会挡住用户第一次运行（禁用的条目预检时会被跳过）。
+    scenario["pipeline"] = _demo_items()
     event["pipeline"] = []
     scenario["name"] = "示例场景"
-    scenario["description"] = "示例数据（虚构邮箱，可直接跑通全流程后自行替换）"
+    scenario["description"] = ("示例数据（虚构邮箱，可直接跑通全流程后自行替换）；"
+                               "含两个禁用状态的条目示例，启用后填上模板/文件即可用")
     event["name"] = "示例事件"
     filled = 0
     for rec in list(scenario["recipients"]) + list(event["recipients"]):
@@ -1199,11 +1351,47 @@ def seed_demo(store, example_path=None):
     store.save_settings(settings)
     store.save_scenario(scenario)
     store.save_event(event)
+
+    # P4：示例收件人库（让「收件人库」标签页不是空的，也示范跨事件复用）
+    pool_added = 0
+    for rec in (data.get("pool") or []):
+        if not isinstance(rec, dict) or not rec.get("name"):
+            continue
+        src = normalize_pool_recipient(rec)
+        if not src.get("open_pw"):
+            src["open_pw"] = gen_pw()
+        if not src.get("owner_pw"):
+            src["owner_pw"] = gen_pw()
+        ok, err, saved = store.save_pool_recipient(src)
+        if not ok:
+            notes.append("写入示例收件人库失败：%s" % err)
+            break
+        pool_added += 1
+    if pool_added:
+        notes.append("已生成示例收件人库 %d 条（可跨事件复用）" % pool_added)
+
     notes.append("已生成示例场景「示例场景」+ 事件「示例事件」，"
                  "收件人 %d 位%s"
                  % (len(scenario["recipients"]),
                     ("，自动补齐口令 %d 个" % filled) if filled else ""))
     return True, notes
+
+
+def _demo_items():
+    """示例条目：两种产出条目各一个，默认**禁用**（不参与预检，不会挡住首次运行）。"""
+    return [
+        normalize_item({
+            "kind": "generate", "name": "示例：季度对账单", "enabled": False,
+            "params": {"template_path": "", "to_pdf": True, "watermark": True,
+                       "encrypt": True, "permissions": list(DEFAULT_PERMISSIONS)},
+            "granularity": "per_lp",
+        }),
+        normalize_item({
+            "kind": "attach", "name": "示例：附加说明文件", "enabled": False,
+            "params": {"files": [], "path_source": PATH_SOURCE_MANUAL},
+            "granularity": "per_lp",
+        }),
+    ]
 
 
 # ============================================================================
@@ -2247,7 +2435,9 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         run["status"] = "preflight_failed"
         run["finished_at"] = _now_str()
         _log("预检未通过，已中止（不生成半成品）：%d 个问题" % len(errors))
-        store.save_run(run)
+        ok, save_err = store.save_run(run)
+        if not ok:
+            run["warnings"].append("执行记录保存失败：%s" % save_err)
         return run
 
     opts = event.get("options") or {}
@@ -2365,7 +2555,11 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         run["status"] = "ok"
     run["finished_at"] = _now_str()
     run["info"] = info
-    store.save_run(run)
+    ok, save_err = store.save_run(run)
+    if not ok:
+        # 执行记录写不进去要让人知道（否则「执行历史」里什么都没有却查不到原因）
+        run["warnings"].append("执行记录保存失败：%s" % save_err)
+        _log("执行记录保存失败：%s" % save_err)
     _log("===== 完成：成功 %d，失败 %d，跳过 %d ====="
          % (run["stats"]["ok"], run["stats"]["fail"], run["stats"]["skip"]))
     return run

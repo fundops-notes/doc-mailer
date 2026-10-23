@@ -90,5 +90,29 @@
     }
   ],
   "subject": "机密文件（{{收件人名称}} 专属）",
-  "body": "<div style=\"font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;\">\n<p><b>{{收件人名称}}</b> 您好：</p>\n<p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>\n<p style=\"padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;\">\n<b>打开口令：{{打开口令}}</b></p>\n<p style=\"color:#888;font-size:12px;\">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>\n<p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>\n</div>"
+  "body": "<div style=\"font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;\">\n<p><b>{{收件人名称}}</b> 您好：</p>\n<p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>\n<p style=\"padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;\">\n<b>打开口令：{{打开口令}}</b></p>\n<p style=\"color:#888;font-size:12px;\">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>\n<p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>\n</div>",
+  "pool": [
+    {
+      "name": "苏州启衡科技有限公司",
+      "wm": "苏州启衡科技有限公司",
+      "to": "ir@qiheng-demo.cn",
+      "cc": "fin@qiheng-demo.cn",
+      "bcc": "",
+      "subject": "",
+      "files": "",
+      "open_pw": "",
+      "owner_pw": ""
+    },
+    {
+      "name": "宁波晨曦汐诺供应链股份有限公司",
+      "wm": "宁波晨曦汐诺供应链股份有限公司",
+      "to": "contact@chenxi-demo.cn",
+      "cc": "",
+      "bcc": "",
+      "subject": "",
+      "files": "",
+      "open_pw": "",
+      "owner_pw": ""
+    }
+  ]
 }

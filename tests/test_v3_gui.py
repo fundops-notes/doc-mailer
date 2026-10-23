@@ -73,11 +73,27 @@ def test_nav_has_only_three_entries(app):
 
 
 def test_event_library_has_event_and_template_tabs(app):
+    """事件库的标签页：事件 / 场景模板 / 收件人库 / 执行历史。
+
+    收件人库与执行历史（P4）做在**标签页**里，不占顶层导航入口 ——
+    用户当初明确说过「三个入口看不懂区别，只要事件库」。
+    """
     app.show_screen("home")
     tabs = [app.home_nb.tab(i, "text") for i in range(app.home_nb.index("end"))]
-    assert len(tabs) == 2
+    assert len(tabs) == 4
     assert "事件" in tabs[0]
     assert "场景模板" in tabs[1]
+    assert "收件人库" in tabs[2]
+    assert "执行历史" in tabs[3]
+
+
+def test_nav_still_has_only_three_entries(app):
+    """P4 加了收件人库/执行历史，但**顶层导航仍然只有三项**。"""
+    app.show_screen("home")
+    assert "scenes" not in app._screens
+    assert "lib" not in app._screens
+    assert "pool" not in app._screens
+    assert "runs" not in app._screens
 
 
 def test_open_event_reopens_after_leaving_workbench(app):

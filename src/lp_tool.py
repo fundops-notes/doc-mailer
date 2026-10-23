@@ -56,9 +56,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.2.0"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.1.1"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.2.0"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -650,9 +650,16 @@ class App:
         self.home_nb.add(self.home_tab_ev, text=" 事件 ")
         self.home_tab_sc = ttk.Frame(self.home_nb)
         self.home_nb.add(self.home_tab_sc, text=" 场景模板 ")
+        # P4：收件人库与执行历史做成标签页，不占顶层导航入口
+        self.home_tab_pool = ttk.Frame(self.home_nb)
+        self.home_nb.add(self.home_tab_pool, text=" 收件人库 ")
+        self.home_tab_runs = ttk.Frame(self.home_nb)
+        self.home_nb.add(self.home_tab_runs, text=" 执行历史 ")
 
         self._build_events_tab(self.home_tab_ev)
         self._build_scenes(self.home_tab_sc)
+        self._build_pool_tab(self.home_tab_pool)
+        self._build_runs_tab(self.home_tab_runs)
 
     def _build_events_tab(self, parent):
         bar = ttk.Frame(parent)
@@ -718,6 +725,8 @@ class App:
     def _refresh_home(self):
         self._refresh_events_tab()
         self._refresh_scenes()
+        self._refresh_pool_tab()
+        self._refresh_runs_tab()
 
     def _refresh_events_tab(self):
         events = self.store.list_events()
@@ -889,6 +898,476 @@ class App:
             messagebox.showinfo("提示", "请先选中一个事件")
             return
         self.open_event(eid)
+
+    # ================= 收件人库（事件库里的第三个标签页，P4） =================
+    #
+    # 为什么不做成独立导航页：用户 2026-10-23 明确说过「场景与事件 / 场景模板 / 收件人库
+    # 三个入口看不懂区别，只要事件库」，当时把收件人库那个空壳页删了。
+    # 所以这里做进事件库的标签页，顶层导航仍然是「事件库 / 设置 / 帮助」。
+
+    def _build_pool_tab(self, parent=None):
+        f = parent if parent is not None else getattr(self, "home_tab_pool", None)
+        if f is None:
+            return
+        ttk.Label(f, text="收件人库", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(f, text=(
+            "常用的那批收件人，跨事件复用。\n"
+            "「从事件导入…」把某个事件的收件人整个收进库；「添加到事件…」把库里的人并进某个事件。\n"
+            "合并按收件人名称进行；「事件里已有的打开口令 / 权限口令」不会被覆盖。\n"
+            "库里也存着口令，与 lp_data/ 其余部分同管控级别。"),
+            style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
+
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(0, 4))
+        for text, cmd, tip in (
+                ("新增", self._pool_new, "在收件人库里新增一条"),
+                ("编辑", self._pool_edit, "编辑选中的收件人"),
+                ("删除", self._pool_delete, "从库里删除选中的收件人"),
+                ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
+                ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
+                ("导入 Excel/CSV", self._pool_import, "按收件人清单模板导入（可先下载模板）"),
+                ("导出 Excel", self._pool_export, "把收件人库导出成 Excel"),
+        ):
+            b = ttk.Button(bar, text=text, command=cmd)
+            b.pack(side="left", padx=2)
+            ToolTip(b, tip)
+        b = ttk.Button(bar, text="下载导入模板", command=self._wb_export_template)
+        b.pack(side="left", padx=(10, 2))
+        ToolTip(b, "收件人清单模板（含填写说明页），与事件里用的是同一份")
+
+        frame = ttk.Frame(f)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=["name"], show="headings",
+                            selectmode="extended")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        tree.bind("<Double-1>", lambda _e: self._pool_edit())
+        self._pool_tree = tree
+        self._pool_iids = {}
+
+        ttk.Label(f, foreground="#b00", text=(
+            "安全提示：收件人库里含打开口令与权限口令，属敏感文件；"
+            "本程序同目录的 lp_data/ 同理，请限定在本机/受控共享目录使用。")
+        ).pack(fill="x", pady=(4, 0))
+
+    def _refresh_pool_tab(self):
+        tree = getattr(self, "_pool_tree", None)
+        if tree is None:
+            return
+        pool = self.store.list_pool()
+        fcols = []
+        for r in pool:
+            for k in (r.get("fields") or {}):
+                if k not in fcols:
+                    fcols.append(k)
+        cols = ["name", "to", "cc", "bcc", "wm", "group", "atts"] + \
+            ["f%d" % i for i in range(len(fcols))] + ["open_pw", "owner_pw"]
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "附件路径"] + fcols + \
+            ["打开口令", "权限口令(勿发)"]
+        tree.delete(*tree.get_children())
+        self._pool_iids = {}
+        try:
+            tree.configure(columns=cols)
+        except Exception:
+            pass
+        for c, h in zip(cols, heads):
+            try:
+                tree.heading(c, text=h)
+                tree.column(c, width=150 if c in ("to", "cc", "bcc")
+                            else (200 if c == "atts" else 110))
+            except Exception:
+                pass
+        for i, r in enumerate(pool):
+            atts = [str(p) for p in (r.get("attachments") or []) if str(p).strip()]
+            att_txt = "；".join(
+                (Path(p).name if Path(p).exists() else "⚠ " + Path(p).name)
+                for p in atts)
+            vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""), att_txt]
+            vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
+            vals += [r.get("open_pw", ""),
+                     "••••" if r.get("owner_pw") else ""]
+            iid = "p%d" % i
+            self._pool_iids[iid] = r.get("id", "")
+            tree.insert("", "end", iid=iid, values=vals)
+
+    def _pool_selected(self):
+        tree = getattr(self, "_pool_tree", None)
+        if tree is None:
+            return []
+        ids = self._pool_iids or {}
+        return [ids[i] for i in tree.selection() if i in ids]
+
+    def _pool_new(self):
+        rec = lp_v3.new_pool_recipient({
+            "name": "", "wm": "", "to": "", "cc": "", "bcc": "",
+            "open_pw": gen_pw(), "owner_pw": gen_pw(), "fields": {},
+            "attachments": [], "group": ""})
+
+        def save(out):
+            out["id"] = rec.get("id", "")
+            ok, err, _rec = self.store.save_pool_recipient(out)
+            if not ok:
+                messagebox.showerror("保存失败", err)
+                return False
+            self._refresh_pool_tab()
+            return True
+
+        self._recipient_dialog(rec, self._pool_field_cols(),
+                               "新增收件人（收件人库）", save,
+                               "（库里还没有自定义字段列）")
+
+    def _pool_field_cols(self):
+        cols = []
+        for r in self.store.list_pool():
+            for k in (r.get("fields") or {}):
+                if k not in cols:
+                    cols.append(k)
+        return cols
+
+    def _pool_edit(self):
+        tree = getattr(self, "_pool_tree", None)
+        sel = tree.selection() if tree else ()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一位收件人")
+            return
+        rid = (self._pool_iids or {}).get(sel[0])
+        rec = None
+        for r in self.store.list_pool():
+            if r.get("id") == rid:
+                rec = dict(r)
+                break
+        if rec is None:
+            return
+
+        def save(out):
+            out["id"] = rid
+            ok, err, _rec = self.store.save_pool_recipient(out)
+            if not ok:
+                messagebox.showerror("保存失败", err)
+                return False
+            self._refresh_pool_tab()
+            return True
+
+        self._recipient_dialog(rec, self._pool_field_cols(),
+                               "编辑收件人（收件人库）", save,
+                               "（库里还没有自定义字段列）")
+
+    def _pool_delete(self):
+        ids = self._pool_selected()
+        if not ids:
+            messagebox.showinfo("提示", "请先选中要删除的收件人")
+            return
+        if not messagebox.askyesno("确认删除",
+                                   "确定要从收件人库里删除 %d 位收件人吗？\n"
+                                   "（不会影响任何事件里的收件人）" % len(ids)):
+            return
+        for rid in ids:
+            ok, err = self.store.delete_pool_recipient(rid)
+            if not ok:
+                messagebox.showerror("删除失败", err)
+                return
+        self._refresh_pool_tab()
+
+    def _pick_event(self, title):
+        """弹窗选一个事件。返回 event id 或 None。"""
+        events = self.store.list_events()
+        if not events:
+            messagebox.showinfo("提示", "还没有任何事件")
+            return None
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.grab_set()
+        win.geometry("460x360")
+        ttk.Label(win, text=title, justify="left").pack(anchor="w", padx=12, pady=(10, 4))
+        lb = tk.Listbox(win, exportselection=False)
+        lb.pack(fill="both", expand=True, padx=12)
+        for e in events:
+            lb.insert("end", "%s（%d 位收件人）" % (e.get("name", ""),
+                                                  len(e.get("recipients", []))))
+        picked = {"id": None}
+
+        def ok():
+            sel = lb.curselection()
+            if sel:
+                picked["id"] = events[sel[0]].get("id")
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=8)
+        ttk.Button(btns, text="确定", command=ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+        return picked["id"]
+
+    def _pool_from_event(self):
+        eid = self._pick_event("把哪个事件的收件人收进收件人库？")
+        if not eid:
+            return
+        ev, _err = self.store.load_event(eid)
+        if not ev:
+            return
+        recips = ev.get("recipients") or []
+        if not recips:
+            messagebox.showinfo("提示", "这个事件还没有收件人")
+            return
+        pool = self.store.list_pool()
+        added = updated = 0
+        for rec in recips:
+            src = dict(rec)
+            src.pop("id", None)
+            pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, src)
+            if new_rec is not None:
+                ok, err, _saved = self.store.save_pool_recipient(new_rec)
+                if not ok:
+                    messagebox.showerror("保存失败", err)
+                    return
+                added += 1
+            elif is_update:
+                updated += 1
+        self._refresh_pool_tab()
+        messagebox.showinfo("已收入收件人库",
+                            "新增 %d 位，按名称合并 %d 位（库里的口令保留）。" % (added, updated))
+
+    def _pool_to_event(self):
+        ids = self._pool_selected()
+        if not ids:
+            messagebox.showinfo("提示", "请先选中要添加的收件人")
+            return
+        eid = self._pick_event("把选中的收件人添加到哪个事件？")
+        if not eid:
+            return
+        ev, _err = self.store.load_event(eid)
+        if not ev:
+            return
+        pool = {r.get("id"): r for r in self.store.list_pool()}
+        recs = [pool[i] for i in ids if i in pool]
+        if not recs:
+            return
+        new_ev, added, updated = lp_v3.merge_recipients_into_event(ev, recs)
+        ok, err = self.store.save_event(new_ev)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        self._refresh_home()
+        messagebox.showinfo(
+            "已添加",
+            "事件「%s」新增 %d 位，按名称合并 %d 位。\n"
+            "（事件里已有的打开/权限口令没有被覆盖）"
+            % (new_ev.get("name", ""), added, updated))
+
+    def _pool_import(self):
+        path = filedialog.askopenfilename(title="选择收件人清单",
+                                          filetypes=[("表格", "*.xlsx *.csv"),
+                                                     ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            rows = lp_v3.read_spreadsheet(path)
+        except Exception as e:
+            messagebox.showerror("读取失败", str(e))
+            return
+        result = lp_v3.validate_recipient_rows(rows)
+        action = self._show_import_result(result, path)
+        if not action:
+            return
+        pool = self.store.list_pool()
+        added = updated = 0
+        for item in result.get("items") or []:
+            if action == "ok_only" and item.get("status") == "error":
+                continue
+            rec = item.get("record") or {}
+            if not rec.get("name"):
+                continue
+            pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, rec)
+            if new_rec is not None:
+                ok, err, _saved = self.store.save_pool_recipient(new_rec)
+                if not ok:
+                    messagebox.showerror("保存失败", err)
+                    return
+                added += 1
+            elif is_update:
+                updated += 1
+        self._refresh_pool_tab()
+        messagebox.showinfo("导入完成",
+                            "收件人库新增 %d 位，按名称合并 %d 位。" % (added, updated))
+
+    def _pool_export(self):
+        pool = self.store.list_pool()
+        if not pool:
+            messagebox.showinfo("提示", "收件人库还是空的")
+            return
+        rows = lp_v3.recipients_to_rows(pool)
+        self._write_xlsx_sheets(
+            "收件人库.xlsx",
+            [("收件人库", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
+            "已导出",
+            "收件人库已导出。\n\n注意：文件里含打开口令与权限口令，属敏感文件，"
+            "请按与 lp_data/ 相同的管控要求保存。")
+
+    # ================= 执行历史（事件库里的第四个标签页，P4） =================
+
+    RUN_STATUS_LABELS = {
+        "ok": "已完成",
+        "preflight_failed": "预检未通过",
+        "failed": "失败",
+        "": "未完成",
+    }
+
+    def _build_runs_tab(self, parent=None):
+        f = parent if parent is not None else getattr(self, "home_tab_runs", None)
+        if f is None:
+            return
+        ttk.Label(f, text="执行历史", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(f, text=(
+            "每一次生成草稿都会留一条记录（时间、每个收件人拿到了哪些文件、有没有出错）。\n"
+            "双击一行看详情。执行记录是审计材料，这里只看不删。"),
+            style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
+
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(bar, text="查看详情", command=self._runs_detail).pack(side="left")
+        ttk.Button(bar, text="打开该事件", command=self._runs_open_event).pack(side="left", padx=4)
+        ttk.Button(bar, text="刷新", command=self._refresh_runs_tab).pack(side="left")
+
+        frame = ttk.Frame(f)
+        frame.pack(fill="both", expand=True)
+        cols = ["started", "event", "status", "drafts", "ok", "fail", "skip", "files"]
+        heads = ["开始时间", "事件", "状态", "草稿", "成功", "失败", "跳过", "附件包"]
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+            tree.column(c, width=150 if c == "started" else (200 if c == "event" else 84))
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        tree.bind("<Double-1>", lambda _e: self._runs_detail())
+        self._runs_tree = tree
+        self._runs_ids = {}
+
+    def _refresh_runs_tab(self):
+        tree = getattr(self, "_runs_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        self._runs_ids = {}
+        runs = self.store.list_runs()
+        for i, r in enumerate(runs):
+            items = r.get("items") or []
+            drafts = len([x for x in items if (x.get("draft") or "").strip()])
+            files = sum(len(x.get("files") or []) for x in items)
+            st = r.get("status") or ""
+            vals = [
+                r.get("started_at", ""),
+                r.get("event_name", "") or "（事件已删除）",
+                self.RUN_STATUS_LABELS.get(st, st or "未完成"),
+                "%d/%d" % (drafts, len(items)),
+                r.get("stats", {}).get("ok", 0),
+                r.get("stats", {}).get("fail", 0),
+                r.get("stats", {}).get("skip", 0),
+                files,
+            ]
+            iid = "r%d" % i
+            self._runs_ids[iid] = r
+            tree.insert("", "end", iid=iid, values=vals)
+
+    def _runs_selected(self):
+        tree = getattr(self, "_runs_tree", None)
+        if tree is None:
+            return None
+        sel = tree.selection()
+        if not sel:
+            return None
+        return (self._runs_ids or {}).get(sel[0])
+
+    def _runs_detail(self):
+        run = self._runs_selected()
+        if not run:
+            messagebox.showinfo("提示", "请先选中一条执行记录")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("执行详情 · %s · %s" % (run.get("event_name", ""),
+                                         run.get("started_at", "")))
+        win.geometry("1000x620")
+        win.transient(self.root)
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(head, text="状态：%s" % self.RUN_STATUS_LABELS.get(
+            run.get("status") or "", run.get("status") or "未完成"),
+            style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text="开始 %s" % run.get("started_at", ""),
+                  style="Sub.TLabel").pack(side="left", padx=12)
+        if run.get("finished_at"):
+            ttk.Label(head, text="结束 %s" % run.get("finished_at", ""),
+                      style="Sub.TLabel").pack(side="left", padx=12)
+
+        cols = ["who", "members", "files", "missing", "draft", "error"]
+        heads = ["收件人/组", "成员", "附件包", "缺失", "草稿", "错误"]
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=10, pady=4)
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=12)
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+        tree.column("who", width=180)
+        tree.column("members", width=220)
+        tree.column("files", width=70, stretch=False)
+        tree.column("missing", width=200)
+        tree.column("draft", width=110, stretch=False)
+        tree.column("error", width=260)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        for it in run.get("items") or []:
+            members = it.get("members") or []
+            tree.insert("", "end", values=(
+                it.get("name", ""),
+                "、".join(members),
+                len(it.get("files") or []),
+                "、".join(it.get("missing") or [])[:120],
+                it.get("draft", "") or "—",
+                (it.get("error") or "")[:160]))
+
+        log_box = ttk.LabelFrame(win, text=" 执行日志 / 错误与提醒 ", style="Card.TLabelframe")
+        log_box.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        txt = tk.Text(log_box, height=9, wrap="word")
+        txt.pack(fill="both", expand=True, padx=6, pady=6)
+        lines = []
+        for e in run.get("errors") or []:
+            lines.append("【错误】%s" % e)
+        for w in run.get("warnings") or []:
+            lines.append("【提醒】%s" % w)
+        lines.append("")
+        lines += list(run.get("logs") or [])
+        txt.insert("1.0", "\n".join(lines) or "（无日志）")
+        txt.config(state="disabled")
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=(0, 10))
+        ttk.Button(btns, text="打开该事件",
+                   command=lambda: (win.destroy(),
+                                    self._runs_open_event())).pack(side="left", padx=6)
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="left", padx=6)
+
+    def _runs_open_event(self):
+        run = self._runs_selected()
+        if not run:
+            messagebox.showinfo("提示", "请先选中一条执行记录")
+            return
+        eid = run.get("event_id")
+        ev, err = self.store.load_event(eid)
+        if not ev:
+            messagebox.showinfo("提示", "这个事件已经不存在了")
+            return
+        self.show_screen("home")
+        self.open_event(ev["id"])
 
     # ================= 场景模板（事件库里的第二个标签页） =================
 
@@ -1371,6 +1850,11 @@ class App:
             ("检查附件", self._wb_check_attachments, "检查收件人专属附件文件是否存在。"),
             ("补齐缺失口令", self._wb_fill_passwords,
              "为打开口令/权限口令为空的收件人批量生成随机口令。"),
+            ("从收件人库添加…", self._wb_add_from_pool,
+             "从收件人库（常用收件人）里挑人加进本事件。\n"
+             "按名称合并：本事件已有的口令不会被覆盖。"),
+            ("存入收件人库", self._wb_save_to_pool,
+             "把本事件的收件人整个存进收件人库，方便下个事件复用。"),
         ]:
             b = ttk.Button(bar, text=text, command=cmd)
             b.pack(side="left", padx=2)
@@ -1887,16 +2371,14 @@ class App:
         idxs = sorted((tree.index(i) for i in tree.selection()), reverse=True)
         return [ev["recipients"][i] for i in idxs]
 
-    def _wb_edit_recipient(self):
-        tree = getattr(self, "_wb_rec_tree", None)
-        ev = self._wb_event
-        sel = tree.selection() if tree else ()
-        rec = dict(ev["recipients"][tree.index(sel[0])]) if sel else {
-            "name": "", "wm": "", "to": "", "cc": "", "bcc": "",
-            "open_pw": gen_pw(), "owner_pw": gen_pw(), "fields": {},
-            "attachments": [], "group": ""}
+    def _recipient_dialog(self, rec, field_cols, title, on_save, no_field_hint=""):
+        """收件人编辑对话框 —— 事件里与收件人库里**共用同一套表单**。
+
+        rec: 初始值；field_cols: 自定义字段列名；
+        on_save(out): 保存回调，返回 True 表示关闭对话框。
+        """
         win = tk.Toplevel(self.root)
-        win.title("编辑收件人" if sel else "新增收件人")
+        win.title(title)
         win.grab_set()
         rows = [("收件人名称（水印默认用同名）", "name"), ("水印名称", "wm"),
                 ("收件人To（多人用;分隔）", "to"), ("抄送CC（可空）", "cc"),
@@ -1919,11 +2401,10 @@ class App:
         ttk.Label(win, text="自定义字段", foreground="#444").grid(
             row=r0, column=0, sticky="e", padx=6, pady=(8, 2))
         field_entries = {}
-        fcols = self._wb_field_columns()
+        fcols = field_cols or []
         if not fcols:
-            ttk.Label(win, text="（还没有自定义字段列，可先在收件人页点"
-                          "「添加自定义字段列」）", foreground="#888"
-                      ).grid(row=r0, column=1, sticky="w", padx=6)
+            ttk.Label(win, text=no_field_hint or "（没有自定义字段列）",
+                      foreground="#888").grid(row=r0, column=1, sticky="w", padx=6)
         for j, k in enumerate(fcols):
             ttk.Label(win, text=k).grid(row=r0 + 1 + j, column=0, sticky="e", padx=6, pady=2)
             e = ttk.Entry(win, width=52)
@@ -1942,18 +2423,124 @@ class App:
             out["wm"] = out["wm"] or out["name"]
             out["attachments"] = split_paths(out.get("attachments", ""))
             out["fields"] = {k: e.get().strip() for k, e in field_entries.items()}
+            if on_save(out):
+                win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=r0 + 1 + len(fcols), column=0, columnspan=2, pady=8)
+        ttk.Button(btns, text="保存", command=ok).pack(side="left", padx=8)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
+        return win
+
+    def _wb_edit_recipient(self):
+        tree = getattr(self, "_wb_rec_tree", None)
+        ev = self._wb_event
+        sel = tree.selection() if tree else ()
+        rec = dict(ev["recipients"][tree.index(sel[0])]) if sel else {
+            "name": "", "wm": "", "to": "", "cc": "", "bcc": "",
+            "open_pw": gen_pw(), "owner_pw": gen_pw(), "fields": {},
+            "attachments": [], "group": ""}
+
+        def save(out):
             if sel:
                 ev["recipients"][tree.index(sel[0])] = out
             else:
                 ev["recipients"].append(out)
             self._wb_save()
             self._wb_show_step(self._wb_step)
+            return True
+
+        self._recipient_dialog(
+            rec, self._wb_field_columns(),
+            "编辑收件人" if sel else "新增收件人", save,
+            "（还没有自定义字段列，可先在收件人页点「添加自定义字段列」）")
+
+    def _wb_add_from_pool(self):
+        """从收件人库挑人加进当前事件。"""
+        ev = self._wb_event
+        if not ev:
+            return
+        pool = self.store.list_pool()
+        if not pool:
+            messagebox.showinfo("收件人库是空的",
+                                "收件人库里还没有人。\n"
+                                "可以先在「事件库 → 收件人库」标签页里新建，"
+                                "或用「存入收件人库」把某个事件的收件人存进去。")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("从收件人库添加")
+        win.geometry("620x520")
+        win.grab_set()
+        ttk.Label(win, text=(
+            "勾选要加进「%s」的收件人。\n"
+            "按名称合并：本事件里已有的收件人口令不会被覆盖，只补空缺。"
+            % ev.get("name", "")), justify="left").pack(anchor="w", padx=12, pady=(10, 4))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12)
+        tree = ttk.Treeview(frame, columns=["name", "to"], show="headings",
+                            selectmode="extended", height=16)
+        tree.heading("name", text="收件人名称")
+        tree.heading("to", text="To")
+        tree.column("name", width=280)
+        tree.column("to", width=260)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        ids = {}
+        for i, r in enumerate(pool):
+            iid = "p%d" % i
+            ids[iid] = r
+            tree.insert("", "end", iid=iid, values=(r.get("name", ""), r.get("to", "")))
+
+        def ok():
+            recs = [ids[i] for i in tree.selection() if i in ids]
+            if not recs:
+                messagebox.showwarning("未选择", "请先勾选要添加的收件人", parent=win)
+                return
+            new_ev, added, updated = lp_v3.merge_recipients_into_event(ev, recs)
+            ok2, err = self.store.save_event(new_ev)
+            if not ok2:
+                messagebox.showerror("保存失败", err, parent=win)
+                return
+            ev["recipients"] = new_ev["recipients"]
+            self._wb_save()
+            self._wb_show_step(self._wb_step)
+            messagebox.showinfo("已添加",
+                                "新增 %d 位，按名称合并 %d 位（已有口令保留）。"
+                                % (added, updated), parent=win)
             win.destroy()
 
         btns = ttk.Frame(win)
-        btns.grid(row=r0 + 1 + len(fcols), column=0, columnspan=2, pady=8)
-        ttk.Button(btns, text="保存", command=ok).pack(side="left", padx=8)
-        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="添加", command=ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+
+    def _wb_save_to_pool(self):
+        """把当前事件的收件人整个存进收件人库。"""
+        ev = self._wb_event
+        recips = ev.get("recipients") or []
+        if not recips:
+            messagebox.showinfo("提示", "这个事件还没有收件人")
+            return
+        pool = self.store.list_pool()
+        added = updated = 0
+        for rec in recips:
+            src = dict(rec)
+            src.pop("id", None)
+            pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, src)
+            if new_rec is not None:
+                ok, err, _saved = self.store.save_pool_recipient(new_rec)
+                if not ok:
+                    messagebox.showerror("保存失败", err)
+                    return
+                added += 1
+            elif is_update:
+                updated += 1
+        self._refresh_pool_tab()
+        messagebox.showinfo("已存入收件人库",
+                            "新增 %d 位，按名称合并 %d 位（库里已有的口令保留）。"
+                            % (added, updated))
 
     def _wb_delete_recipients(self):
         tree = getattr(self, "_wb_rec_tree", None)
@@ -3577,7 +4164,7 @@ class App:
         if not messagebox.askyesno(
                 "确认生成",
                 "即将为「%s」生成全部文件与 Outlook 草稿。\n\n"
-                "草稿只写入草稿箱，**不会发送**。\n\n开始？" % ev.get("name", "")):
+                "草稿只写入草稿箱，不会自动发送。\n\n开始？" % ev.get("name", "")):
             return
         self.running = True
         self._cancel = threading.Event()
