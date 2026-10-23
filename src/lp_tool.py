@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 import fitz
 import watermark_encrypt as wm
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -126,7 +126,7 @@ def check_latest(timeout=8):
         import json as _j
         d = _j.loads(r.read().decode("utf-8"))
     asset = next((a for a in d.get("assets", [])
-                  if a["name"] == "LP_Tool_portable.zip"), None)
+                  if a["name"].startswith("doc-mailer_") and a["name"].endswith("_portable.zip")), None)
     return {"tag": d.get("tag_name", ""), "body": (d.get("body") or "")[:400],
             "url": d.get("html_url", ""),
             "asset_url": asset["browser_download_url"] if asset else None,
@@ -722,82 +722,365 @@ class App:
                                  f"无法写入 {DATA_FILE}\n{e}")
 
     def _build_homepage(self):
-        """首页：流程图导航"""
+        """首页：流程导航（纯标准 ttk，零自定义字体/光标/hover）"""
         home = ttk.Frame(self._container)
         self._pages["home"] = home
 
-        # 标题
-        ttk.Label(home, text="文档分发助手", font=("Microsoft YaHei", 22, "bold"),
-                  foreground="#1a3a5c").pack(pady=(40, 5))
-        ttk.Label(home, text=f"v{APP_VERSION} — 批量加密分发 · 逐人水印 · Outlook 草稿",
-                  font=("Microsoft YaHei", 11), foreground="#666").pack(pady=(0, 30))
+        ttk.Label(home, text="文档分发助手",
+                  font=("", 20, "bold")).pack(pady=(30, 4))
+        ttk.Label(home, text=f"v{APP_VERSION}  批量加密分发 · 逐人水印 · Outlook 草稿",
+                  font=("", 10)).pack(pady=(0, 20))
 
-        # 流程节点按钮
-        flow = ttk.Frame(home)
-        flow.pack(pady=10)
+        # 按钮行
+        btns = ttk.Frame(home)
+        btns.pack(pady=10)
 
         steps = [
-            ("📋", "收件人管理", "导入/维护清单\n口令 · 附件 · 合并组", "lp"),
-            ("✉️", "邮件模板", "所见即所得编辑\n字段替换 · 富文本", "tpl"),
-            ("🔐", "生成文件", "水印加密 · Word模板\n批量生成 PDF", "run"),
-            ("📤", "草稿与发送", "检查附件 · 生成草稿\n人工复核后发送", "run"),
+            ("1\n收件人管理", "导入维护清单", "lp"),
+            ("2\n邮件模板", "所见即所得", "tpl"),
+            ("3\nWord模板", "批量生成通知", "word"),
+            ("4\n生成文件", "水印加密PDF", "run"),
+            ("5\n草稿发送", "Outlook草稿", "draft"),
         ]
+        for i, (title, desc, page) in enumerate(steps):
+            col = ttk.Frame(btns)
+            col.grid(row=0, column=i, padx=6)
+            b = ttk.Button(col, text=title, width=14,
+                           command=lambda pg=page: self._show_page(pg))
+            b.pack(pady=(4, 2))
+            ttk.Label(col, text=desc, font=("", 8),
+                      foreground="#666").pack(pady=(0, 4))
+            if i < 3:
+                ttk.Label(btns, text="-->", font=("", 10)
+                          ).grid(row=0, column=i * 2 + 1, sticky="s", pady=(0, 25))
 
-        for i, (icon, title, desc, page) in enumerate(steps):
-            card = tk.Frame(flow, bg="#f0f4f8", bd=1, relief="raised", padx=2, pady=2)
-            card.grid(row=0, column=i, padx=8, pady=5, sticky="nsew")
-
-            btn = tk.Label(card, text=f"{icon}", font=("Segoe UI Emoji", 28),
-                           bg="#f0f4f8", cursor="hand2")
-            btn.pack(pady=(8, 2))
-            ttk.Label(card, text=title, font=("Microsoft YaHei", 12, "bold"),
-                      background="#f0f4f8").pack()
-            ttk.Label(card, text=desc, font=("Microsoft YaHei", 9),
-                      foreground="#555", background="#f0f4f8",
-                      justify="center").pack(pady=(2, 8))
-
-            # 点击进入页面
-            for w in (card, btn):
-                w.bind("<Button-1>", lambda e, pg=page: self._show_page(pg))
-            # hover 效果
-            card.bind("<Enter>", lambda e, c=card: c.configure(bg="#dce8f5"))
-            card.bind("<Leave>", lambda e, c=card: c.configure(bg="#f0f4f8"))
-
-            # 箭头（最后一个后面不加）
-            if i < len(steps) - 1:
-                ttk.Label(flow, text="→", font=("", 18)).grid(row=0, column=i * 2 + 1,
-                                                               padx=2, sticky="s", pady=(0, 40))
-
-        # 底部快捷信息
-        info = ttk.Frame(home)
-        info.pack(side="bottom", fill="x", padx=20, pady=10)
-        n_lps = len(self.data.get("lps", []))
-        ttk.Label(info, text=f"当前清单：{n_lps} 位收件人", foreground="#666").pack(side="left")
-        ttk.Label(info, text="版本 " + APP_VERSION, foreground="#aaa").pack(side="right")
-        if n_lps > 0:
-            ttk.Button(info, text="继续上次操作 → 生成",
-                       command=lambda: self._show_page("run")).pack(side="right", padx=10)
+        # 状态行
+        status = ttk.Frame(home)
+        status.pack(side="bottom", fill="x", padx=16, pady=8)
+        n = len(self.data.get("lps", []))
+        ttk.Label(status, text=f"当前清单：{n} 位收件人").pack(side="left")
+        ttk.Label(status, text="v" + APP_VERSION,
+                  foreground="#aaa").pack(side="right")
 
         home.pack(fill="both", expand=True)
 
+    def _build_word_page(self, parent):
+        """Word 模板批量生成：字段映射 + 数据表 + 生成 PDF/Word"""
+        # --- 上方：模板与输出设置 ---
+        top = ttk.LabelFrame(parent, text=" 模板与输出 ")
+        top.pack(fill="x", padx=6, pady=4)
+
+        r1 = ttk.Frame(top); r1.pack(fill="x", padx=4, pady=3)
+        ttk.Label(r1, text="Word模板：").pack(side="left")
+        self._wt_path = tk.StringVar(value=self.data.get("word_template") or "")
+        ttk.Entry(r1, textvariable=self._wt_path, width=50).pack(side="left", padx=4)
+        ttk.Button(r1, text="选择…", command=self._wt_pick).pack(side="left")
+        ttk.Button(r1, text="检测占位符", command=self._wt_detect).pack(side="left", padx=6)
+
+        r2 = ttk.Frame(top); r2.pack(fill="x", padx=4, pady=3)
+        ttk.Label(r2, text="输出格式：").pack(side="left")
+        self._wt_fmt = tk.StringVar(value="pdf")
+        ttk.Radiobutton(r2, text="PDF", variable=self._wt_fmt, value="pdf").pack(side="left", padx=4)
+        ttk.Radiobutton(r2, text="Word (.docx)", variable=self._wt_fmt, value="docx").pack(side="left", padx=4)
+        ttk.Label(r2, text="   输出目录：").pack(side="left")
+        self._wt_outdir = tk.StringVar(
+            value=self.data.get("wt_outdir") or str(Path.home() / "Documents" / "Word批量生成"))
+        ttk.Entry(r2, textvariable=self._wt_outdir, width=40).pack(side="left", padx=4)
+        ttk.Button(r2, text="浏览", command=self._wt_browse_out).pack(side="left")
+
+        # --- 中部左右分栏：字段映射 + 数据表 ---
+        mid = ttk.PanedWindow(parent, orient="horizontal")
+        mid.pack(fill="both", expand=True, padx=6, pady=4)
+
+        # 左：字段映射表
+        map_frame = ttk.LabelFrame(mid, text=" 字段映射（Word占位符 ← 数据列） ")
+        map_frame.pack_propagate(False)
+        self._wt_map_tree = ttk.Treeview(map_frame, columns=["ph", "col"],
+                                          show="headings", height=8)
+        self._wt_map_tree.heading("ph", text="Word 占位符")
+        self._wt_map_tree.heading("col", text="数据列名")
+        self._wt_map_tree.column("ph", width=150)
+        self._wt_map_tree.column("col", width=150)
+        map_scroll = ttk.Scrollbar(map_frame, orient="vertical",
+                                    command=self._wt_map_tree.yview)
+        self._wt_map_tree.configure(yscrollcommand=map_scroll.set)
+        self._wt_map_tree.pack(side="left", fill="both", expand=True, padx=(4,0), pady=4)
+        map_scroll.pack(side="right", fill="y")
+
+        map_btns = ttk.Frame(map_frame)
+        map_btns.pack(fill="x", padx=4, pady=2)
+        ttk.Button(map_btns, text="添加映射", command=self._wt_add_map).pack(side="left", padx=2)
+        ttk.Button(map_btns, text="删除选中", command=self._wt_del_map).pack(side="left", padx=2)
+
+        mid.add(map_frame, weight=0)
+
+        # 右：数据表（可导入 Excel）
+        data_frame = ttk.LabelFrame(mid, text=" 数据表（从 Excel 导入或手动填写） ")
+        self._wt_data_tree = ttk.Treeview(data_frame, show="headings", height=10)
+        data_vsb = ttk.Scrollbar(data_frame, orient="vertical",
+                                  command=self._wt_data_tree.yview)
+        data_hsb = ttk.Scrollbar(data_frame, orient="horizontal",
+                                  command=self._wt_data_tree.xview)
+        self._wt_data_tree.configure(yscrollcommand=data_vsb.set,
+                                      xscrollcommand=data_hsb.set)
+        self._wt_data_tree.pack(side="left", fill="both", expand=True, padx=(4,0), pady=4)
+        data_vsb.pack(side="right", fill="y")
+        data_hsb.pack(side="bottom", fill="x")
+
+        data_btns = ttk.Frame(data_frame)
+        data_btns.pack(fill="x", padx=4, pady=2)
+        ttk.Button(data_btns, text="导入Excel", command=self._wt_import_data).pack(side="left", padx=2)
+        ttk.Button(data_btns, text="清空数据", command=self._wt_clear_data).pack(side="left", padx=2)
+
+        mid.add(data_frame, weight=1)
+
+        # --- 下方：操作与日志 ---
+        bot = ttk.LabelFrame(parent, text=" 操作 ")
+        bot.pack(fill="both", padx=6, pady=4)
+
+        act = ttk.Frame(bot); act.pack(fill="x", padx=4, pady=3)
+        self._wt_gen_btn = ttk.Button(act, text="批量生成", command=self._wt_generate)
+        self._wt_gen_btn.pack(side="left", padx=4)
+        self._wt_stop_btn = ttk.Button(act, text="停止", command=self._wt_stop)
+        self._wt_stop_btn.pack(side="left")
+        self._wt_stop_btn.state(["disabled"])
+        ttk.Label(act, text="  从 Word 模板逐行替换占位符并导出（格式保持不变）",
+                  foreground="#666").pack(side="left", padx=8)
+
+        self._wt_log = tk.Text(bot, height=6, state="disabled",
+                                font=("Consolas", 9), background="#fafafa")
+        self._wt_log.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # 恢复已有映射
+        for m in self.data.get("wt_mappings", []):
+            self._wt_map_tree.insert("", "end", values=m)
+
+    def _wt_pick(self):
+        path = filedialog.askopenfilename(
+            title="选择 Word 模板",
+            filetypes=[("Word 文档", "*.docx;*.doc")])
+        if path:
+            self._wt_path.set(path)
+            self.data["word_template"] = path
+            self.save_data()
+
+    def _wt_detect(self):
+        """从 Word 模板检测占位符（{{xxx}} 和 ?xxx? 两种格式）"""
+        path = self._wt_path.get().strip()
+        if not path or not Path(path).exists():
+            messagebox.showwarning("Word 模板", "请先选择有效的 .docx 文件")
+            return
+        try:
+            import win32com.client
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            doc = word.Documents.Open(path, ReadOnly=True)
+            text = doc.Content.Text
+            doc.Close(SaveChanges=0)
+            word.Quit()
+            # 检测两种占位符格式
+            placeholders = set(re.findall(r"\{\{[^}]+\}\}", text))
+            placeholders |= set(re.findall(r"\?[^?\s]{2,30}\?", text))
+            if not placeholders:
+                messagebox.showinfo("检测结果", "未检测到占位符。\n"
+                                    "支持格式：{{字段名}} 或 ?字段名?")
+                return
+            # 更新映射表
+            existing = {self._wt_map_tree.item(i)["values"][0]
+                        for i in self._wt_map_tree.get_children()}
+            for ph in sorted(placeholders):
+                if ph not in existing:
+                    self._wt_map_tree.insert("", "end", values=(ph, ""))
+            messagebox.showinfo("检测结果",
+                                f"检测到 {len(placeholders)} 个占位符，已添加到映射表。\n"
+                                "请为每个占位符指定对应的数据列名。")
+        except Exception as e:
+            messagebox.showerror("检测失败", str(e))
+
+    def _wt_add_map(self):
+        ph = tk.simpledialog.askstring("添加映射", "Word 占位符（如 {{LP_Name}} 或 ?CC1?）:")
+        if not ph:
+            return
+        col = tk.simpledialog.askstring("添加映射", "对应数据列名（如 name / call_amount）:")
+        if col:
+            self._wt_map_tree.insert("", "end", values=(ph, col))
+            self._wt_save_mappings()
+
+    def _wt_del_map(self):
+        for i in self._wt_map_tree.selection():
+            self._wt_map_tree.delete(i)
+        self._wt_save_mappings()
+
+    def _wt_save_mappings(self):
+        mappings = [self._wt_map_tree.item(i)["values"]
+                    for i in self._wt_map_tree.get_children()]
+        self.data["wt_mappings"] = [list(m) for m in mappings]
+        self.save_data()
+
+    def _wt_browse_out(self):
+        d = filedialog.askdirectory(title="输出目录")
+        if d:
+            self._wt_outdir.set(d)
+            self.data["wt_outdir"] = d
+            self.save_data()
+
+    def _wt_import_data(self):
+        """从 Excel 导入数据表（第一行为列名）"""
+        path = filedialog.askopenfilename(
+            title="导入数据表",
+            filetypes=[("Excel/CSV", "*.xlsx;*.csv")])
+        if not path:
+            return
+        try:
+            rows = read_spreadsheet(path)
+            if not rows or len(rows) < 2:
+                messagebox.showwarning("导入", "至少需要表头行 + 1 行数据")
+                return
+            headers = [str(h).strip() for h in rows[0] if h]
+            self._wt_data_tree.delete(*self._wt_data_tree.get_children())
+            self._wt_data_tree["columns"] = headers
+            for h in headers:
+                self._wt_data_tree.heading(h, text=h)
+                self._wt_data_tree.column(h, width=100)
+            for row in rows[1:]:
+                vals = [str(v) if v else "" for v in row[:len(headers)]]
+                self._wt_data_tree.insert("", "end", values=vals)
+            messagebox.showinfo("导入完成",
+                                f"已导入 {len(rows)-1} 行 × {len(headers)} 列。\n"
+                                "请在映射表中为每个 Word 占位符指定列名。")
+        except Exception as e:
+            messagebox.showerror("导入失败", str(e))
+
+    def _wt_clear_data(self):
+        self._wt_data_tree.delete(*self._wt_data_tree.get_children())
+
+    def _wt_generate(self):
+        """批量生成：逐行替换占位符并导出"""
+        tpl = self._wt_path.get().strip()
+        if not tpl or not Path(tpl).exists():
+            messagebox.showwarning("Word 模板", "请先选择有效的模板文件")
+            return
+        data_rows = []
+        for item in self._wt_data_tree.get_children():
+            data_rows.append(dict(zip(
+                self._wt_data_tree["columns"],
+                self._wt_data_tree.item(item)["values"])))
+        if not data_rows:
+            messagebox.showwarning("数据表", "数据表为空，请先导入")
+            return
+        mappings = {str(ph): str(col)
+                    for ph, col in (self._wt_map_tree.item(i)["values"]
+                                    for i in self._wt_map_tree.get_children())
+                    if col}
+        if not mappings:
+            messagebox.showwarning("字段映射", "映射表为空。请先「检测占位符」并指定列名。")
+            return
+        outdir = Path(self._wt_outdir.get())
+        outdir.mkdir(parents=True, exist_ok=True)
+        fmt = self._wt_fmt.get()
+        self._wt_gen_btn.state(["disabled"])
+        self._wt_stop_btn.state(["!disabled"])
+        self._wt_cancel = threading.Event()
+        self._wt_log_msg(f"开始：{len(data_rows)} 行，格式={'PDF' if fmt=='pdf' else 'Word'}")
+
+        def worker():
+            import pythoncom
+            import win32com.client
+            pythoncom.CoInitialize()
+            word = None
+            try:
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                ok, fail = 0, 0
+                for i, row in enumerate(data_rows):
+                    if self._wt_cancel.is_set():
+                        self._wt_log_msg("已停止")
+                        break
+                    try:
+                        doc = word.Documents.Open(tpl, ReadOnly=True)
+                        for ph, col in mappings.items():
+                            val = str(row.get(col, ""))
+                            doc.Content.Find.Execute(
+                                ph, False, False, False, False, False,
+                                True, 1, False, val, 2)
+                        name_val = str(row.get(list(mappings.values())[0]
+                                                if mappings else "name", f"row{i+1}"))
+                        safe = sanitize_filename(name_val, 60)
+                        if fmt == "pdf":
+                            out = outdir / (safe + ".pdf")
+                            doc.SaveAs2(str(out.resolve()), FileFormat=17)
+                        else:
+                            out = outdir / (safe + ".docx")
+                            doc.SaveAs2(str(out.resolve()), FileFormat=16)
+                        doc.Close(SaveChanges=0)
+                        ok += 1
+                        self._wt_log_msg(f"[OK] {out.name}")
+                    except Exception as e:
+                        fail += 1
+                        self._wt_log_msg(f"[失败] 行{i+1}: {e}")
+                        try:
+                            doc.Close(SaveChanges=0)
+                        except Exception:
+                            pass
+                self._wt_log_msg(f"完成：成功 {ok}，失败 {fail}")
+            except Exception as e:
+                self._wt_log_msg(f"全局错误：{e}")
+            finally:
+                if word:
+                    try:
+                        word.Quit()
+                    except Exception:
+                        pass
+                pythoncom.CoUninitialize()
+                self.root.after(0, lambda: (
+                    self._wt_gen_btn.state(["!disabled"]),
+                    self._wt_stop_btn.state(["disabled"])))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _wt_stop(self):
+        if hasattr(self, "_wt_cancel"):
+            self._wt_cancel.set()
+
+    def _wt_log_msg(self, msg):
+        def append():
+            self._wt_log.configure(state="normal")
+            self._wt_log.insert("end", msg + chr(10))
+            self._wt_log.see("end")
+            self._wt_log.configure(state="disabled")
+        self.root.after(0, append)
+
+    def _build_draft_page(self, parent):
+        """草稿与发送：检查附件 + 生成草稿 + 发送指引"""
+        guide = ttk.Frame(parent)
+        guide.pack(fill="x", padx=6, pady=4)
+        ttk.Label(guide, text="此页面与「生成文件」页面下半部分相同：批量生成加密文件 + Outlook 草稿。",
+                  foreground="#666").pack(anchor="w")
+        ttk.Label(guide, text="草稿只写入 Outlook 草稿箱（.Save），绝不自动发送。发送前请逐封人工复核。",
+                  foreground="#b00").pack(anchor="w")
+        ttk.Button(guide, text="前往生成页面 →", width=18,
+                   command=lambda: self._show_page("run")).pack(anchor="w", pady=4)
+        ttk.Label(guide, text="生成完成后，到 Outlook 草稿箱逐封检查：收件人/抄送/标题/正文/附件/口令。",
+                  foreground="#666").pack(anchor="w", pady=(8,0))
+
     def _show_page(self, name):
-        """切换到指定功能页面"""
-        for p in self._pages.values():
-            p.pack_forget()
+        """切换到指定功能页面（首次进入时构建）"""
+        for pg in self._pages.values():
+            pg.pack_forget()
         if name not in self._pages:
             frame = ttk.Frame(self._container)
             self._pages[name] = frame
 
-            # 返回按钮行
             nav = ttk.Frame(frame)
             nav.pack(fill="x", padx=4, pady=2)
-            ttk.Button(nav, text="← 首页", width=8,
+            ttk.Button(nav, text="< 首页", width=8,
                        command=lambda: self._show_page("home")).pack(side="left")
-            titles = {"lp": "收件人管理", "tpl": "邮件模板", "run": "生成 / Outlook 草稿"}
+            titles = {"lp": "收件人管理", "tpl": "邮件模板",
+                      "word": "Word 模板批量生成",
+                      "run": "生成加密文件", "draft": "草稿与发送"}
             ttk.Label(nav, text=titles.get(name, name),
-                      font=("Microsoft YaHei", 12, "bold")).pack(side="left", padx=12)
+                      font=("", 11, "bold")).pack(side="left", padx=12)
 
-            # 功能内容
             content = ttk.Frame(frame)
             content.pack(fill="both", expand=True)
             if name == "lp":
@@ -806,10 +1089,13 @@ class App:
             elif name == "tpl":
                 self.tab_tpl = content
                 self.build_tab_tpl()
+            elif name == "word":
+                self._build_word_page(content)
             elif name == "run":
                 self.tab_run = content
                 self.build_tab_run()
-
+            elif name == "draft":
+                self._build_draft_page(content)
         self._pages[name].pack(fill="both", expand=True)
 
     def _guide(self, parent, text):
@@ -857,7 +1143,15 @@ class App:
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=150 if c in ("to", "subject") else 110)
-        self.tree.pack(fill="both", expand=True, padx=6, pady=4)
+        # 横向+纵向滚动条（列多时可左右拖动看完整数据）
+        tree_scroll = ttk.Frame(f)
+        tree_scroll.pack(fill="both", expand=True, padx=6, pady=4)
+        vsb = ttk.Scrollbar(tree_scroll, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_scroll, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
         self.tree.bind("<Double-1>", lambda e: self.edit_selected())
 
         ttk.Label(f, foreground="#b00",
@@ -867,13 +1161,7 @@ class App:
 
     def refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
-        # 同步首页计数
-        if "home" in self._pages:
-            for w in self._pages["home"].winfo_children():
-                if isinstance(w, ttk.Frame):
-                    for c in w.winfo_children():
-                        if isinstance(c, ttk.Label) and "位收件人" in str(c.cget("text")):
-                            c.configure(text=f"当前清单：{len(self.data[chr(39)+chr(108)+chr(112)+chr(115)+chr(39)])} 位收件人")
+
         for rec in self.data["lps"]:
             self.tree.insert("", "end", values=[
                 rec.get("name", ""), rec.get("wm", ""), rec.get("to", ""),
