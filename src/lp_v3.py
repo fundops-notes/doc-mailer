@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.2.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.3.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -2060,11 +2060,28 @@ def event_uses_recipient_paths(event):
     return False
 
 
-def assemble_attachments(event, unit, final_outputs):
+def _file_digest(path):
+    """文件内容指纹（大小 + SHA256）。读不了返回 None（不参与内容去重）。"""
+    import hashlib
+    try:
+        p = Path(path)
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return "%d:%s" % (p.stat().st_size, h.hexdigest())
+    except OSError:
+        return None
+
+
+def assemble_attachments(event, unit, final_outputs, dup_log=None):
     """组装附件包。返回 (文件列表, 缺失文件列表)。
 
     附件包 = 所有流水线条目的产物 + 事件级静态附件 + 收件人专属附件。
     （每个条目返回的已经是最终产物——docx 已转 pdf、pdf 已加水印/加密。）
+    去重两层：先按路径（大小写不敏感），再按内容指纹（大小+SHA256）——
+    合并组内同内容不同文件名的副本只保留第一份。
+    dup_log 传入 list 时，每丢弃一个重复附件记 (保留的, 被丢弃的)。
     """
     files, missing = [], []
 
@@ -2087,13 +2104,23 @@ def assemble_attachments(event, unit, final_outputs):
             if event_uses_recipient_paths(event):
                 break          # 已由流水线条目按路径来源产出，不重复附加
             _add(p)
-    # 去重（保持顺序）
-    seen, out = set(), []
+    # 去重：路径 → 内容指纹（保持顺序，保留首个）
+    seen_path, seen_hash, out = set(), {}, []
     for p in files:
         key = str(p).lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(p)
+        if key in seen_path:
+            if dup_log is not None:
+                dup_log.append((p, p))     # 同路径重复（理论上少见）
+            continue
+        seen_path.add(key)
+        digest = _file_digest(p)
+        if digest is not None and digest in seen_hash:
+            if dup_log is not None:
+                dup_log.append((seen_hash[digest], p))
+            continue
+        if digest is not None:
+            seen_hash[digest] = p
+        out.append(p)
     return out, missing
 
 
@@ -2489,7 +2516,12 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
             continue
         rep = unit.get("rep") or {}
         final_files = _final_for(unit)
-        files, missing = assemble_attachments(event, unit, final_files)
+        dup_log = []
+        files, missing = assemble_attachments(event, unit, final_files,
+                                              dup_log=dup_log)
+        for kept, dropped in dup_log:
+            _log("[附件去重] %s 与 %s 内容相同，仅保留前者"
+                 % (Path(kept).name, Path(dropped).name))
         item = {
             "key": key,
             "kind": "group" if unit.get("group") else "lp",

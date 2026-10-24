@@ -112,11 +112,11 @@ def test_preflight_pass_with_mapped_placeholders(word_template):
 
 def test_assemble_attachments_respects_scope(tmp_path):
     a_all = tmp_path / "all.pdf"
-    a_all.write_bytes(b"1")
+    a_all.write_bytes(b"content-all")
     a_one = tmp_path / "one.pdf"
-    a_one.write_bytes(b"1")
+    a_one.write_bytes(b"content-one")   # 内容各不相同（同内容会被哈希去重合并）
     a_grp = tmp_path / "grp.pdf"
-    a_grp.write_bytes(b"1")
+    a_grp.write_bytes(b"content-grp")
     ev = _event(recips=[{"name": "甲", "group": "G1"}, {"name": "乙", "group": "G2"}])
     ev["attachments"] = [
         {"name": "全员", "path": str(a_all), "scope": "all", "targets": [], "group": ""},
