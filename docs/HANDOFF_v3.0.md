@@ -2,10 +2,10 @@
 
 > 交接文档。给接手实现的 agent / 同事。
 > **文件名沿用 `HANDOFF_v3.0.md`（历史沿革，改名会打断各处引用），内容已覆盖到 v3.2.0。**
-> 最后更新：2026-10-24（**v3.4.6 流水线三个小修复已发版**，见 §26；v3.4.4/v3.4.5 见 §24/§25）
+> 最后更新：2026-10-24（**v3.4.7 检查更新根因修复已发版**，见 §27；v3.4.4~v3.4.6 见 §24~§26）
 >
 > **当前代码版本：`3.4.4`**（`lp_tool.py` 与 `lp_v3.py` 两处一致；使用说明三处同步）。
-> 已发布：v2.2.0（旧）、v3.1.0 / v3.1.1、v3.2.0、v3.3.0、v3.3.1、v3.3.2、v3.4.0/v3.4.1、v3.4.2、v3.4.3、**v3.4.4**（v3.4.3 独立验收问题修复版，见 §24）、**v3.4.5**（v3.4.4 界面热修，见 §25）、**v3.4.6**（改名直改/要素模板导入/内联说明，见 §26）。
+> 已发布：v2.2.0（旧）、v3.1.0 / v3.1.1、v3.2.0、v3.3.0、v3.3.1、v3.3.2、v3.4.0/v3.4.1、v3.4.2、v3.4.3、**v3.4.4**（v3.4.3 独立验收问题修复版，见 §24）、**v3.4.5**（v3.4.4 界面热修，见 §25）、**v3.4.6**（改名直改/要素模板导入/内联说明，见 §26）、**v3.4.7**（检查更新 API 限流修复，见 §27）。
 
 ---
 
@@ -1174,3 +1174,64 @@ Word-MailMerge 参数区的「Word-MailMerge 说明 / 导出要素模板 / 下�
   两资产从 Release 下载回来做 SHA256 复核，与本地构建产物**字节级一致**：
   `doc-mailer_v3.4.6_portable.zip` 46,414,642 B sha256 `83E5E64B…CF0D0`；
   `doc-mailer_win64.zip` 46,826,364 B sha256 `84519E0D…A2E58`（内含签名 Valid 的 exe）。
+
+
+---
+
+## 27. v3.4.7：「检查更新」总失败（GitHub API 匿名额度 403）修复（2026-10-24）
+
+### 27.1 现象
+
+用户反馈：点「检查更新」总提示「无法连接 GitHub（公司网络可能受限）」，
+但同一台机器浏览器打开 GitHub 正常。
+
+### 27.2 根因（实测证据）
+
+旧版 `check_latest()` 只请求：
+
+`https://api.github.com/repos/fundops-notes/doc-mailer/releases/latest`
+
+GitHub 对未认证 API 请求限 **60 次/小时/IP**。本机走 FlClash 系统代理
+（`127.0.0.1:7890`，出口 IP `43.203.139.69`，共享），实测返回：
+
+```
+HTTP 403 rate limit exceeded
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 0
+X-RateLimit-Used: 60
+X-RateLimit-Reset: 1792846188   （2026-10-24 20:49:48）
+{"message":"API rate limit exceeded for 43.203.139.69. ..."}
+```
+
+而 `https://github.com/fundops-notes/doc-mailer/releases/latest` 同网络下
+HEAD/GET 均 200（跟随 302 到 `/releases/tag/vX.Y.Z`，约 0.3~1s）——
+网页不受 API 额度限制。代码把所有异常都吞成「无法连接 GitHub」，
+所以症状看起来像网络问题。
+
+**第二个 bug（顺带发现）**：`_ver_tuple` 定义漏了 `@staticmethod`，
+`_show_update` 里 `self._ver_tuple(...)` 抛 `TypeError: takes 1 positional argument but 2 were given`，
+被 `_poll_queue` 外层 `except Exception: pass` 吞掉 —— 即使 API 成功，点「检查更新」也毫无反应。
+
+### 27.3 修复
+
+- `check_latest` 改为「网页跳转优先」：
+  1. `GET https://github.com/<repo>/releases/latest` 跟随 302，从最终 URL 取 tag（不受 API 限流）；
+  2. `api.github.com` 仅用于补充 release body / 资产 size/digest；403/超时静默降级；
+  3. API 不可用时按命名规范拼下载地址
+     `https://github.com/<repo>/releases/download/<tag>/doc-mailer_v<ver>_portable.zip`；
+     有 `GITHUB_TOKEN`/`GH_TOKEN` 环境变量时自动用于 API（5000 次/小时）。
+- `check_update` 失败时展示两种方式的具体原因（网页跳转 / API），不再统一称「网络受限」。
+- 修复 `_ver_tuple` 的 `@staticmethod`；`_poll_queue` 的 update 分支加兜底提示，不再静默吞异常。
+
+### 27.4 验证
+
+- `pytest`：**228 passed**（新增：API 403 时网页回退、API 正常补充说明/资产、两种方式都失败、
+  `_ver_tuple`/`_show_update` 回归）。
+- 真实端到端（`e2e_v347_verify.py`）：在 API 仍返回 403 的情况下，点「检查更新」
+  成功弹出「当前已是最新版本（v3.4.7）」，`_last_update_err` 记录 API 403 明细。
+- 构建/发版：见 §27.5。
+
+### 27.5 发布结果
+
+- commit：`待回填`；tag：`v3.4.7`；CI run：`待回填`。
+- Release：`待回填`。

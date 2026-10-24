@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.6"
+APP_VERSION = "3.4.7"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.6"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.7"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -5019,36 +5019,97 @@ class App:
 
     # ================= 更新 / 队列 / 关闭 =================
 
+    @staticmethod
     def _ver_tuple(v):
         nums = re.findall(r"\d+", str(v or ""))
         return tuple(int(x) for x in nums[:3])
 
-    def check_latest(self, timeout=8):
-        """查询 GitHub 最新 Release。返回 dict 或 None（网络失败时静默）。"""
+    def check_latest(self, timeout=10):
+        """查询 GitHub 最新 Release。返回 dict 或 None（两种方式都失败时）。
+
+        v3.4.7：不再只依赖 GitHub API。
+        原因：匿名 API 限 60 次/小时/IP，本机走代理时出口 IP 是共享的，经常一整天
+        都是 403 "API rate limit exceeded"；而 github.com 网页不受此限。
+        因此先请求网页 /releases/latest 跟随 302 拿 tag，API 只用来补充说明与资产摘要，
+        403/超时时静默降级（版本号仍然可用）。
+        """
         import urllib.request
-        url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
-        req = urllib.request.Request(url, headers={"User-Agent": "doc-mailer"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            d = json.loads(r.read().decode("utf-8"))
-        asset = next((a for a in d.get("assets", [])
-                      if a["name"].startswith("doc-mailer_") and a["name"].endswith("_portable.zip")), None)
-        return {"tag": d.get("tag_name", ""), "body": (d.get("body") or "")[:400],
-                "url": d.get("html_url", ""),
-                "asset_url": asset["browser_download_url"] if asset else None,
-                "asset_size": asset.get("size") if asset else None,
-                "asset_digest": asset.get("digest") if asset else None}
+
+        self._last_update_err = ""
+        tag = ""
+        html_url = "https://github.com/%s/releases" % UPDATE_REPO
+
+        # --- 1) 网页跳转：不受 API 限流（浏览器能开 GitHub，这里就能通） ---
+        try:
+            web = "https://github.com/%s/releases/latest" % UPDATE_REPO
+            req = urllib.request.Request(web, headers={"User-Agent": "doc-mailer"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                final = r.geturl()
+                m = re.search(r"/releases/tag/([^/?#]+)", final or "")
+                if m:
+                    tag = m.group(1)
+                    html_url = final
+        except Exception as e:
+            self._last_update_err = "网页跳转：%s" % e
+
+        # --- 2) API：补充更新说明 / 资产大小与 digest（拿不到不算失败） ---
+        body, asset_url, asset_size, asset_digest = "", None, None, None
+        try:
+            api = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+            headers = {"User-Agent": "doc-mailer",
+                       "Accept": "application/vnd.github+json"}
+            tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+            if tok:      # 有 token 时用认证额度（5000 次/小时），没有也不影响版本检测
+                headers["Authorization"] = "Bearer " + tok
+            req = urllib.request.Request(api, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            tag = tag or str(d.get("tag_name") or "")
+            body = (d.get("body") or "")[:400]
+            html_url = d.get("html_url") or html_url
+            asset = next((a for a in d.get("assets", [])
+                          if str(a.get("name", "")).startswith("doc-mailer_")
+                          and str(a.get("name", "")).endswith("_portable.zip")), None)
+            if asset:
+                asset_url = asset.get("browser_download_url")
+                asset_size = asset.get("size")
+                asset_digest = asset.get("digest")
+        except Exception as e:
+            msg = "GitHub API：%s" % e
+            self._last_update_err = ((self._last_update_err + "；")
+                                     if self._last_update_err else "") + msg
+
+        if not tag:
+            return None
+        if not html_url or "/releases/tag/" not in html_url:
+            html_url = "https://github.com/%s/releases/tag/%s" % (UPDATE_REPO, tag)
+        ver = tag[1:] if tag[:1] in ("v", "V") else tag
+        if not asset_url and re.match(r"^\d+(\.\d+)*$", ver):
+            # 资产命名规范固定（HANDOFF §7），API 拿不到时按规范拼下载地址
+            asset_url = ("https://github.com/%s/releases/download/%s/"
+                         "doc-mailer_v%s_portable.zip" % (UPDATE_REPO, tag, ver))
+        return {"tag": tag, "body": body, "url": html_url,
+                "asset_url": asset_url, "asset_size": asset_size,
+                "asset_digest": asset_digest}
 
     def check_update(self, auto=False):
         def work():
             try:
                 info = self.check_latest()
-                if info:
-                    self._q.put(("update", (info, auto)))
-            except Exception:
-                if not auto:
-                    self._q.put(("update_err",
-                                 "无法连接 GitHub（公司网络可能受限）。\n"
-                                 "可稍后手动检查，或直接访问 Releases 页面。"))
+            except Exception as e:
+                info = None
+                self._last_update_err = "未知异常：%s" % e
+            if info:
+                self._q.put(("update", (info, auto)))
+            elif not auto:
+                detail = str(getattr(self, "_last_update_err", "") or "无详细信息")
+                if len(detail) > 300:
+                    detail = detail[:300] + "…"
+                self._q.put(("update_err",
+                             "无法获取 GitHub 最新版本。\n\n"
+                             "已尝试「网页跳转 + GitHub API」两种方式。\n"
+                             "明细：%s\n\n"
+                             "可直接打开 Releases 页面手动下载。" % detail))
         threading.Thread(target=work, daemon=True).start()
 
     def _show_update(self, info, auto):
@@ -5179,7 +5240,12 @@ class App:
                     self._wb_log(payload)
                     self.root.after(300, lambda p=payload: messagebox.showinfo("批量结束", p))
                 elif kind == "update":
-                    self._show_update(*payload)
+                    try:
+                        self._show_update(*payload)
+                    except Exception as e:
+                        # v3.4.7：更新信息处理异常不能静默（之前被外层 except 吞掉）
+                        messagebox.showerror("检查更新",
+                                             "处理更新信息失败：%s" % e)
                 elif kind == "update_err":
                     messagebox.showwarning("检查更新", payload)
                 elif kind == "update_ready":

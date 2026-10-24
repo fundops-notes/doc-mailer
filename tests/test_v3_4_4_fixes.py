@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_346():
-    assert lp_tool.APP_VERSION == "3.4.6"
-    assert lp_v3.APP_VERSION == "3.4.6"
+def test_version_is_347():
+    assert lp_tool.APP_VERSION == "3.4.7"
+    assert lp_v3.APP_VERSION == "3.4.7"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -534,3 +534,97 @@ def test_mailmerge_uses_inline_hint_not_help_dialog(app, tmp_path):
     assert "转 PDF → 加水印 → 加密" in joined
     assert "水印文字与各人打开口令在「收件人」处维护" in joined
     assert any("导入要素模板" in t for t, _b in _buttons(a._wb_content))
+
+
+# ---------------------------------------------------------------- v3.4.7 检查更新
+
+class _FakeResp:
+    def __init__(self, url="", body=b"{}"):
+        self._url = url
+        self._body = body
+
+    def geturl(self):
+        return self._url
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_check_latest_web_fallback_when_api_rate_limited(monkeypatch):
+    """APP 以前的唯一路径 api.github.com 常被 403 限流；现在网页跳转仍能拿到版本。"""
+    import urllib.error
+    calls = []
+
+    def fake_urlopen(req, timeout=None, **k):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        calls.append(url)
+        if "api.github.com" in url:
+            raise urllib.error.HTTPError(url, 403, "rate limit exceeded",
+                                         {"X-RateLimit-Remaining": "0"}, None)
+        return _FakeResp("https://github.com/fundops-notes/doc-mailer/releases/tag/v9.9.9")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    a = object.__new__(lp_tool.App)
+    a._last_update_err = ""
+    info = lp_tool.App.check_latest(a, timeout=5)
+    assert info is not None
+    assert info["tag"] == "v9.9.9"
+    assert info["asset_url"].endswith("/download/v9.9.9/doc-mailer_v9.9.9_portable.zip")
+    assert "api.github.com" in calls[0] or "api.github.com" in calls[-1]
+    assert "rate limit" in a._last_update_err
+
+
+def test_check_latest_api_still_supplies_notes_and_asset(monkeypatch):
+    import json as _json
+    body = _json.dumps({"tag_name": "v9.9.9", "body": "更新说明",
+                        "html_url": "https://github.com/fundops-notes/doc-mailer/releases/tag/v9.9.9",
+                        "assets": [{"name": "doc-mailer_v9.9.9_portable.zip",
+                                    "browser_download_url": "https://example.com/a.zip",
+                                    "size": 123, "digest": "sha256:abc"}]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None, **k):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.github.com" in url:
+            return _FakeResp(url, body)
+        return _FakeResp("https://github.com/fundops-notes/doc-mailer/releases/tag/v9.9.9")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    a = object.__new__(lp_tool.App)
+    a._last_update_err = ""
+    info = lp_tool.App.check_latest(a, timeout=5)
+    assert info["body"] == "更新说明"
+    assert info["asset_url"] == "https://example.com/a.zip"
+    assert info["asset_size"] == 123
+    assert info["asset_digest"] == "sha256:abc"
+
+
+def test_check_latest_returns_none_when_both_fail(monkeypatch):
+    def fake_urlopen(req, timeout=None, **k):
+        raise OSError("network down")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    a = object.__new__(lp_tool.App)
+    a._last_update_err = ""
+    assert lp_tool.App.check_latest(a, timeout=1) is None
+    assert "网页跳转" in a._last_update_err
+    assert "GitHub API" in a._last_update_err
+
+def test_ver_tuple_is_static_and_show_update_works(app):
+    """回归：_ver_tuple 曾缺 @staticmethod，_show_update 里 self._ver_tuple(...) 抛
+    TypeError，被 _poll_queue 吞掉 → 点「检查更新」永远没反应。"""
+    a, mb, _fd, _err = app
+    assert lp_tool.App._ver_tuple("v3.4.7") == (3, 4, 7)
+    info = {"tag": "v3.4.7", "body": "", "url": "u",
+            "asset_url": None, "asset_size": None, "asset_digest": None}
+    a._show_update(info, False)     # 不应抛异常
+    hits = [m for m in mb.calls if m[1] == "检查更新"]
+    assert hits and "已是最新版本" in hits[-1][2]
