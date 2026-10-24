@@ -56,9 +56,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.3.1"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.3.2"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -2074,7 +2074,9 @@ class App:
         summary = ttk.Frame(win)
         summary.pack(fill="x", padx=12)
         ttk.Label(summary, text="共 %d 行" % len(items)).pack(side="left")
-        ttk.Label(summary, text="通过 %d" % n_ok, foreground="#2f7d32").pack(side="left", padx=14)
+        ttk.Label(summary, text="将导入 %d 条（通过+警告）" % (n_ok + n_warn),
+                  foreground="#2f7d32").pack(side="left", padx=14)
+        ttk.Label(summary, text="通过 %d" % n_ok, foreground="#2f7d32").pack(side="left")
         ttk.Label(summary, text="警告 %d" % n_warn, foreground="#b8860b").pack(side="left")
         ttk.Label(summary, text="错误 %d" % n_err, foreground="#b00").pack(side="left", padx=14)
         for m in result.get("fatal") or []:

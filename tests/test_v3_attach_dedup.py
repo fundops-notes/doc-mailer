@@ -164,3 +164,53 @@ class TestFileDigest:
 
     def test_digest_none_on_missing(self, tmp_path):
         assert lp_v3._file_digest(tmp_path / "nope.bin") is None
+
+
+class TestEmptyNameRowsVisible:
+    """空名行：不导入（逻辑不变），但导入结果里可见（红色 error）。"""
+
+    def test_empty_name_row_shown_as_error(self):
+        rows = [
+            ["收件人名称", "收件人"],
+            ["甲", "a@x.cn"],
+            ["", "noname@x.cn"],
+        ]
+        v = lp_v3.validate_recipient_rows(rows)
+        assert len(v["items"]) == 2
+        empty = v["items"][1]
+        assert empty["no"] == 3 and empty["status"] == "error"
+        assert "名称为空" in empty["errors"][0] and "不会导入" in empty["errors"][0]
+        assert v["error_count"] == 1
+
+    def test_fully_empty_row_not_shown(self):
+        rows = [
+            ["收件人名称", "收件人"],
+            ["甲", "a@x.cn"],
+            ["", None],
+            [None, ""],
+        ]
+        v = lp_v3.validate_recipient_rows(rows)
+        assert len(v["items"]) == 1
+
+    def test_example_placeholder_row_not_shown(self):
+        rows = [
+            ["收件人名称", "收件人"],
+            ["示例：某某公司", "x@x.cn"],
+            ["乙", "b@x.cn"],
+        ]
+        v = lp_v3.validate_recipient_rows(rows)
+        assert len(v["items"]) == 1 and v["items"][0]["name"] == "乙"
+
+    def test_row_numbers_aligned_after_drops(self):
+        """丢行后行号不错位（按原始行号）"""
+        rows = [
+            ["收件人名称", "收件人"],
+            ["", "dropped@x.cn"],       # 行2 空名
+            ["甲", "a@x.cn"],           # 行3
+            ["乙", "b@x.cn"],           # 行4
+        ]
+        v = lp_v3.validate_recipient_rows(rows)
+        nos = [it["no"] for it in v["items"]]
+        assert nos == [2, 3, 4]   # 按原始行号排列
+        assert v["items"][0]["status"] == "error"
+        assert v["items"][1]["name"] == "甲" and v["items"][1]["no"] == 3

@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.3.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.3.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -2793,11 +2793,38 @@ def validate_recipient_rows(rows, existing_names=None, check_files=True):
     res["unknown_cols"] = _unknown
     res["field_cols"] = field_cols
 
+    # 空名行在 parse 阶段被丢弃（不导入——这是既定逻辑，不改）。
+    # 这里把它们补回结果表：显示为红色 error（名称为空，该行不会导入），
+    # 让用户在导入结果里看得见，而不是静默消失。完全空白的行不显示（无意义）。
+    # 同时修正行号：丢行后 enumerate 会错位，改为按原始行号对齐。
+    name_idx = None
+    if rows:
+        for idx, h in enumerate(rows[0]):
+            hs = "" if h is None else str(h).strip().lower()
+            if hs in HEADER_ALIASES.get("name", ()):
+                name_idx = idx
+                break
+    kept_nos, empty_items = [], []
+    for ridx, row in enumerate(rows[1:] if rows else []):
+        def _cell(i):
+            if i is None or i >= len(row):
+                return ""
+            v = row[i]
+            return "" if v is None else str(v).strip()
+        nm = _cell(name_idx)
+        if nm and not nm.startswith("示例："):
+            kept_nos.append(ridx + 2)
+        elif not nm and any((str(c).strip() if c is not None else "")
+                            for c in row):
+            empty_items.append({
+                "no": ridx + 2, "name": "", "status": "error",
+                "errors": ["名称为空（该行不会导入）"], "warnings": [],
+                "record": {}})
     existing = set(existing_names or [])
     seen = {}
     has_owner_pw = False
     for idx, rec in enumerate(recips):
-        no = idx + 2          # 表格里的实际行号（1 是表头）
+        no = kept_nos[idx] if idx < len(kept_nos) else idx + 2
         errors, warnings = [], []
         name = rec.get("name", "")
         if not name:
@@ -2854,6 +2881,11 @@ def validate_recipient_rows(rows, existing_names=None, check_files=True):
             "no": no, "name": name, "status": status,
             "errors": errors, "warnings": warnings, "record": rec,
         })
+
+    # 空名行并入结果（红色 error），按行号排序；计数在 return 前统一补
+    res["items"].extend(empty_items)
+    res["items"].sort(key=lambda it: it.get("no", 0))
+    res["error_count"] += len(empty_items)
 
     if has_owner_pw:
         res["notes"].append(
