@@ -1125,5 +1125,8 @@ Word-MailMerge 参数区的「Word-MailMerge 说明 / 导出要素模板 / 下�
 
 ### 25.4 发布结果
 
-- commit：`待回填`；tag：`v3.4.5`；CI run：`待回填`。
-- Release：`待回填`（两资产从 Release 下载回来做哈希复核）。
+- commit：`2e0ea3f`；tag：`v3.4.5`（已 push）；CI run **40091416821** conclusion=**success**。
+- Release：**id=422700970**（https://github.com/fundops-notes/doc-mailer/releases/tag/v3.4.5）；
+  两资产从 Release 下载回来做哈希复核，与本地构建产物**字节级一致**：
+  `doc-mailer_v3.4.5_portable.zip` 46,413,396 B sha256 `19ED35C1…C6236`；
+  `doc-mailer_win64.zip` 46,822,787 B sha256 `5E26EC14…E4BA5`（内含签名 Valid 的 exe）。
