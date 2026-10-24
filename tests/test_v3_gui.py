@@ -72,19 +72,15 @@ def test_nav_has_only_three_entries(app):
     assert "lib" not in app._screens
 
 
-def test_event_library_has_event_and_template_tabs(app):
-    """事件库的标签页：事件 / 场景模板 / 收件人库 / 执行历史。
-
-    收件人库与执行历史（P4）做在**标签页**里，不占顶层导航入口 ——
-    用户当初明确说过「三个入口看不懂区别，只要事件库」。
-    """
+def test_event_library_tabs_without_scenario(app):
+    """v3.5.1：事件库标签页 = 事件 / 收件人库 / 执行历史（场景模板已移除）。"""
     app.show_screen("home")
     tabs = [app.home_nb.tab(i, "text") for i in range(app.home_nb.index("end"))]
-    assert len(tabs) == 4
+    assert len(tabs) == 3, tabs
     assert "事件" in tabs[0]
-    assert "场景模板" in tabs[1]
-    assert "收件人库" in tabs[2]
-    assert "执行历史" in tabs[3]
+    assert "收件人库" in tabs[1]
+    assert "执行历史" in tabs[2]
+    assert not any("场景" in t for t in tabs)
 
 
 def test_nav_still_has_only_three_entries(app):
@@ -153,21 +149,17 @@ def test_send_mode_switch_persists(app):
     assert len(lp_v3.draft_units(again)) == 2
 
 
-def test_create_scenario_and_event_from_home(app):
+def test_new_event_from_home_no_scenario(app):
+    """v3.5.1：新建事件不再从场景模板派生；场景相关入口/按钮已移除。"""
     app.show_screen("home")
-    before = len(app.store.list_scenarios())
-    sc = lp_v3.new_scenario("测试场景")
-    sc["recipients"].append(lp_v3.normalize_recipient(
-        {"name": "甲公司", "to": "a@x.com", "open_pw": "op1", "owner_pw": "ow1"}))
-    assert app.store.save_scenario(sc)[0]
-    app._refresh_home()
-    assert len(app.store.list_scenarios()) == before + 1
-    app._new_event(sc)
+    assert not hasattr(app, "_build_scenes")
+    assert not hasattr(app, "_new_scenario")
+    n = len(app.store.list_events())
+    app._new_event()
     evs = app.store.list_events()
-    ev = next((e for e in evs if e.get("scenario_name") == "测试场景"), None)
-    assert ev is not None, "新建的事件没找到：%s" % [e.get("name") for e in evs]
-    assert ev["recipients"][0]["name"] == "甲公司"
-    assert ev["scenario_name"] == "测试场景"
+    assert len(evs) == n + 1
+    new = [e for e in evs if e.get("name") == "未命名事件"]
+    assert new and new[0].get("scenario_id") == ""
 
 
 def test_workbench_all_five_steps(app):

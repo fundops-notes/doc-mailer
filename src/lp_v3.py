@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.5.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.5.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -47,6 +47,13 @@ EVENTS_DIR = "events"
 SCENARIOS_DIR = "scenarios"
 RUNS_DIR = "runs"
 RECIPIENTS_DIR = "recipients"   # 收件人库（P4 跨事件复用）
+
+
+def app_dir() -> Path:
+    """程序所在目录（单 exe → exe 目录；源码运行 → 源码目录）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
 PW_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
 
@@ -632,6 +639,7 @@ def normalize_item(it):
         "watermark": False,
         "encrypt": False,
         "permissions": list(DEFAULT_PERMISSIONS),
+        "filename_tpl": "",       # kind=generate：这一条统一使用的产物文件名模板
     }
     v = params.get("template_path")
     if isinstance(v, str):
@@ -648,6 +656,9 @@ def normalize_item(it):
     for b in ("to_pdf", "watermark", "encrypt"):
         if b in params:
             p[b] = bool(params[b])
+    ftpl = params.get("filename_tpl")
+    if isinstance(ftpl, str):
+        p["filename_tpl"] = ftpl.strip()
     perms = params.get("permissions")
     if isinstance(perms, list):
         # 注意：用户主动清空权限位时保留空列表（= 只能打开查看）；
@@ -1409,17 +1420,11 @@ def seed_demo(store, example_path=None):
         data = {"lps": rows,
                 "subject": DEFAULT_SUBJECT_V3, "body": DEFAULT_BODY_V3}
     settings, scenario, event, notes = v2_to_v3_payload(data)
-    # 示例数据没有 Word 模板路径，**事件**的流水线留空（用户自己加条目）。
-    # 两种产出条目的示例放在**场景模板**里 —— 场景不参与预检，
-    # 放禁用条目不会挡住用户第一次运行（禁用的条目预检时会被跳过）。
-    scenario["pipeline"] = _demo_items()
+    # v3.5.1：场景模板功能已移除；示例数据只保留一个事件
     event["pipeline"] = []
-    scenario["name"] = "示例场景"
-    scenario["description"] = ("示例数据（虚构邮箱，可直接跑通全流程后自行替换）；"
-                               "含两个禁用状态的条目示例，启用后填上模板/文件即可用")
     event["name"] = "示例事件"
     filled = 0
-    for rec in list(scenario["recipients"]) + list(event["recipients"]):
+    for rec in list(event["recipients"]):
         if not rec.get("open_pw"):
             rec["open_pw"] = gen_pw()
             filled += 1
@@ -1428,7 +1433,6 @@ def seed_demo(store, example_path=None):
             filled += 1
     store.ensure_dirs()
     store.save_settings(settings)
-    store.save_scenario(scenario)
     store.save_event(event)
 
     # P4：示例收件人库（让「收件人库」标签页不是空的，也示范跨事件复用）
@@ -1449,28 +1453,10 @@ def seed_demo(store, example_path=None):
     if pool_added:
         notes.append("已生成示例收件人库 %d 条（可跨事件复用）" % pool_added)
 
-    notes.append("已生成示例场景「示例场景」+ 事件「示例事件」，"
-                 "收件人 %d 位%s"
-                 % (len(scenario["recipients"]),
+    notes.append("已生成示例事件「示例事件」，收件人 %d 位%s"
+                 % (len(event["recipients"]),
                     ("，自动补齐口令 %d 个" % filled) if filled else ""))
     return True, notes
-
-
-def _demo_items():
-    """示例条目：两种产出条目各一个，默认**禁用**（不参与预检，不会挡住首次运行）。"""
-    return [
-        normalize_item({
-            "kind": "generate", "name": "示例：季度对账单", "enabled": False,
-            "params": {"template_path": "", "to_pdf": True, "watermark": True,
-                       "encrypt": True, "permissions": list(DEFAULT_PERMISSIONS)},
-            "granularity": "per_group",
-        }),
-        normalize_item({
-            "kind": "attach", "name": "示例：附加说明文件", "enabled": False,
-            "params": {"files": [], "path_source": PATH_SOURCE_MANUAL},
-            "granularity": "per_group",
-        }),
-    ]
 
 
 # ============================================================================
@@ -1769,15 +1755,18 @@ def build_units(event, mode):
     return out
 
 
-def item_output_name(event, unit, source_path, orig_name=None):
+def item_output_name(event, unit, source_path, orig_name=None, filename_tpl=None):
     """产物文件名（不含扩展名）。
 
     orig_name: 覆盖「原件名」占位符的取值。**生成文档条目用它自己的条目名**
     （否则两个条目用同一个 Word 模板会产出同名文件，附件包里就撞名了）；
     附加文件条目用源文件名（原件名本来就该是那个文件）。
+    filename_tpl: v3.5.1 起支持**条目级**模板（Word-MailMerge 参数区填写）；
+    为空时回退旧的事件级 options.filename_tpl（兼容旧数据）。
     """
     opts = event.get("options") or {}
-    tpl = opts.get("filename_tpl") or DEFAULT_FILENAME_TPL
+    tpl = (str(filename_tpl).strip() if filename_tpl else "") or \
+        opts.get("filename_tpl") or DEFAULT_FILENAME_TPL
     rec = unit.get("rep") or {}
     fields = build_field_map(rec, event)
     stem = Path(source_path).stem if source_path else ""
@@ -1965,8 +1954,10 @@ def execute_item(item, unit, event, ctx):
         fmap = build_field_map(rep or {}, event, sheet_row)
         apply_mapping_overrides(fmap, item.get("mapping") or {},
                                 rep or {}, event, sheet_row)
-        base = item_output_name(event, unit, tpl,
-                                orig_name=(item.get("name") or "").strip() or None)
+        base = item_output_name(
+            event, unit, tpl,
+            orig_name=(item.get("name") or "").strip() or None,
+            filename_tpl=(params.get("filename_tpl") or ""))
         docx = outdir / (base + ".docx")
         wm.generate_notice_docx(tpl, str(docx), fmap, batch=ctx.word)
         cur = docx
@@ -2541,8 +2532,10 @@ def _item_preview_files(event, item, unit):
                 out.append(base + Path(str(sp)).suffix)
         else:
             src = params.get("template_path", "")
-            base = item_output_name(event, one, src,
-                                    orig_name=(item.get("name") or "").strip() or None)
+            base = item_output_name(
+                event, one, src,
+                orig_name=(item.get("name") or "").strip() or None,
+                filename_tpl=(params.get("filename_tpl") or ""))
             out.append(base + (".pdf" if params.get("to_pdf") else ".docx"))
     return out
 
@@ -2610,8 +2603,8 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         return run
 
     opts = event.get("options") or {}
-    base_out = Path(outdir or opts.get("outdir") or store.get_settings().get("outdir")
-                    or (Path.home() / "Documents" / "LP分发输出"))
+    base_out = Path(outdir or opts.get("outdir")
+                    or store.get_settings().get("outdir") or app_dir())
     base_out = base_out / sanitize_filename(event.get("name", "事件"), 60)
     base_out.mkdir(parents=True, exist_ok=True)
 

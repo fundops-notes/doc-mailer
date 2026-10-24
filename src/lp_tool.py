@@ -57,15 +57,14 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    HEADER_ALIASES, ITEM_KIND_DESC, ITEM_KIND_LABELS, ITEM_KINDS,
                    MOCK_HEADERS, MOCK_LPS, PERMISSIONS, PERMISSION_LABELS,
                    Store, clone_event, gen_pw, migrate_v2_to_v3, needs_migration,
-                   new_event, new_item, new_scenario, normalize_attachment,
+                   new_event, new_item, normalize_attachment,
                    normalize_event, normalize_item, normalize_recipient,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
-                   read_spreadsheet, sanitize_filename, split_mails, split_paths,
-                   sync_scenario_to_event)
+                   read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.5.1"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.5.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.5.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -549,7 +548,7 @@ class App:
             if err:
                 self._boot_error = err
             # 空目录（第一次装 v3）→ 播种示例数据
-            if not self.store.list_scenarios() and not self.store.list_events():
+            if not self.store.list_events():
                 try:
                     ok, notes = lp_v3.seed_demo(self.store)
                     if ok:
@@ -702,8 +701,8 @@ class App:
         """事件库：唯一的主页面。
 
         一次分发 = 一个事件，里面装「发送模式 + 收件人 + 流水线 + 邮件模板」。
-        「场景模板」收进同一页的第二个标签页，不再单独占一个导航入口
-        （之前是「场景与事件 / 场景模板 / 收件人库」三个入口，用户看不懂区别）。
+        v3.5.1：移除「场景模板」标签页——实际使用中它只是复制一份配置，
+        没有同步能力，普通用户用不到；事件库只保留事件/收件人库/执行历史。
         """
         f = parent if parent is not None else self._screens["home"]
 
@@ -718,8 +717,6 @@ class App:
 
         self.home_tab_ev = ttk.Frame(self.home_nb)
         self.home_nb.add(self.home_tab_ev, text=" 事件 ")
-        self.home_tab_sc = ttk.Frame(self.home_nb)
-        self.home_nb.add(self.home_tab_sc, text=" 场景模板 ")
         # P4：收件人库与执行历史做成标签页，不占顶层导航入口
         self.home_tab_pool = ttk.Frame(self.home_nb)
         self.home_nb.add(self.home_tab_pool, text=" 收件人库 ")
@@ -727,7 +724,6 @@ class App:
         self.home_nb.add(self.home_tab_runs, text=" 执行历史 ")
 
         self._build_events_tab(self.home_tab_ev)
-        self._build_scenes(self.home_tab_sc)
         self._build_pool_tab(self.home_tab_pool)
         self._build_runs_tab(self.home_tab_runs)
 
@@ -796,7 +792,6 @@ class App:
 
     def _refresh_home(self):
         self._refresh_events_tab()
-        self._refresh_scenes()
         self._refresh_pool_tab()
         self._refresh_runs_tab()
 
@@ -906,25 +901,8 @@ class App:
         canvas.configure(scrollregion=(0, 0, width, need_h))
 
 
-    def _new_scenario(self, from_event=None):
-        name = simpledialog.askstring("新建场景", "场景名称：", initialvalue="新建场景")
-        if not name:
-            return
-        sc = new_scenario(name)
-        if from_event:
-            sc["recipients"] = [normalize_recipient(r) for r in from_event.get("recipients", [])]
-            sc["pipeline"] = [normalize_item(s) for s in from_event.get("pipeline", [])]
-            sc["attachments"] = [normalize_attachment(a) for a in from_event.get("attachments", [])]
-            sc["mail"] = dict(from_event.get("mail") or {})
-            sc["options"] = dict(from_event.get("options") or {})
-        ok, err = self.store.save_scenario(sc)
-        if not ok:
-            messagebox.showerror("保存失败", err)
-            return
-        self._refresh_home()
-
-    def _new_event(self, scenario=None):
-        ev = new_event("未命名事件", scenario)
+    def _new_event(self):
+        ev = new_event("未命名事件")
         ok, err = self.store.save_event(ev)
         if not ok:
             messagebox.showerror("保存失败", err)
@@ -1436,139 +1414,12 @@ class App:
         self.show_screen("home")
         self.open_event(ev["id"])
 
-    # ================= 场景模板（事件库里的第二个标签页） =================
-
-    def _build_scenes(self, parent=None):
-        f = parent if parent is not None else getattr(self, "home_tab_sc", None)
-        if f is None:
-            return
-        head = ttk.Frame(f)
-        head.pack(fill="x")
-        ttk.Label(head, text="场景模板", style="Head.TLabel").pack(side="left")
-        ttk.Label(head, text="可复用的「怎么做」模板。场景修改不会影响已创建的事件"
-                             "——事件在创建时复制了一份配置。",
-                  style="Sub.TLabel").pack(side="left", padx=12)
-        bar = ttk.Frame(f)
-        bar.pack(fill="x", pady=4)
-        ttk.Button(bar, text="新建场景", command=self._new_scenario).pack(side="left")
-        ttk.Button(bar, text="重命名", command=self._rename_scenario).pack(side="left", padx=4)
-        ttk.Button(bar, text="删除场景", command=self._del_scenario).pack(side="left")
-        ttk.Button(bar, text="以此新建事件", command=self._scene_new_event).pack(side="left", padx=8)
-        ttk.Button(bar, text="同步到事件…", command=self._scene_sync_event,
-                   ).pack(side="left")
-        ToolTip(bar.winfo_children()[-1],
-                "把当前场景的流水线/附件/邮件模板/选项覆盖到选中的事件。\n"
-                "收件人按名称合并：已存在的收件人保留自己的口令与自定义字段，"
-                "只补齐空缺。\n事件不会自动跟随场景变化，需要你显式点这个按钮。")
-        cols = ["name", "desc", "recips", "steps", "atts", "derived", "go"]
-        heads = ["名称", "说明", "收件人模板", "流水线", "附件", "派生事件", ""]
-        self.sc_tree = ttk.Treeview(f, columns=cols, show="headings", selectmode="browse")
-        for c, h in zip(cols, heads):
-            self.sc_tree.heading(c, text=h)
-            self.sc_tree.column(c, width=200 if c in ("name", "desc") else 90)
-        vsb = ttk.Scrollbar(f, orient="vertical", command=self.sc_tree.yview)
-        self.sc_tree.configure(yscrollcommand=vsb.set)
-        self.sc_tree.pack(side="top", fill="both", expand=True, padx=4)
-        vsb.pack(side="right", fill="y")
-
-    def _refresh_scenes(self):
-        self.sc_tree.delete(*self.sc_tree.get_children())
-        events = self.store.list_events()
-        derived = {}
-        for e in events:
-            derived[e.get("scenario_id", "")] = derived.get(e.get("scenario_id", ""), 0) + 1
-        for sc in self.store.list_scenarios():
-            self.sc_tree.insert("", "end", iid=sc["id"], values=[
-                sc.get("name", ""), sc.get("description", ""),
-                len(sc.get("recipients", [])), len(sc.get("pipeline", [])),
-                len(sc.get("attachments", [])), derived.get(sc["id"], 0), "›"])
-
-    def _selected_scenario_id(self):
-        sel = self.sc_tree.selection()
-        return sel[0] if sel else None
-
-    def _rename_scenario(self):
-        sid = self._selected_scenario_id()
-        if not sid:
-            messagebox.showinfo("提示", "请先选中一个场景")
-            return
-        sc, err = self.store.load_scenario(sid)
-        if not sc:
-            messagebox.showerror("读取失败", err or "场景不存在")
-            return
-        name = simpledialog.askstring("重命名场景", "场景名称：", initialvalue=sc.get("name", ""))
-        if not name:
-            return
-        sc["name"] = name
-        self.store.save_scenario(sc)
-        self._refresh_scenes()
-
-    def _del_scenario(self):
-        sid = self._selected_scenario_id()
-        if not sid:
-            messagebox.showinfo("提示", "请先选中一个场景")
-            return
-        sc, _err = self.store.load_scenario(sid)
-        if not messagebox.askyesno("删除场景",
-                                   "确认删除场景「%s」？\n\n已创建的事件不受影响。"
-                                   % (sc.get("name", "") if sc else sid)):
-            return
-        self.store.delete_scenario(sid)
-        self._refresh_scenes()
-
-    def _scene_new_event(self):
-        sid = self._selected_scenario_id()
-        if not sid:
-            messagebox.showinfo("提示", "请先选中一个场景")
-            return
-        sc, err = self.store.load_scenario(sid)
-        if not sc:
-            messagebox.showerror("读取失败", err or "场景不存在")
-            return
-        self._new_event(sc)
-
-    def _scene_sync_event(self):
-        """手动把场景配置同步到指定事件（复制式，用户显式触发）。"""
-        sid = self._selected_scenario_id()
-        if not sid:
-            messagebox.showinfo("提示", "请先选中一个场景")
-            return
-        sc, err = self.store.load_scenario(sid)
-        if not sc:
-            messagebox.showerror("读取失败", err or "场景不存在")
-            return
-        events = self.store.list_events()
-        if not events:
-            messagebox.showinfo("提示", "还没有发送事件")
-            return
-        names = [e.get("name", "") for e in events]
-        pick = simpledialog.askstring(
-            "同步到事件",
-            "要把场景「%s」同步到哪个事件？\n请输入事件名称：\n\n%s"
-            % (sc.get("name", ""), "\n".join(names)), initialvalue=names[0])
-        if not pick:
-            return
-        target = next((e for e in events if e.get("name") == pick.strip()), None)
-        if target is None:
-            messagebox.showwarning("同步", "没有找到名为「%s」的事件" % pick)
-            return
-        if not messagebox.askyesno(
-                "确认同步",
-                "将用场景「%s」覆盖事件「%s」的：\n"
-                "· 流水线（%d 步）\n· 静态附件（%d 个）\n· 邮件模板与选项\n\n"
-                "收件人按名称合并，已有口令与自定义字段保留。\n\n确认同步？"
-                % (sc.get("name", ""), target.get("name", ""),
-                   len(sc.get("pipeline", [])), len(sc.get("attachments", [])))):
-            return
-        new_ev, notes = sync_scenario_to_event(sc, target)
-        ok, err = self.store.save_event(new_ev)
-        if not ok:
-            messagebox.showerror("保存失败", err)
-            return
-        messagebox.showinfo("同步完成", "\n".join("· " + n for n in notes))
-        self._refresh_scenes()
-
     # ================= 设置 =================
+
+    def _outdir_display(self):
+        """设置页显示的输出目录：用户没设时显示程序所在目录（v3.5.1）。"""
+        v = str(self.settings.get("outdir") or "").strip()
+        return v or str(app_dir())
 
     def _build_settings(self, parent=None):
         f = parent if parent is not None else self._screens["settings"]
@@ -1579,38 +1430,26 @@ class App:
         row = ttk.Frame(f)
         row.pack(fill="x", pady=2)
         ttk.Label(row, text="默认输出目录：").pack(side="left")
-        self.set_outdir = tk.StringVar(value=self.settings.get("outdir", ""))
+        self.set_outdir = tk.StringVar(value=self._outdir_display())
         ttk.Entry(row, textvariable=self.set_outdir, width=52).pack(side="left", padx=4)
         ttk.Button(row, text="浏览", command=self._set_pick_outdir).pack(side="left")
         ttk.Button(row, text="保存", command=self._save_settings).pack(side="left", padx=8)
-
-        row2 = ttk.Frame(f)
-        row2.pack(fill="x", pady=2)
-        ttk.Label(row2, text="文件名模板：").pack(side="left")
-        self.set_fname = tk.StringVar(value=self.settings.get("filename_tpl", DEFAULT_FILENAME_TPL))
-        ttk.Entry(row2, textvariable=self.set_fname, width=40).pack(side="left", padx=4)
-        ttk.Label(row2, text="字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}",
-                  style="Sub.TLabel").pack(side="left", padx=6)
-        ttk.Button(row2, text="保存", command=self._save_settings).pack(side="left", padx=8)
-
-        row3 = ttk.Frame(f)
-        row3.pack(fill="x", pady=2)
-        self.set_gp_mode = tk.BooleanVar(value=bool(self.settings.get("gp_owner_mode")))
-        ttk.Checkbutton(row3, text="GP 统一权限口令（每个文件同一个 owner 口令）",
-                        variable=self.set_gp_mode).pack(side="left")
-        self.set_gp_pw = tk.StringVar(value=self.settings.get("gp_owner_pw", ""))
-        ttk.Entry(row3, textvariable=self.set_gp_pw, width=22, show="*").pack(side="left", padx=6)
-        ttk.Button(row3, text="保存", command=self._save_settings).pack(side="left", padx=8)
+        ttk.Label(f, text="（默认：程序所在文件夹；清空/恢复为该目录即使用默认值）",
+                  style="Sub.TLabel").pack(anchor="w", padx=(0, 0), pady=(0, 4))
 
         wm_row = ttk.Frame(f)
         wm_row.pack(fill="x", pady=6)
         ttk.Button(wm_row, text="水印设置…", command=self.open_wm_settings).pack(side="left")
         self.wm_summary = ttk.Label(wm_row, text="", style="Sub.TLabel")
         self.wm_summary.pack(side="left", padx=10)
-        ttk.Button(wm_row, text="自动更新设置", command=self._save_settings).pack(side="left", padx=10)
         self.set_auto = tk.BooleanVar(value=bool(self.settings.get("auto_update", True)))
         ttk.Checkbutton(wm_row, text="启动时检查更新（连接 GitHub）",
-                        variable=self.set_auto).pack(side="left")
+                        variable=self.set_auto, command=self._save_settings).pack(side="left")
+
+        ttk.Label(f, text="文件名模板已移到「文档流水线 → Word-MailMerge」参数区，"
+                          "可对每一条生成任务单独设置。",
+                  style="Sub.TLabel", wraplength=760, justify="left").pack(
+            anchor="w", pady=(2, 4))
 
         info = ttk.LabelFrame(f, text=" 数据存储 ", style="Card.TLabelframe")
         info.pack(fill="x", pady=8)
@@ -1618,14 +1457,11 @@ class App:
         self.store_info.pack(anchor="w", padx=8, pady=6)
 
     def _refresh_settings(self):
-        self.set_outdir.set(self.settings.get("outdir", ""))
-        self.set_fname.set(self.settings.get("filename_tpl", DEFAULT_FILENAME_TPL))
-        self.set_gp_mode.set(bool(self.settings.get("gp_owner_mode")))
-        self.set_gp_pw.set(self.settings.get("gp_owner_pw", ""))
+        self.set_outdir.set(self._outdir_display())
         self.set_auto.set(bool(self.settings.get("auto_update", True)))
         self._update_wm_summary()
         self.store_info.configure(
-            text="位置：%s\n结构：settings.json · events/ · scenarios/ · runs/\n"
+            text="位置：%s\n结构：settings.json · events/ · recipients/ · runs/\n"
                  "旧版数据：%s"
                  % (self.store.data_dir,
                     "已迁移，保留为 lp_data.json.bak" if self.store.legacy_file.with_name(
@@ -1638,26 +1474,19 @@ class App:
             self._save_settings()
 
     def _save_settings(self):
-        self.settings["outdir"] = self.set_outdir.get().strip()
-        self.settings["filename_tpl"] = self.set_fname.get().strip() or DEFAULT_FILENAME_TPL
-        self.settings["gp_owner_mode"] = bool(self.set_gp_mode.get())
-        self.settings["gp_owner_pw"] = self.set_gp_pw.get().strip()
+        d = self.set_outdir.get().strip()
+        try:
+            if d and Path(d).resolve() == app_dir().resolve():
+                d = ""      # 程序目录存空，便携包换位置后仍默认跟随程序
+        except Exception:
+            pass
+        self.settings["outdir"] = d
         self.settings["auto_update"] = bool(self.set_auto.get())
         ok, err = self.store.save_settings(self.settings)
         if not ok:
             messagebox.showerror("保存失败", err)
             return
         self._update_wm_summary()
-
-    def _persist_settings(self):
-        """只把 self.settings 落盘（不依赖「设置」页的 tk 变量）。
-
-        供流水线参数区等非设置页的开关使用（v3.4.4：统一密码勾选原来调
-        `_save_settings()`，在非设置页会因 set_outdir 等变量不存在而崩）。
-        """
-        ok, err = self.store.save_settings(self.settings)
-        if not ok:
-            messagebox.showerror("保存失败", err)
 
     # ================= 帮助 =================
 
@@ -3575,6 +3404,18 @@ class App:
                        command=lambda: self._wb_pick_template(item, tpl_var)).pack(side="left")
             ttk.Button(r1, text="检测占位符", width=10,
                        command=lambda: self._wb_detect_placeholders(item)).pack(side="left", padx=4)
+            # v3.5.1：文件名模板从「设置」下沉到这一条生成任务
+            frow = ttk.Frame(box)
+            frow.pack(fill="x", padx=8, pady=(0, 2))
+            ttk.Label(frow, text="生成文件名模板：").pack(side="left")
+            _ftpl = (params.get("filename_tpl") or "").strip() or DEFAULT_FILENAME_TPL
+            fname_var = self._wb_keep_var(tk.StringVar(value=_ftpl))
+            ttk.Entry(frow, textvariable=fname_var, width=30).pack(side="left", padx=4)
+            ttk.Button(frow, text="保存", width=6,
+                       command=lambda: self._wb_save_item_filename(item, fname_var)
+                       ).pack(side="left")
+            ttk.Label(box, text="可用字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}",
+                      foreground="#888").pack(anchor="w", padx=8, pady=(0, 2))
             # v3.4.6：不再弹「说明」窗口，关键信息直接内联在参数区
             ttk.Label(box, justify="left", foreground="#888", wraplength=490,
                       text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。\n"
@@ -3665,18 +3506,15 @@ class App:
             r_gp = ttk.Frame(box)
             r_gp.pack(fill="x", padx=8, pady=(0, 4))
             _ev_opts = (self._wb_event or {}).get("options") or {}
+            # v3.5.1：全局 GP 设置已删除；此开关只作用于当前事件
             gp_mode_var = self._wb_keep_var(tk.BooleanVar(
-                value=bool(_ev_opts.get("gp_owner_mode",
-                                        self.settings.get("gp_owner_mode")))))
+                value=bool(_ev_opts.get("gp_owner_mode"))))
             gp_pw_var = self._wb_keep_var(tk.StringVar(
-                value=_ev_opts.get("gp_owner_pw", self.settings.get("gp_owner_pw", ""))))
+                value=_ev_opts.get("gp_owner_pw", "")))
 
             def _gp_changed(mode_v=gp_mode_var, pw_v=gp_pw_var):
                 mode = bool(mode_v.get())
                 pw = pw_v.get().strip()
-                self.settings["gp_owner_mode"] = mode
-                self.settings["gp_owner_pw"] = pw
-                self._persist_settings()        # v3.4.4：原为不存在的 save_data()
                 # 引擎/预检只读 event["options"]，这里必须同步过去，否则勾了等于没勾
                 ev = self._wb_event
                 if ev is not None:
@@ -3990,6 +3828,14 @@ class App:
         messagebox.showinfo("检测结果", msg)
 
     # ---------- 模板 / 文件选择 ----------
+
+    def _wb_save_item_filename(self, item, var):
+        """保存这一条 Word-MailMerge 的产物文件名模板。"""
+        params = item.setdefault("params", {})
+        val = var.get().strip()
+        params["filename_tpl"] = "" if val == DEFAULT_FILENAME_TPL else val
+        self._wb_save()
+        self._wb_render_params(item)
 
     def _wb_pick_template(self, item, var):
         path = filedialog.askopenfilename(title="选择 Word 模板",

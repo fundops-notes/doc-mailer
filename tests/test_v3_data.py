@@ -204,13 +204,13 @@ def test_migration_refuses_to_overwrite_corrupt_legacy(tmp_path):
     assert not (tmp_path / "lp_data" / "settings.json").exists()
 
 
-def test_seed_demo_creates_scenario_and_event(tmp_path):
-    """首次启动播种示例数据：v2 的「开箱有演示数据」体验要保留。"""
+def test_seed_demo_creates_event_only(tmp_path):
+    """首次启动播种示例数据：v3.5.1 起不再生成场景模板，只建示例事件。"""
     from lp_v3 import seed_demo
     s = Store(tmp_path)
     ok, notes = seed_demo(s)
     assert ok
-    assert len(s.list_scenarios()) == 1
+    assert len(s.list_scenarios()) == 0
     evs = s.list_events()
     assert len(evs) == 1
     recips = evs[0]["recipients"]

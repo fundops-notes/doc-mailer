@@ -212,17 +212,15 @@ def test_seed_demo_seeds_pool(tmp_path):
     assert pool[0]["owner_pw"], "示例库记录也要有权限口令"
 
 
-def test_seed_demo_scenario_has_disabled_demo_items(tmp_path):
-    """两种产出条目的示例放在**场景**里，且默认禁用（不参与预检，不挡首次运行）。"""
+def test_seed_demo_has_no_scenario_and_empty_pipeline(tmp_path):
+    """v3.5.1：场景模板移除后，示例数据只有事件，且流水线为空（不挡首次运行）。"""
     ex = tmp_path / "lp_data.example.json"
     ex.write_text(
         '{"lps": [{"name": "甲公司", "to": "a@x.com", "open_pw": "o1", '
         '"owner_pw": "w1"}]}', encoding="utf-8")
     store = lp_v3.Store(base_dir=tmp_path)
     lp_v3.seed_demo(store, ex)
-    sc = store.list_scenarios()[0]
-    kinds = [i["kind"] for i in sc["pipeline"]]
-    assert "generate" in kinds and "attach" in kinds
-    assert all(not i["enabled"] for i in sc["pipeline"])
+    assert store.list_scenarios() == []
     ev = store.list_events()[0]
-    assert ev["pipeline"] == [], "示例事件本身不该带条目（否则预检会挡住首次运行）"
+    assert ev["pipeline"] == []
+    assert ev["recipients"][0]["name"] == "甲公司"

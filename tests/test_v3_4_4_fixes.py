@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_350():
-    assert lp_tool.APP_VERSION == "3.5.0"
-    assert lp_v3.APP_VERSION == "3.5.0"
+def test_version_is_351():
+    assert lp_tool.APP_VERSION == "3.5.1"
+    assert lp_v3.APP_VERSION == "3.5.1"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -364,9 +364,7 @@ def test_gp_unified_password_persists_and_reaches_engine(app):
     entry.event_generate("<KeyRelease>", keysym="a")
     a.root.update()
     assert not errors, "勾选统一密码不应再抛异常：%s" % errors[-1]
-    settings, _e = a.store.load_settings()
-    assert settings["gp_owner_mode"] is True
-    assert settings["gp_owner_pw"] == "GPsecret123"
+    # v3.5.1：全局 GP 设置已删除，条目级开关只写 event.options
     saved, _e2 = a.store.load_event(ev["id"])
     assert saved["options"]["gp_owner_mode"] is True
     assert saved["options"]["gp_owner_pw"] == "GPsecret123", "引擎只读 event.options，必须同步"
@@ -815,3 +813,47 @@ def test_top_nav_buttons_and_morandi_styles(app):
     # 没有左侧「主导航」栏
     labels = [str(w.cget("text")) for w in _walk(a.root) if _cls(w) == "TLabel"]
     assert "主导航" not in labels
+
+# ---------------------------------------------------------------- v3.5.1
+
+def test_settings_page_clean_and_default_outdir(app):
+    """设置页：删除 GP 统一口令与全局文件名模板；默认输出目录显示程序目录。"""
+    a, _mb, _fd, _err = app
+    a.show_screen("settings")
+    a.root.update()
+    labels = [str(w.cget("text")) for w in _walk(a._screens["settings"])
+              if _cls(w) == "TLabel"]
+    joined = "\n".join(labels)
+    assert "GP" not in joined
+    assert "文件名模板：" not in joined
+    assert not hasattr(a, "set_fname")
+    assert not hasattr(a, "set_gp_mode")
+    assert a.set_outdir.get() == str(lp_tool.app_dir())
+    a.set_outdir.set(str(lp_tool.app_dir()))
+    a._save_settings()
+    st, _e = a.store.load_settings()
+    assert st.get("outdir") == "", "程序目录应存为空值，便携包换位置仍默认跟随"
+
+
+def test_filename_template_per_word_mailmerge_item(app):
+    """v3.5.1：文件名模板是 Word-MailMerge 条目参数，不再在设置页。"""
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "文件名", [{"name": "甲", "to": "a@x.com",
+                                    "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "generate", "params": {}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    labels = [str(w.cget("text")) for w in _walk(a._wb_params_frame) if _cls(w) == "TLabel"]
+    assert any("生成文件名模板" in x for x in labels), labels
+    item = a._wb_event["pipeline"][0]
+    item["params"]["filename_tpl"] = "{{LP名称}}_专属账单"
+    a._wb_save()
+    # 条目级模板覆盖事件默认
+    unit = {"rep": {"name": "甲"}, "recipients": [], "lp_name": "甲",
+            "group_key": "甲", "group": ""}
+    name = lp_v3.item_output_name(a._wb_event, unit, "C:/x/模板.docx",
+                                  filename_tpl=item["params"]["filename_tpl"])
+    assert name == "甲_专属账单"
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["pipeline"][0]["params"]["filename_tpl"] == "{{LP名称}}_专属账单"
