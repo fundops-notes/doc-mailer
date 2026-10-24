@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.4"
+APP_VERSION = "3.4.5"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.4"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.5"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -2945,10 +2945,11 @@ class App:
         #  仍是 parent，PanedWindow 又后创建、z 序在上，结果左栏内容被整个盖住。）
         pw2 = ttk.PanedWindow(parent, orient="horizontal")
         pw2.pack(fill="both", expand=True, pady=(0, 4))
-        left_col = ttk.Frame(pw2)
-        pw2.add(left_col, weight=3)
-        right_col = ttk.Frame(pw2)
-        pw2.add(right_col, weight=2)
+        # v3.4.5：给两栏显式初始宽度，避免默认窗口下左栏被右栏挤到按钮被裁掉
+        left_col = ttk.Frame(pw2, width=540)
+        pw2.add(left_col, weight=5)
+        right_col = ttk.Frame(pw2, width=400)
+        pw2.add(right_col, weight=3)
 
         # ---------- 左栏：条目表 + 参数区 ----------
         frame = ttk.Frame(left_col)
@@ -2960,9 +2961,9 @@ class App:
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
         tree.column("no", width=36, stretch=False, anchor="center")
-        tree.column("name", width=150)
+        tree.column("name", width=130)
         tree.column("kind", width=78, stretch=False)
-        tree.column("source", width=190)
+        tree.column("source", width=150)
         tree.column("proc", width=96, stretch=False)
         tree.column("gran", width=104, stretch=False)
         tree.column("on", width=44, stretch=False, anchor="center")
@@ -3424,15 +3425,15 @@ class App:
             r1.pack(fill="x", padx=8, pady=4)
             ttk.Label(r1, text="Word 模板：").pack(side="left")
             tpl_var = self._wb_keep_var(tk.StringVar(value=params.get("template_path", "")))
-            ttk.Entry(r1, textvariable=tpl_var, width=54).pack(side="left", padx=4)
+            ttk.Entry(r1, textvariable=tpl_var, width=32).pack(side="left", padx=4)
             ttk.Button(r1, text="选择…", width=6,
                        command=lambda: self._wb_pick_template(item, tpl_var)).pack(side="left")
             ttk.Button(r1, text="检测占位符", width=10,
                        command=lambda: self._wb_detect_placeholders(item)).pack(side="left", padx=4)
+            ttk.Label(box, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
+                      foreground="#888").pack(anchor="w", padx=8, pady=(2, 0))
             hrow = ttk.Frame(box)
             hrow.pack(fill="x", padx=8, pady=(0, 4))
-            ttk.Label(hrow, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
-                      foreground="#888").pack(side="left")
             ttk.Button(hrow, text="Word-MailMerge 说明", width=18,
                        command=self._show_mailmerge_help).pack(side="left", padx=(8, 0))
             ttk.Button(hrow, text="导出要素模板", width=12,
@@ -3444,25 +3445,26 @@ class App:
 
             r1 = ttk.Frame(box)
             r1.pack(fill="x", padx=8, pady=4)
-            ttk.Label(r1, text="文件（每行一个路径）：").pack(side="left", anchor="n")
-            files_text = tk.Text(r1, height=4, width=58, wrap="none")
-            files_text.pack(side="left", padx=4)
+            ttk.Label(r1, text="文件（每行一个路径）：").pack(anchor="w")
+            # v3.4.5：文本框与按钮改为上下两行，默认窗口宽度下按钮不会被裁掉
+            files_text = tk.Text(r1, height=4, width=40, wrap="none")
+            files_text.pack(fill="x", padx=0, pady=(2, 4))
             for p in (params.get("files") or []):
                 files_text.insert("end", str(p) + "\n")
             btns = ttk.Frame(r1)
-            btns.pack(side="left", anchor="n", padx=4)
+            btns.pack(fill="x")
             b_add = ttk.Button(btns, text="添加文件…", width=12,
                                command=lambda: self._wb_add_attach_files(item, files_text))
             b_add.pack(side="left")
             b_imp = ttk.Button(btns, text="从 Excel 导入路径…", width=18,
                                command=lambda: self._wb_import_attach_paths(item, files_text))
-            b_imp.pack(side="left", pady=4)
+            b_imp.pack(side="left", padx=4)
             b_save = ttk.Button(btns, text="保存", width=6,
                                 command=lambda: self._wb_save_attach_files(item, files_text))
             b_save.pack(side="left")
             b_tpl = ttk.Button(btns, text="导出路径模板", width=12,
                                command=lambda: self._wb_export_attach_path_template(item))
-            b_tpl.pack(side="left", pady=4)
+            b_tpl.pack(side="left", padx=4)
             ttk.Label(box, text=(
                 "每行一个文件路径。从 Excel 导入时路径与收件人一一对应；"
                 "所有人同一份文件用「统一附件」按钮设置。"
@@ -3488,10 +3490,11 @@ class App:
         ttk.Checkbutton(r2, text="加密（AES-256）", variable=enc_var,
                         command=lambda: self._wb_item_flag(item, "encrypt", enc_var)
                         ).pack(side="left")
-        ttk.Label(r2, foreground="#888",
-                  text="水印文字与各人打开口令在「收件人」处维护").pack(side="left", padx=(8, 0))
         ToolTip(r2, "处理顺序固定，你不用排：转 PDF → 加水印 → 加密。\n"
                    "加密只对 PDF 生效；打开口令取该收件人的打开口令。")
+        ttk.Label(box, foreground="#888",
+                  text="水印文字与各人打开口令在「收件人」处维护",
+                  wraplength=500, justify="left").pack(anchor="w", padx=8, pady=(0, 2))
 
         # --- 加密选项：发送人统一密码（即 GP 统一权限口令机制，方便发送人核对）---
         if params.get("encrypt"):
@@ -3521,8 +3524,7 @@ class App:
             # v3.4.4：输入口令时 StringVar 一变化就保存（真实键入 / 测试都可靠）
             gp_pw_var.trace_add("write", lambda *_a: _gp_changed())
 
-            ttk.Checkbutton(r_gp, text="发送人统一密码（所有文件用同一口令打开，"
-                                      "方便发送人核对；收件人仍用各自口令）",
+            ttk.Checkbutton(r_gp, text="发送人统一密码（所有文件同一口令，便于发送人核对）",
                             variable=gp_mode_var,
                             command=_gp_changed).pack(side="left")
             e_gp = ttk.Entry(r_gp, textvariable=gp_pw_var, width=20, show="*")
@@ -3545,9 +3547,9 @@ class App:
                                 variable=pv,
                                 command=lambda k=pk, v=pv: self._wb_item_perm(item, k, v)
                                 ).pack(side="left", padx=(0, 10))
-            ttk.Label(r3, foreground="#888", text=(
-                "默认只允许打印。全部取消 = 收件人只能打开查看，不能打印/编辑/复制。")
-            ).pack(side="left")
+            ttk.Label(box, foreground="#888", text=(
+                "默认只允许打印。全部取消 = 收件人只能打开查看，不能打印/编辑/复制。"),
+                wraplength=500, justify="left").pack(anchor="w", padx=8, pady=(0, 2))
 
         # --- 产出粒度（条目级：这一条产出几份文件）---
         r4 = ttk.Frame(box)
@@ -3624,14 +3626,23 @@ class App:
         cols = ["ph", "src", "val"]
         heads = ["Word 占位符", "填什么（数据来源）",
                  "预览值（以「%s」为例）" % (rec0.get("name") or "第一位收件人")]
-        tree = ttk.Treeview(parent, columns=cols, show="headings", height=7,
+        tframe = ttk.Frame(parent)
+        tframe.pack(fill="both", expand=True, padx=8, pady=4)
+        tree = ttk.Treeview(tframe, columns=cols, show="headings", height=7,
                             selectmode="extended")
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
-        tree.column("ph", width=190)
-        tree.column("src", width=230)
-        tree.column("val", width=250)
-        tree.pack(fill="both", expand=True, padx=8, pady=4)
+        tree.column("ph", width=170)
+        tree.column("src", width=190)
+        tree.column("val", width=180)
+        tvsb = ttk.Scrollbar(tframe, orient="vertical", command=tree.yview)
+        thsb = ttk.Scrollbar(tframe, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=tvsb.set, xscrollcommand=thsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        tvsb.grid(row=0, column=1, sticky="ns")
+        thsb.grid(row=1, column=0, sticky="ew")
+        tframe.rowconfigure(0, weight=1)
+        tframe.columnconfigure(0, weight=1)
         tree.bind("<Double-1>", lambda e, it=item: self._wb_edit_mapping(it))
         self._wb_map_iids = {}
         for i, (ph, src, val) in enumerate(rows):
