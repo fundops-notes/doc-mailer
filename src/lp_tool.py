@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.7.1"
+APP_VERSION = "3.7.2"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.1"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.2"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -342,7 +342,10 @@ def _editor_place_image(tw, index, token):
     photo = _editor_photo(token)
     if photo is None:
         return
-    tw.image_create(index, image=photo)
+    # v3.7.2：图片放在 token 之后（token 被 elide）。若图片与 token 同索引，
+    # elide 会把图片一起隐藏，表现为“插入了但看不到”。
+    end = "%s+%dc" % (index, len(token))
+    tw.image_create(end, image=photo)
     tag = "__elide_%s" % token
     try:
         tw.tag_configure(tag, elide=True)
@@ -1090,8 +1093,6 @@ class App:
                 ("新增", self._pool_new, "在收件人库里新增一条"),
                 ("编辑", self._pool_edit, "编辑选中的收件人"),
                 ("标签…", self._pool_tags, "给选中收件人批量加/移除标签"),
-                ("清理库内字段", self._pool_clean_fields,
-                 "删除收件人库里历史遗留的自定义字段（字段属于事件，不应存在库里）"),
                 ("删除", self._pool_delete, "从库里删除选中的收件人"),
                 ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
                 ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
@@ -1324,29 +1325,6 @@ class App:
             side="left", padx=6)
         ttk.Button(btns, text="关闭", command=win.destroy).pack(side="left", padx=6)
 
-    def _pool_clean_fields(self):
-        """清除收件人库里历史遗留的自定义字段（字段属于事件，不应在库中累积）。"""
-        pool = self.store.list_pool()
-        affected = [r for r in pool if r.get("fields")]
-        if not affected:
-            messagebox.showinfo("清理库内字段", "收件人库里没有自定义字段，无需清理。")
-            return
-        if not messagebox.askyesno(
-                "清理库内字段",
-                "收件人库有 %d 位带自定义字段（历史遗留）。\n\n"
-                "这些字段是事件数据，不属于收件人本身；清理只动收件人库，\n"
-                "不会影响任何事件。确定清理？" % len(affected)):
-            return
-        for rec in affected:
-            rec2 = dict(rec)
-            rec2["fields"] = {}
-            ok, err, _saved = self.store.save_pool_recipient(rec2)
-            if not ok:
-                messagebox.showerror("清理失败", err)
-                return
-        self._refresh_pool_tab()
-        messagebox.showinfo("清理库内字段", "已清理 %d 位收件人的历史字段。" % len(affected))
-
     def _pool_delete(self):
         ids = self._pool_selected()
         if not ids:
@@ -1450,7 +1428,15 @@ class App:
         if not ev:
             return
         pool = {r.get("id"): r for r in self.store.list_pool()}
-        recs = [pool[i] for i in ids if i in pool]
+        # v3.7.2：旧库可能残留历史字段，添加进事件时不带过去（字段属于事件）
+        recs = []
+        for i in ids:
+            src = pool.get(i)
+            if src is None:
+                continue
+            src = dict(src)
+            src["fields"] = {}
+            recs.append(src)
         if not recs:
             return
         new_ev, added, updated = lp_v3.merge_recipients_into_event(ev, recs)
@@ -1791,8 +1777,8 @@ class App:
             "    · 可给收件人打标签；「标签…」支持批量添加、批量移除共有标签；\n"
             "    · 只属于部分收件人的特异标签不会被批量移除；\n"
             "    · 「从事件导入…」收进库后会提示给这批收件人打标签；\n"
-            "    · 自定义字段只属于事件，收件人库不保存/显示字段；\n"
-            "      旧库可用「清理库内字段」清掉历史字段。\n\n"
+            "    · 自定义字段只属于事件，收件人库/收件人信息都不显示字段；\n"
+            "      字段由 Excel/要素模板导入，只用于文档映射。\n\n"
             "输出目录：\n"
             "    以「设置 → 默认输出目录」为准；未设置时用程序所在文件夹。\n"
             "    处理与生成草稿都用同一个目录，事件里不再单独保存输出路径。\n\n"
@@ -2035,10 +2021,10 @@ class App:
         self._wb_mode_hint.pack(side="left", padx=8)
         self._wb_update_mode_hint()
 
-        fcols = self._wb_field_columns()
-        ttk.Label(parent, text="自定义字段列供文档映射使用%s。"
-                  % ("（当前：" + "、".join(fcols) + "）" if fcols else "（还没有）"),
-                  style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(parent, text=(
+            "自定义字段由「导入 Excel/CSV」或 Word-MailMerge 的「导入要素模板」带入，"
+            "只用于文档映射，不在收件人表里显示。"),
+            style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(0, 4))
@@ -2056,13 +2042,6 @@ class App:
             ("新增", self._wb_edit_recipient, "手工添加一位收件人。"),
             ("编辑", self._wb_edit_recipient, "编辑选中的收件人（也可直接双击行）。"),
             ("删除", self._wb_delete_recipients, "删除选中的收件人（可多选）。"),
-            ("添加自定义字段列", self._wb_add_field_column,
-             "给收件人表加一个自定义字段列（Call_Amount / Unfunded 这类），\n"
-             "之后在编辑对话框里给每位收件人填值。"),
-            ("删除字段列", self._wb_del_field_column,
-             "从当前事件所有收件人里删除一个自定义字段列（同时去掉指向它的映射）。"),
-            ("套用字段模板", self._wb_apply_field_template,
-             "用设置里预定义的字段模板（如「催缴场景字段」）一次性铺开多列。"),
             ("检查附件", self._wb_check_attachments, "检查收件人专属附件文件是否存在。"),
             ("补齐缺失口令", self._wb_fill_passwords,
              "为打开口令/权限口令为空的收件人批量生成随机口令。"),
@@ -2076,10 +2055,9 @@ class App:
             b.pack(side="left", padx=2)
             ToolTip(b, tip)
 
-        cols = ["name", "to", "cc", "bcc", "wm", "group"] + fcols + \
-            ["open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组"] + fcols + \
-                ["打开口令", "权限口令(勿发)"]
+        cols = ["name", "to", "cc", "bcc", "wm", "group", "open_pw", "owner_pw"]
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组",
+                 "打开口令", "权限口令(勿发)"]
         # 注意：Treeview 必须建在 frame 里。之前建在 parent 里、却 pack 进 frame，
         # 结果它被排到了 frame 下面，表格被挤成右下角一小块。
         frame = ttk.Frame(parent)
@@ -2102,10 +2080,9 @@ class App:
             # （v3.4.0~3.4.3 这里多塞了一个 att_txt，Tk 会丢弃最后一个值
             #  → 权限口令的 •••• 被丢掉 + 整行错位 + 明文口令外泄。）
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
-                    r.get("bcc", ""), r.get("wm", ""), r.get("group", "")]
-            vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
-            vals += [r.get("open_pw", ""),
-                     "••••" if r.get("owner_pw") else ""]
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""),
+                    r.get("open_pw", ""),
+                    "••••" if r.get("owner_pw") else ""]
             tree.insert("", "end", values=vals)
 
         ttk.Label(parent, foreground="#b00", text=(
@@ -2580,10 +2557,9 @@ class App:
         return [ev["recipients"][i] for i in idxs]
 
     def _recipient_dialog(self, rec, field_cols, title, on_save, no_field_hint=""):
-        """收件人编辑对话框 —— 事件里与收件人库里**共用同一套表单**。
+        """收件人编辑对话框（事件/收件人库共用）。
 
-        rec: 初始值；field_cols: 自定义字段列名；
-        on_save(out): 保存回调，返回 True 表示关闭对话框。
+        v3.7.2：自定义字段属于事件，不在收件人信息里展示/编辑；保存时保留原字段。
         """
         win = tk.Toplevel(self.root)
         win.title(title)
@@ -2601,20 +2577,24 @@ class App:
             e.insert(0, rec.get(key, ""))
             e.grid(row=i, column=1, padx=6, pady=4)
             entries[key] = e
+
         r0 = len(rows)
-        ttk.Label(win, text="自定义字段", foreground="#444").grid(
-            row=r0, column=0, sticky="e", padx=6, pady=(8, 2))
-        field_entries = {}
-        fcols = field_cols or []
-        if not fcols:
-            ttk.Label(win, text=no_field_hint or "（没有自定义字段列）",
+        if field_cols:
+            ttk.Label(win, text="自定义字段（事件数据）", foreground="#444").grid(
+                row=r0, column=0, sticky="e", padx=6, pady=(8, 2))
+            field_entries = {}
+            for j, k in enumerate(field_cols):
+                ttk.Label(win, text=k).grid(row=r0 + 1 + j, column=0,
+                                            sticky="e", padx=6, pady=2)
+                e = ttk.Entry(win, width=52)
+                e.insert(0, (rec.get("fields") or {}).get(k, ""))
+                e.grid(row=r0 + 1 + j, column=1, padx=6, pady=2)
+                field_entries[k] = e
+        else:
+            field_entries = {}
+            ttk.Label(win, text=(no_field_hint or
+                                 "自定义字段由 Excel/要素模板导入，这里不显示、不修改。"),
                       foreground="#888").grid(row=r0, column=1, sticky="w", padx=6)
-        for j, k in enumerate(fcols):
-            ttk.Label(win, text=k).grid(row=r0 + 1 + j, column=0, sticky="e", padx=6, pady=2)
-            e = ttk.Entry(win, width=52)
-            e.insert(0, (rec.get("fields") or {}).get(k, ""))
-            e.grid(row=r0 + 1 + j, column=1, padx=6, pady=2)
-            field_entries[k] = e
 
         def ok():
             out = {k: e.get().strip() for k, e in entries.items()}
@@ -2625,15 +2605,16 @@ class App:
                 messagebox.showwarning("口令", "权限口令不能与打开口令相同", parent=win)
                 return
             out["wm"] = out["wm"] or out["name"]
-            # v3.4.4：附件路径不再在对话框里维护，保存时原样保留旧数据
-            # （流水线「路径来源=收件人附件」仍兼容旧数据，不能在这里被清空）。
             out["attachments"] = list(rec.get("attachments") or [])
-            out["fields"] = {k: e.get().strip() for k, e in field_entries.items()}
+            # 隐藏字段时保留原字段值，避免编辑收件人把导入的字段清空
+            out["fields"] = ({k: e.get().strip() for k, e in field_entries.items()}
+                             if field_entries else dict(rec.get("fields") or {}))
             if on_save(out):
                 win.destroy()
 
         btns = ttk.Frame(win)
-        btns.grid(row=r0 + 1 + len(fcols), column=0, columnspan=2, pady=8)
+        btns.grid(row=r0 + (len(field_entries) + 1 if field_entries else 1),
+                  column=0, columnspan=2, pady=8)
         ttk.Button(btns, text="保存", command=ok).pack(side="left", padx=8)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
         return win
@@ -2657,9 +2638,9 @@ class App:
             return True
 
         self._recipient_dialog(
-            rec, self._wb_field_columns(),
+            rec, [],
             "编辑收件人" if sel else "新增收件人", save,
-            "（还没有自定义字段列，可先在收件人页点「添加自定义字段列」）")
+            "自定义字段由 Excel/要素模板导入，这里不显示、不修改。")
 
     def _wb_add_from_pool(self):
         """从收件人库挑人加进当前事件。"""
@@ -3669,6 +3650,8 @@ class App:
             fields = rec.setdefault("fields", {})
             for i, key in col_keys.items():
                 val = row[i] if i < len(row) else None
+                # 日期类列（Due_Date / 日期）的 Excel 序列号转可读日期
+                val = lp_v3.coerce_date_like_value(header[i] if i < len(header) else key, val)
                 val = "" if val is None else str(val).strip()
                 if val == "":
                     continue      # 空单元格不覆盖已有值

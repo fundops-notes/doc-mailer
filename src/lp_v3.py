@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.7.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.7.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -294,6 +294,34 @@ def parse_import_rows(rows):
     return lps, unknown
 
 
+DATE_HEADER_RE = re.compile(r"date|due|日期|时间|截止|到期|期限", re.I)
+
+
+def coerce_date_like_value(header, value):
+    """日期类列：把 Excel 的日期序列号（如 46193）转成 YYYY-MM-DD。
+
+    有的模板列格式是 General，openpyxl 只能拿到数字，Excel 里看着也像数字，
+    但列名是 Due_Date / 日期 时用户意图显然是日期，导入时统一转成可读日期。
+    """
+    if value is None or value == "":
+        return value
+    if not DATE_HEADER_RE.search(str(header or "")):
+        return value
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+        return value.strftime("%Y-%m-%d")
+    txt = str(value).strip()
+    if not re.fullmatch(r"\d{5}(\.\d+)?", txt):
+        return value
+    try:
+        num = float(txt)
+        if 20000 <= num <= 90000:
+            from openpyxl.utils.datetime import from_excel
+            return from_excel(num).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return value
+
+
 def parse_import_rows_v3(rows):
     """v3 收件人导入。
 
@@ -332,7 +360,7 @@ def parse_import_rows_v3(rows):
         fields = {}
         for idx, col in field_cols:
             if idx < len(row):
-                v = row[idx]
+                v = coerce_date_like_value(col, row[idx])
                 if v is not None and str(v).strip():
                     fields[col] = str(v).strip()
         recips.append(normalize_recipient({

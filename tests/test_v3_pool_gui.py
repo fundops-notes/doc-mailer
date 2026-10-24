@@ -186,36 +186,6 @@ def test_pool_does_not_collect_event_fields(app):
     assert "Call_Amount" not in heads and "Due_Date" not in heads
 
 
-def test_pool_clean_fields_removes_legacy_fields(app):
-    _pool_rec(app, "甲公司", fields={"Call_Amount": "200,000"})
-    app.show_screen("home")
-    app._refresh_pool_tab()
-    app._pool_clean_fields()
-    app.root.update()
-    assert all(not r.get("fields") for r in app.store.list_pool())
-
-
-def test_add_event_field_then_delete_column(app):
-    ev = _event(app, "字段事件", [{"name": "甲公司", "to": "a@x.com",
-                                   "open_pw": "op1", "owner_pw": "ow1"}])
-    app.open_event(ev["id"])
-    app._wb_show_step(0)
-    app.root.update()
-    # 直接加字段（跳过 simpledialog 交互）
-    app._wb_event["recipients"][0].setdefault("fields", {})["Call_Amount"] = "200,000"
-    app._wb_save()
-    assert "Call_Amount" in app._wb_field_columns()
-    # 删除字段列：用 stub 回答 simpledialog
-    old = lp_tool.simpledialog.askstring
-    lp_tool.simpledialog.askstring = lambda *a, **k: "Call_Amount"
-    try:
-        app._wb_del_field_column()
-    finally:
-        lp_tool.simpledialog.askstring = old
-    app.root.update()
-    assert "Call_Amount" not in app._wb_field_columns()
-
-
 def test_pool_from_event_pulls_recipients_into_pool(app):
     ev = _event(app, "来源事件", [{"name": "甲公司", "to": "a@x.com",
                                    "open_pw": "op1", "owner_pw": "ow1"}])
@@ -260,8 +230,8 @@ def test_pool_to_event_never_overwrites_event_passwords(app):
     rec = again["recipients"][0]
     assert rec["open_pw"] == "op-evt"
     assert rec["owner_pw"] == "ow-evt"
-    # 空缺仍然会被补上
-    assert rec["fields"].get("Call_Amount") == "200,000"
+    # v3.7.2：收件人库不保存事件字段；即使旧库有字段也不带进事件
+    assert "Call_Amount" not in (rec.get("fields") or {})
 
 
 def test_pool_to_event_adds_new_recipient(app):

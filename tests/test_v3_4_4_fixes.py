@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_371():
-    assert lp_tool.APP_VERSION == "3.7.1"
-    assert lp_v3.APP_VERSION == "3.7.1"
+def test_version_is_372():
+    assert lp_tool.APP_VERSION == "3.7.2"
+    assert lp_v3.APP_VERSION == "3.7.2"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -178,9 +178,10 @@ def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
     cols = list(tree["columns"])
     vals = list(tree.item(tree.get_children()[0])["values"])
     assert len(vals) == len(cols), "values 必须与 columns 一一对应：%s vs %s" % (vals, cols)
-    assert "附件路径" not in [tree.heading(c)["text"] for c in cols]
-    assert vals[cols.index("Call_Amount")] == "200,000"
-    assert vals[cols.index("Due_Date")] == "2026-11-15"
+    heads = [tree.heading(c)["text"] for c in cols]
+    assert "附件路径" not in heads
+    # v3.7.2：自定义字段不在收件人信息里显示
+    assert "Call_Amount" not in heads and "Due_Date" not in heads
     assert vals[cols.index("owner_pw")] == "••••", "权限口令必须打码"
     assert vals[cols.index("open_pw")] == "Open123456"
     # 记录里的 attachments 本体仍在（流水线兼容旧数据）
@@ -493,8 +494,8 @@ def test_import_field_template_applies_values_and_mapping(app, tmp_path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.append(["收件人名称", "{{Call_Amount}}", "{{Client_Name}}", "{{Due_Date}}"])
-    ws.append(["甲公司", 200000, "甲方科技", "2026-11-15"])
-    ws.append(["乙公司", 300000, "乙方科技", "2026-12-01"])
+    ws.append(["甲公司", 200000, "甲方科技", 46193])
+    ws.append(["乙公司", 300000, "乙方科技", 46042])
     ws.append(["查无此人", 999, "X", "2027-01-01"])
     wb.save(str(src))
     fd.open_path = str(src)
@@ -506,6 +507,9 @@ def test_import_field_template_applies_values_and_mapping(app, tmp_path):
     assert r1["fields"]["Call_Amount"] == "200000"
     assert r1["fields"]["Client_Name"] == "甲方科技"
     assert r2["fields"]["Call_Amount"] == "300000"
+    # 46193 / 46042 是 General 格式的 Excel 日期序列号，应按日期导入
+    assert r1["fields"]["Due_Date"] == "2026-06-20"
+    assert r2["fields"]["Due_Date"] == "2026-01-20"
     assert saved["pipeline"][0]["mapping"]["{{Call_Amount}}"] == "fields.Call_Amount"
     assert saved["pipeline"][0]["mapping"]["{{Client_Name}}"] == "fields.Client_Name"
     msgs = [m for m in mb.calls if m[0] == "info" and "已导入" in m[1]]
@@ -1138,3 +1142,59 @@ def test_run_event_uses_per_email_override(tmp_path, monkeypatch):
     assert run is not None
     assert calls and calls[0][0] == "单独主题"
     assert "单独正文" in calls[0][1]
+
+# ---------------------------------------------------------------- v3.7.2
+
+def test_recipient_table_hides_fields_but_edit_preserves_them(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "隐藏字段", [{
+        "name": "甲公司", "to": "a@x.com", "open_pw": "Open123456",
+        "owner_pw": "Owner123456",
+        "fields": {"Call_Amount": "200,000", "Due_Date": "2026-11-15"},
+    }])
+    a.open_event(ev["id"])
+    a._wb_show_step(0)
+    a.root.update()
+    heads = [a._wb_rec_tree.heading(c)["text"] for c in a._wb_rec_tree["columns"]]
+    assert "Call_Amount" not in heads and "Due_Date" not in heads
+    # 打开编辑弹窗再保存，不应清空导入的字段
+    tree = a._wb_rec_tree
+    tree.selection_set(tree.get_children()[0])
+    a._wb_edit_recipient()
+    a.root.update()
+    dlg = _find_toplevel(a.root, "编辑收件人")
+    assert dlg is not None
+    labels = [str(w.cget("text")) for w in _walk(dlg) if _cls(w) == "TLabel"]
+    assert "Call_Amount" not in labels and "Due_Date" not in labels
+    for t, b in _buttons(dlg):
+        if t == "保存":
+            b.invoke()
+            break
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["recipients"][0]["fields"]["Call_Amount"] == "200,000"
+    assert saved["recipients"][0]["fields"]["Due_Date"] == "2026-11-15"
+
+
+def test_inserted_image_is_visible_in_editor(app, tmp_path):
+    a, _mb, _fd, _err = app
+    from PIL import Image
+    png = tmp_path / "pic.png"
+    Image.new("RGB", (80, 50), (200, 120, 90)).save(str(png))
+    ev = _save_event(a, "图片可见", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a.root.update()
+    a.body_text.insert("end", "前")
+    lp_tool._editor_insert_image(a.body_text, str(png))
+    a.root.update()
+    names = a.body_text.image_names()
+    assert names, "图片应插入编辑器"
+    bbox = a.body_text.bbox(names[0])
+    assert bbox and bbox[2] and bbox[3], "图片应有可见尺寸（不能被 elide 隐藏）"
+    html = lp_tool.text_to_html(a.body_text)
+    lp_tool.load_html(a.body_text, html)
+    a.root.update()
+    assert a.body_text.image_names(), "重新加载后图片仍可见"
