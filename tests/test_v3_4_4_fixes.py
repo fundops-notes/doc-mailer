@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_345():
-    assert lp_tool.APP_VERSION == "3.4.5"
-    assert lp_v3.APP_VERSION == "3.4.5"
+def test_version_is_346():
+    assert lp_tool.APP_VERSION == "3.4.6"
+    assert lp_v3.APP_VERSION == "3.4.6"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -421,3 +421,116 @@ def test_process_overrides_multi_file_saved_as_list(app):
     a.root.update()
     saved, _e = a.store.load_event(ev["id"])
     assert saved["process_overrides"]["甲"] == ["C:/a.pdf", "C:/b.pdf"]
+
+
+# ---------------------------------------------------------------- v3.4.6
+
+def test_item_rename_direct_without_dialog(app):
+    """名称输入框 +「改名」直接生效，不再弹重命名对话框。"""
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "改名", [{"name": "甲", "to": "a@x.com",
+                                  "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "name": "旧名字",
+                                "params": {"files": ["C:/a.pdf"]}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    assert not hasattr(a, "_wb_rename_item"), "重命名对话框应已删除"
+    entry = a._wb_item_name_entry
+    entry.delete(0, "end")
+    entry.insert(0, "新名字")
+    for t, b in _buttons(a._wb_params_frame):
+        if t == "改名":
+            b.invoke()
+            break
+    a.root.update()
+    item = a._wb_event["pipeline"][0]
+    assert item["name"] == "新名字"
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["pipeline"][0]["name"] == "新名字", "改名必须立即持久化"
+    assert _find_toplevel(a.root, "重命名条目") is None, "不应再弹出重命名对话框"
+
+
+def test_double_click_item_focuses_name_entry_without_dialog(app):
+    """双击条目行只是聚焦名称输入框，不弹窗。"""
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "双击", [{"name": "甲", "to": "a@x.com",
+                                  "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": ["C:/a.pdf"]}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    tree = a._wb_pipe_tree
+    iid = tree.get_children()[0]
+    tree.identify_column = lambda _x: "#2"          # 模拟双击「条目名称」列
+    tree.identify_row = lambda _y: iid
+    import types
+    a._wb_on_pipe_double(types.SimpleNamespace(x=10, y=10))
+    a.root.update()
+    assert _find_toplevel(a.root, "重命名条目") is None
+    assert a._wb_item_name_entry is not None
+
+
+def test_import_field_template_applies_values_and_mapping(app, tmp_path):
+    """导出要素模板后必须能导回来：按收件人名称匹配、写入 fields、自动接映射。"""
+    a, mb, fd, _err = app
+    tpl = tmp_path / "t.docx"
+    _mini_docx(tpl, "Dear {{Client_Name}} Amount {{Call_Amount}}")
+    ev = _save_event(a, "要素导入", [
+        {"name": "甲公司", "to": "a@x.com", "open_pw": "Open123456",
+         "owner_pw": "Owner123456", "fields": {"Call_Amount": "OLD"}},
+        {"name": "乙公司", "to": "b@x.com", "open_pw": "Open223456",
+         "owner_pw": "Owner223456"},
+    ], pipeline=[{"kind": "generate", "params": {"template_path": str(tpl)}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    item = a._wb_event["pipeline"][0]
+    # 造一份「要素模板」：收件人名称 + 占位符列（与导出的格式一致）
+    import openpyxl
+    src = tmp_path / "要素.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["收件人名称", "{{Call_Amount}}", "{{Client_Name}}", "{{Due_Date}}"])
+    ws.append(["甲公司", 200000, "甲方科技", "2026-11-15"])
+    ws.append(["乙公司", 300000, "乙方科技", "2026-12-01"])
+    ws.append(["查无此人", 999, "X", "2027-01-01"])
+    wb.save(str(src))
+    fd.open_path = str(src)
+    a._wb_import_field_template(item)
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    r1 = saved["recipients"][0]
+    r2 = saved["recipients"][1]
+    assert r1["fields"]["Call_Amount"] == "200000"
+    assert r1["fields"]["Client_Name"] == "甲方科技"
+    assert r2["fields"]["Call_Amount"] == "300000"
+    assert saved["pipeline"][0]["mapping"]["{{Call_Amount}}"] == "fields.Call_Amount"
+    assert saved["pipeline"][0]["mapping"]["{{Client_Name}}"] == "fields.Client_Name"
+    msgs = [m for m in mb.calls if m[0] == "info" and "已导入" in m[1]]
+    assert msgs, "导入后应有汇总提示"
+    assert "查无此人" in msgs[-1][2], "未匹配的收件人应在提示里列出"
+
+
+def test_mailmerge_uses_inline_hint_not_help_dialog(app, tmp_path):
+    """v3.4.6：不需要「Word-MailMerge 说明」按钮/弹窗，关键信息直接显示。"""
+    a, _mb, _fd, _err = app
+    tpl = tmp_path / "t.docx"
+    _mini_docx(tpl, "{{Client_Name}}")
+    ev = _save_event(a, "内联说明", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456",
+                                      "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "generate", "params": {"template_path": str(tpl)}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    texts = [t for t, _b in _buttons(a._wb_content)]
+    assert not any("说明" in t for t in texts), "不应再有说明按钮：%s" % texts
+    assert not hasattr(a, "_show_mailmerge_help"), "说明弹窗方法应删除"
+    labels = [str(w.cget("text")) for w in _walk(a._wb_params_frame)
+              if _cls(w) == "TLabel"]
+    joined = "\n".join(labels)
+    assert "占位符写法" in joined
+    assert "转 PDF → 加水印 → 加密" in joined
+    assert "水印文字与各人打开口令在「收件人」处维护" in joined
+    assert any("导入要素模板" in t for t, _b in _buttons(a._wb_content))

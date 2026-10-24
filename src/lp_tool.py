@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.5"
+APP_VERSION = "3.4.6"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.5"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.6"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -3120,8 +3120,15 @@ class App:
             return
         iid = tree.identify_row(event.y)
         item = self._wb_item_by_id(iid) if iid else None
-        if item is not None:
-            self._wb_rename_item(item)
+        if item is None:
+            return
+        # v3.4.6：双击不再弹重命名窗口，直接选中并聚焦左侧参数区名称输入框
+        if iid:
+            tree.selection_set(iid)
+            tree.focus(iid)
+        self._wb_sel_item = item.get("id")
+        self._wb_render_params(item)
+        self.root.after_idle(self._wb_focus_item_name)
 
     def _wb_pipe_press(self, event):
         tree = getattr(self, "_wb_pipe_tree", None)
@@ -3266,31 +3273,28 @@ class App:
         self._wb_render_params(None)
 
 
-    def _wb_rename_item(self, item):
-        win = tk.Toplevel(self.root)
-        win.title("重命名条目")
-        win.grab_set()
-        ttk.Label(win, text="条目名称：").pack(anchor="w", padx=12, pady=(10, 2))
-        var = tk.StringVar(value=item.get("name") or "")
-        e = ttk.Entry(win, textvariable=var, width=36)
-        e.pack(anchor="w", padx=12)
-        e.focus_set()
-        e.select_range(0, "end")
+    def _wb_apply_item_name(self, item, name_var):
+        """v3.4.6：参数区改名字段直接生效（不再弹对话框）。"""
+        name = name_var.get().strip()
+        if not name:
+            messagebox.showwarning("改名", "条目名称不能为空")
+            return
+        if name == (item.get("name") or ""):
+            return
+        item["name"] = name
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=item.get("id"))
+        self._wb_render_params(item)
 
-        def ok():
-            name = var.get().strip()
-            if name:
-                item["name"] = name
-                self._wb_save()
-            win.destroy()
-            self._wb_fill_pipe_table(keep_sel=item.get("id"))
-            self._wb_render_params(item)
-
-        btns = ttk.Frame(win)
-        btns.pack(pady=10)
-        ttk.Button(btns, text="确定", command=ok).pack(side="left", padx=6)
-        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
-        e.bind("<Return>", lambda _e2: ok())
+    def _wb_focus_item_name(self):
+        """把焦点放到当前条目的名称输入框（双击条目行时用）。"""
+        e = getattr(self, "_wb_item_name_entry", None)
+        try:
+            if e is not None and e.winfo_exists():
+                e.focus_set()
+                e.select_range(0, "end")
+        except Exception:
+            pass
 
     # ---------- 条目参数区 ----------
 
@@ -3366,6 +3370,98 @@ class App:
             "已按模板里的 %d 个占位符生成要素模板（%d 位收件人）。\n"
             "每列填好后可作为外部数据表使用。" % (len(phs), len(recips)))
 
+    def _wb_import_field_template(self, item):
+        """导入要素模板：Excel 回填「收件人名称 + 占位符列」到收件人字段。
+
+        v3.4.6：导出要素模板之后必须能导回来。
+        规则：按「收件人名称」匹配本事件收件人；每个占位符列的值写进该收件人的
+        `fields[占位符名]`（空单元格不覆盖旧值）；模板里检测到的占位符自动映射到
+        `fields.<占位符名>`，这样「▶ 处理」/生成草稿时就能直接取到值。
+        """
+        params = item.get("params") or {}
+        path = filedialog.askopenfilename(
+            title="导入要素模板", filetypes=[("Excel", "*.xlsx"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            rows = read_spreadsheet(path)
+        except Exception as e:
+            messagebox.showerror("导入要素模板", "读取失败：\n%s" % e)
+            return
+        if not rows or len(rows) < 2:
+            messagebox.showinfo("导入要素模板", "文件里没有数据行。")
+            return
+        header = ["" if h is None else str(h).strip() for h in rows[0]]
+        name_aliases = {a.lower() for a in HEADER_ALIASES.get("name", ())}
+        name_idx = None
+        for i, h in enumerate(header):
+            if h.lower() in name_aliases:
+                name_idx = i
+                break
+        if name_idx is None:
+            name_idx = 0          # 导出的模板第一列固定是「收件人名称」
+        col_keys = {}
+        for i, h in enumerate(header):
+            if i == name_idx or not h:
+                continue
+            key = lp_v3.placeholder_key(h)
+            if key:
+                col_keys[i] = key
+        if not col_keys:
+            messagebox.showinfo("导入要素模板",
+                                "除了「收件人名称」外没有可导入的占位符列。")
+            return
+        ev = self._wb_event
+        by_name = {str(r.get("name", "")).strip(): r
+                   for r in (ev.get("recipients") or [])}
+        updated, unmatched, cells = 0, [], 0
+        filled_keys = set()
+        for row in rows[1:]:
+            name = str(row[name_idx] or "").strip() if name_idx < len(row) else ""
+            if not name or name.startswith("示例："):
+                continue
+            rec = by_name.get(name)
+            if rec is None:
+                unmatched.append(name)
+                continue
+            fields = rec.setdefault("fields", {})
+            for i, key in col_keys.items():
+                val = row[i] if i < len(row) else None
+                val = "" if val is None else str(val).strip()
+                if val == "":
+                    continue      # 空单元格不覆盖已有值
+                fields[key] = val
+                filled_keys.add(key)
+                cells += 1
+            updated += 1
+        # 模板里的占位符 → 刚导入的字段来源
+        mapped = 0
+        tpl = (params.get("template_path") or "").strip()
+        phs = []
+        if tpl and Path(tpl).exists():
+            try:
+                phs = wm.detect_placeholders(tpl)
+            except Exception:
+                phs = []
+        mapping = item.setdefault("mapping", {})
+        imported_keys = set(col_keys.values())
+        for ph in phs:
+            key = lp_v3.placeholder_key(ph)
+            # 只有真的有值的列才自动接映射；空列不覆盖用户已有/内置来源
+            if key in imported_keys and key in filled_keys:
+                mapping[ph] = "fields." + key
+                mapped += 1
+        self._wb_save()
+        self._wb_render_params(item)
+        msg = "已导入 %d 位收件人的要素（%d 个单元格）。" % (updated, cells)
+        if mapped:
+            msg += "\n已自动把 %d 个占位符接到对应字段来源。" % mapped
+        if unmatched:
+            msg += "\n\n以下收件人名称在事件里找不到（未导入）：\n" + "、".join(unmatched[:10])
+            if len(unmatched) > 10:
+                msg += "…"
+        messagebox.showinfo("要素模板已导入", msg)
+
     def _wb_export_attach_path_template(self, item):
         """导出路径模板：收件人 + 该收件人在这条附加文件条目下会取到的路径。"""
         ev = self._wb_event
@@ -3387,20 +3483,6 @@ class App:
             "手填路径条目所有人相同；按「收件人附件/字段/外部表」取值的会逐人不同。"
             % (len(rows) - 1))
 
-    def _show_mailmerge_help(self):
-        messagebox.showinfo(
-            "Word-MailMerge 说明",
-            "用 Word 做邮件合并：\n\n"
-            "1. 在 Word 模板里需要替换的位置写占位符：{{字段}} 或 ?字段?\n"
-            "   （例：{{Client_Name}}、{{金额}}、?Due_Date?）\n"
-            "2. 收件人表里的列（含自定义字段）都可以作为字段\n"
-            "3. 点「检测占位符」自动从模板提取 → 在映射表里给每个占位符选数据来源\n"
-            "4. 处理顺序固定：转 PDF → 加水印 → 加密\n\n"
-            "· 加水印：水印文字 = 每位收件人的「水印」列（在收件人处维护）\n"
-            "· 加密：打开口令 = 每位收件人的「打开口令」列（在收件人处维护）；\n"
-            "  可勾选「发送人统一密码」方便自己打开核对\n"
-            "· Word 文档的格式（字体/表格/页眉页脚）保持不变")
-
     def _wb_item_params(self, parent, item):
         kind = item.get("kind") or "generate"
         params = item.setdefault("params", {})
@@ -3413,9 +3495,12 @@ class App:
         r0.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Label(r0, text="名称：").pack(side="left")
         name_var = self._wb_keep_var(tk.StringVar(value=item.get("name") or ""))
-        ttk.Entry(r0, textvariable=name_var, width=28).pack(side="left", padx=4)
+        name_entry = ttk.Entry(r0, textvariable=name_var, width=28)
+        name_entry.pack(side="left", padx=4)
+        self._wb_item_name_entry = name_entry
+        name_entry.bind("<Return>", lambda _e: self._wb_apply_item_name(item, name_var))
         ttk.Button(r0, text="改名", width=6,
-                   command=lambda: self._wb_rename_item(item)).pack(side="left")
+                   command=lambda: self._wb_apply_item_name(item, name_var)).pack(side="left")
         ttk.Label(r0, text="   类型：%s" % ITEM_KIND_LABELS.get(kind, ""),
                   foreground="#666").pack(side="left", padx=(12, 0))
         ToolTip(r0, ITEM_KIND_DESC.get(kind, ""))
@@ -3430,14 +3515,19 @@ class App:
                        command=lambda: self._wb_pick_template(item, tpl_var)).pack(side="left")
             ttk.Button(r1, text="检测占位符", width=10,
                        command=lambda: self._wb_detect_placeholders(item)).pack(side="left", padx=4)
-            ttk.Label(box, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
-                      foreground="#888").pack(anchor="w", padx=8, pady=(2, 0))
+            # v3.4.6：不再弹「说明」窗口，关键信息直接内联在参数区
+            ttk.Label(box, justify="left", foreground="#888", wraplength=490,
+                      text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。\n"
+                           "处理顺序固定：转 PDF → 加水印 → 加密；"
+                           "水印文字与各人打开口令在「收件人」处维护。"
+                      ).pack(anchor="w", padx=8, pady=(2, 0))
             hrow = ttk.Frame(box)
-            hrow.pack(fill="x", padx=8, pady=(0, 4))
-            ttk.Button(hrow, text="Word-MailMerge 说明", width=18,
-                       command=self._show_mailmerge_help).pack(side="left", padx=(8, 0))
+            hrow.pack(fill="x", padx=8, pady=(2, 4))
             ttk.Button(hrow, text="导出要素模板", width=12,
                        command=lambda: self._wb_export_field_template(item)
+                       ).pack(side="left")
+            ttk.Button(hrow, text="导入要素模板", width=12,
+                       command=lambda: self._wb_import_field_template(item)
                        ).pack(side="left", padx=(4, 0))
             ttk.Button(hrow, text="下载示例 Word 模板", width=17,
                        command=self._wb_download_word_example).pack(side="left", padx=(4, 0))
