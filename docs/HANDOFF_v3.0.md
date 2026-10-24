@@ -1386,5 +1386,8 @@ v3.4.4~v3.4.8 的自动更新链路一直存在该问题（此前 API 限流导�
 
 ### 30.4 发布结果
 
-- commit：`待回填`；tag：`v3.5.0`；CI run：`待回填`。
-- Release：`待回填`。
+- commit：`dd28e27`；tag：`v3.5.0`（已 push）；CI run **40099432566** conclusion=**success**。
+- Release：**id=422757465**（https://github.com/fundops-notes/doc-mailer/releases/tag/v3.5.0）；
+  两资产从 Release 下载回来做 SHA256 复核，与本地构建产物**字节级一致**：
+  `doc-mailer_v3.5.0_portable.zip` 46,420,139 B sha256 `56A8F002…722BE`；
+  `doc-mailer_win64.zip` 46,836,412 B sha256 `FAF68AE5…8DC064`（内含签名 Valid 的 exe）。
