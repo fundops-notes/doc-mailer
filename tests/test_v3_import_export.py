@@ -97,12 +97,17 @@ def test_validate_unknown_column_becomes_custom_field():
     assert res["items"][0]["record"]["fields"]["Call_Amount"] == "200,000"
 
 
-def test_validate_missing_attachment_file_is_warning():
+def test_validate_attachment_path_column_is_custom_field_not_attachments():
+    """v3.4.4：导入「附件路径」列不再映射 attachments（收件人页已无该列），
+    只当作未识别列收进自定义字段，因此也不会再报「附件文件不存在」。"""
     head = ["收件人名称", "收件人", "附件路径"]
     res = lp_v3.validate_recipient_rows(
         [head, ["甲公司", "a@x.com", "C:/不存在/文件.pdf"]])
-    assert res["items"][0]["status"] == "warning"
-    assert any("不存在" in w for w in res["items"][0]["warnings"])
+    rec = res["items"][0]["record"]
+    assert rec.get("attachments") == []
+    assert rec["fields"]["附件路径"] == "C:/不存在/文件.pdf"
+    assert "附件路径" in res["unknown_cols"]
+    assert not any("不存在" in w for w in res["items"][0]["warnings"])
 
 
 def test_validate_example_placeholder_row_is_skipped():

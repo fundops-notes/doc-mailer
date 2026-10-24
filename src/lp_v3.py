@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.4.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.4.4"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -161,7 +161,10 @@ HEADER_ALIASES = {
     "to": {"收件人", "收件邮箱", "to", "邮箱", "email"},
     "cc": {"抄送", "cc"},
     "bcc": {"密送", "bcc"},
-    "files": {"附件路径", "附件", "额外附件", "attachments", "files"},
+    # v3.4.4：收件人页已不再露出「附件路径」列；导入时该列按「未识别列」
+    # 收进自定义字段（fields["附件路径"]），不再写 rec["attachments"]。
+    # 仅保留显式的英文/别名列，兼容旧数据导出文件。
+    "files": {"额外附件", "attachments", "files"},
     "subject": {"邮件标题", "标题", "主题", "subject"},
     "open_pw": {"打开口令", "打开密码", "open pw"},   # 不收"密码/口令"这种歧义列名
     "owner_pw": {"权限口令", "权限密码", "owner pw"},
@@ -294,17 +297,17 @@ DEFAULT_FILENAME_TPL = "{{原件名}}_{{LP名称}}"
 
 # 演示数据（均为虚构，邮箱用保留域名，可直接跑通全流程）
 MOCK_LPS = [
-    ["苏州启衡科技有限公司", "", "ir@qiheng-demo.cn", "fin@qiheng-demo.cn", "", "", "", "", ""],
-    ["宁波晨曦汐诺供应链股份有限公司", "", "contact@chenxi-demo.cn", "", "", "", "", "Demo-Open-88", ""],
-    ["新疆乌鲁木齐市泓远红杉智能科技有限公司", "", "admin@hongyuan-demo.cn", "ir@hongyuan-demo.cn", "audit@hongyuan-demo.cn", "", "", "", ""],
-    ["上海临港科创一期产业投资有限公司", "", "lg@chuangxin-demo.cn", "", "", "临港科创2026年度交付文件", "", "", ""],
-    ["珠海横琴粤澳深谋咨询服务有限公司", "", "gp@henqin-demo.cn", "fin@henqin-demo.cn", "", "", "", "", "Demo-Owner-66"],
-    ["北京中关军融创启信息技术有限公司", "演示专用水印", "zg@rongchuang-demo.cn", "", "", "", "", "", ""],
-    ["深圳前海深港现代服务业合作区汇金聚富实业有限公司", "", "huijin@qianhai-demo.cn", "", "", "", "", "", ""],
-    ["杭州西湖区云栖数字经济研究院", "", "yunqi@xihu-demo.cn", "ir@xihu-demo.cn", "", "", "", "", ""],
+    ["苏州启衡科技有限公司", "", "ir@qiheng-demo.cn", "fin@qiheng-demo.cn", "", "", "", ""],
+    ["宁波晨曦汐诺供应链股份有限公司", "", "contact@chenxi-demo.cn", "", "", "", "Demo-Open-88", ""],
+    ["新疆乌鲁木齐市泓远红杉智能科技有限公司", "", "admin@hongyuan-demo.cn", "ir@hongyuan-demo.cn", "audit@hongyuan-demo.cn", "", "", ""],
+    ["上海临港科创一期产业投资有限公司", "", "lg@chuangxin-demo.cn", "", "", "临港科创2026年度交付文件", "", ""],
+    ["珠海横琴粤澳深谋咨询服务有限公司", "", "gp@henqin-demo.cn", "fin@henqin-demo.cn", "", "", "", "Demo-Owner-66"],
+    ["北京中关军融创启信息技术有限公司", "演示专用水印", "zg@rongchuang-demo.cn", "", "", "", "", ""],
+    ["深圳前海深港现代服务业合作区汇金聚富实业有限公司", "", "huijin@qianhai-demo.cn", "", "", "", "", ""],
+    ["杭州西湖区云栖数字经济研究院", "", "yunqi@xihu-demo.cn", "ir@xihu-demo.cn", "", "", "", ""],
 ]
 MOCK_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密送", "邮件标题",
-                "附件路径", "打开口令", "权限口令"]
+                "打开口令", "权限口令"]
 
 # v3 默认邮件模板（与 v2 保持一致的措辞）
 DEFAULT_SUBJECT_V3 = "机密文件（{{收件人名称}} 专属）"
@@ -2163,9 +2166,8 @@ def attachment_fingerprint_warnings(event):
             if prev is None:
                 by_digest[d] = pth
             elif prev.lower() != pth.lower():
-                warns.append("[%s] %s 与 %s 内容完全相同（不同路径），"
-                             "两份都会进入这封邮件，请确认是否有意如此"
-                             % (key, Path(prev).name, Path(pth).name))
+                warns.append("[附件重复提示] %s 与 %s 内容完全相同（不同路径），"
+                             "两份都会保留，请人工确认" % (Path(prev).name, Path(pth).name))
     return warns
 
 
@@ -2908,6 +2910,17 @@ def validate_recipient_rows(rows, existing_names=None, check_files=True):
 
 EXPORT_BASE_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密送",
                        "邮件标题", "附件路径", "合并组", "打开口令", "权限口令"]
+
+
+def import_template_headers(extra=()):
+    """「收件人清单导入模板」的表头 —— 不含「附件路径」。
+
+    为什么要和导出表头分开：导出是数据备份（旧数据的 attachments 路径要留住），
+    而导入模板是发给业务方填的，v3.4.0 起收件人页已不再露出「附件路径」，
+    模板里也不该再出现；v3.4.4 起导入遇到该列也只收进自定义字段。
+    """
+    base = [h for h in EXPORT_BASE_HEADERS if h != "附件路径"]
+    return base + list(extra)
 
 
 def recipients_to_rows(recipients, include_passwords=True):

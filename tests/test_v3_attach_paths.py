@@ -58,12 +58,16 @@ def test_export_recipients_multiple_paths_joined():
 
 # ---------------------------------------------------------------- 导入
 
-def test_import_keeps_attachment_paths_column():
+def test_import_attachment_path_column_goes_to_custom_field():
+    """v3.4.4：收件人页不再露出「附件路径」；导入该列只收进自定义字段，
+    绝不写进 rec["attachments"] 主键。"""
     rows = [HEADERS, ["甲公司", "", "a@x.com", "", "", "",
                       r"C:\资料\补充说明.pdf;C:\资料\合同.pdf", "", ""]]
-    recips, _unknown, _fc = lp_v3.parse_import_rows_v3(rows)
+    recips, unknown, field_cols = lp_v3.parse_import_rows_v3(rows)
     norm = lp_v3.normalize_recipient(recips[0])
-    assert norm["attachments"] == [r"C:\资料\补充说明.pdf", r"C:\资料\合同.pdf"]
+    assert norm["attachments"] == []
+    assert "附件路径" in field_cols and "附件路径" in unknown
+    assert norm["fields"]["附件路径"] == r"C:\资料\补充说明.pdf;C:\资料\合同.pdf"
 
 
 def test_normalize_recipient_dedupes_files_and_attachments():

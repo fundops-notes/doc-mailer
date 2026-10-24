@@ -2,10 +2,11 @@
 
 > 交接文档。给接手实现的 agent / 同事。
 > **文件名沿用 `HANDOFF_v3.0.md`（历史沿革，改名会打断各处引用），内容已覆盖到 v3.2.0。**
-> 最后更新：2026-10-24（**v3.1.0 / v3.1.1 已发版；v3.2.0（P4 收尾）已实施完毕并验证通过，但尚未发版**，见 §16）
+> 最后更新：2026-10-24（**v3.4.4 已实施并本地构建/验证通过，见 §24；GitHub 网络不可达，尚未 push/发 Release**）
 >
-> **当前代码版本：`3.3.0`**（`lp_tool.py` 与 `lp_v3.py` 两处一致）。
-> 已发布：v2.2.0（旧）、v3.1.0 / v3.1.1、**v3.2.0**（P4 收尾，见 §16）、**v3.3.0**（附件哈希去重，见 §18）。
+> **当前代码版本：`3.4.4`**（`lp_tool.py` 与 `lp_v3.py` 两处一致；使用说明三处同步）。
+> 已发布：v2.2.0（旧）、v3.1.0 / v3.1.1、v3.2.0、v3.3.0、v3.3.1、v3.3.2、v3.4.0/v3.4.1、v3.4.2、v3.4.3（历史，见 §18~§23）。
+> v3.4.4 为 v3.4.3 独立验收问题的修复版；本地已构建 exe/便携包，远端 push 待网络恢复后执行。
 
 ---
 
@@ -1011,3 +1012,76 @@ Release v3.4.2（id=422627074），两资产 302，CI run 40080833442 success。
 - 全量 **208 passed**；GUI 实测组件齐备（PanedWindow 右栏确认）。
 - Release v3.4.3（id=422643200），两资产 302，CI run 40083094646 success。
 - 版本号三处同步（lp_tool/lp_v3/使用说明）。
+
+
+---
+
+## 24. v3.4.4：v3.4.3 独立验收问题修复（2026-10-24）
+
+### 24.1 触发
+
+对 v3.4.3 做独立验收（真实 GUI + 真实 Word 流水线，见项目根 `验收报告_v3.4.3.md`）发现
+5 项需求未完全达标，其中 2 项是发布级问题：
+1. **P0** 流水线页左栏（条目表+参数区）被 PanedWindow 的空左栏盖住，默认完全不可见；
+   v3.4.3 的 `pack(in_=left_col)` 只是把窗口塞进左栏的打包列表，父窗口没变，后建的 PanedWindow
+   又压在它上面。
+2. **P1** 收件人表 `values` 比 `columns` 多一个遗留的附件文本 → Tk 丢掉最后一格：
+   权限口令 `••••` 遮罩失效、整行错位、明文打开口令显示在权限口令列。
+3. **P1** 收件人导入模板/`examples/*.xlsx` 仍有「附件路径」列，导入仍写 `rec["attachments"]`。
+4. **P1** Word-MailMerge 的「导出要素模板」「下载示例 Word 模板」两个按钮未接线（后者是死代码）；
+   HANDOFF §23.2 声称已完成，实际未落盘。
+5. **P1** 「发送人统一密码」调用了不存在的 `save_data()`（AttributeError、settings 不落盘），
+   且 settings 没有传给 `event["options"]`，引擎读不到 → 勾了等于没勾。
+6. 其余 P2：流水线条目表无横向滚动条；统一附件按钮不在右栏；帮助页/使用说明残留旧文案；
+   三处重复提示文案不一致；`process_overrides` 对多文件行存「A / B」伪路径；编辑收件人会清空旧
+   `attachments`；行内编辑偶发不提交。
+
+### 24.2 修复清单（本轮实际改动）
+
+- `lp_tool.py::_wb_step_pipeline` 整体重构：PanedWindow 先建，左栏直接创建条目表（**补横向滚动条**）
+  + 参数区；右栏直接创建「📎 统一附件」（可折叠，展开时排在处理区上方）+「▶ 处理」+ 对应表。
+- `_wb_step_recipients`：删掉遗留的 `att_txt`，`vals` 与 `cols` 严格一一对应；权限口令恢复 `••••`。
+- `_recipient_dialog`：不再渲染附件路径，保存时原样保留 `rec["attachments"]`（流水线路径来源兼容旧数据）。
+- 导入模板：`lp_v3.import_template_headers()` 去掉「附件路径」；`HEADER_ALIASES["files"]` 去掉
+  「附件路径/附件」→ 导入时该列按未识别列收进 `fields["附件路径"]`，不再进 `attachments`；
+  `EXPORT_BASE_HEADERS`（导出备份）保留该列以免丢旧数据；重生成 `examples/` 两个 xlsx。
+- Word-MailMerge 参数区补「导出要素模板」（列=检测出的占位符、行=收件人、值按当前映射预填）与
+  「下载示例 Word 模板」（另存为 .docx，含 6 个占位符）；附加文件参数区补「导出路径模板」
+  （收件人 + 附件路径两列）；`_wb_download_word_example` 由死代码变为按钮接线。
+- 「发送人统一密码」：`save_data()` → `_persist_settings()`；settings 变更同时同步
+  `event["options"]["gp_owner_mode"/"gp_owner_pw"]` 并落盘；加 `StringVar.trace_add("write")`，
+  输入即保存。引擎/preflight 现在能读到 GP 口令。
+- 重复内容提示统一：预检 / 检查附件弹窗 / 运行日志三处均为 `[附件重复提示] … 请人工确认`。
+- `_wb_map_save_edits`：单文件存字符串、多文件存路径列表（不再存 `" / "` 拼接伪路径）；
+  行内编辑 `focus_force()` + `<Return>/<KP_Enter>/<FocusOut>` 三键提交。
+- 帮助页与 `docs/使用说明.txt` 按 v3.4.4 现状重写（清掉「产出粒度/生成文档/附件路径列/路径来源」旧说法），
+  `release_body.md` 更新为本版发布说明。
+- 版本号三处：`lp_tool.py` / `lp_v3.py` / `docs/使用说明.txt` → **3.4.4**。
+
+### 24.3 验证
+
+- `python -m pytest lp-doc-mailer/tests -q` → **220 passed**（原 208 + 新增 `tests/test_v3_4_4_fixes.py` 12 条；
+  新测试覆盖：列对齐/遮罩、编辑保留附件、导入模板/导入映射、左右分栏归属、横向滚动条、两个缺失按钮、
+  路径模板、GP 落盘+引擎可见、帮助页文案、重复提示文案、process_overrides 列表、版本号）。
+- `e2e_v344_verify.py`（真实 GUI + 真实 Word→PDF→水印→加密，隔离临时数据目录）→
+  **96 PASS / 0 FAIL / 15 INFO**；含 2 位收件人真实产物（口令可解、权限仅打印、水印在、
+  process_results 回填并持久化）、示例模板/要素模板导出、重复文件附件包与三处提示、导入模板校验等。
+- `sync_release.py` → [OK]（root = 绿色版 = 仓库 src，三文件哈希一致）。
+- `PyInstaller LP_Tool.spec -y` → `dist/LP_Tool.exe` **47,270,168 B = 45.08 MiB**，Authenticode **Valid**
+  （CN=LPDocMailer-Internal）；`--icon icon.ico` / 8 项 excludes 由 spec 保证。
+- `pack_portable.py` → `doc-mailer_v3.4.4_portable.zip`（2551 文件，44.26 MiB，
+  sha256 `FB46DEEA…F5FA9`），读回断言全 [OK]，zip 内源码/说明/图标哈希与根目录一致。
+- `doc-mailer_win64.zip`（44.65 MiB，sha256 `58ADAF9B…8A971`）：exe + `lp_data.example.json` + 使用说明，
+  zip 内 exe 与 dist 同哈希、签名 Valid。
+- 受限沙箱内 Word COM 无法初始化（0x800a13e9），上述 pytest/e2e/打包均在无沙箱环境执行；验收后已清理
+  全部无头 WINWORD.EXE。
+- **未发布**：GitHub 网络不可达，`git push` / Release 上传未执行；本地 commit + tag `v3.4.4` 已打。
+
+### 24.4 已知遗留（本轮未做）
+
+- 已知问题 1 不变：邮件正文/标题的占位符替换仍是 Python `str.replace`（大小写敏感，`{{LP名称}}`
+  不替换）；Word 文档链路因 `Find(MatchCase=False)` 大小写不敏感，两种写法都能替换。
+- 已知问题 2 不变：打开口令在收件人表明文显示（用户拍板不修）；权限口令已恢复 `••••`。
+- 已知问题 3 不变：`PATH_SOURCE_RECIPIENT` / `resolve_item_paths` 仍保留兼容旧数据，UI 无下拉。
+- `rec["attachments"]` 仍保留在数据模型/导出备份中，但 UI 与导入模板不再露出。
+- 远端 Release/CI 未验证（网络）；推送后需确认 tag v3.4.4 触发的 CI 绿。

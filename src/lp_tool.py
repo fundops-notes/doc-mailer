@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文档分发助手 v3.1（GUI exe）
+文档分发助手 v3.4.4（GUI exe）
+
+v3.4.4 修复（相对 v3.4.3）：
+  · 流水线页左右分栏真正落盘：左栏=条目表+参数区，右栏=统一附件+处理按钮+对应表
+  · 收件人表列值对齐（修复权限口令遮罩失效/字段错位）；编辑收件人保留旧附件数据
+  · 收件人清单导入模板去掉「附件路径」列；导入该列只收进自定义字段
+  · Word-MailMerge 参数区补「导出要素模板」「下载示例 Word 模板」；附加文件补「导出路径模板」
+  · 「发送人统一密码」修复并接入引擎；流水线条目表补横向滚动条
 
 v3.1 相对 v3.0 的结构变化：
   · 流水线从「六种步骤」重构为「两种产出条目」：
-      ① 生成文档（Word 模板 → 可选转 PDF / 加水印 / 加密）
+      ① Word-MailMerge（Word 模板 → 可选转 PDF / 加水印 / 加密）
       ② 附加文件（磁盘上已有的文件 → 可选加水印 / 加密）
     处理顺序固定（转 PDF → 加水印 → 加密），用户不用排；每条产出几份文件由条目自己的
-    「产出粒度」决定。
+    「产出颗粒度」决定。
   · 「数据来源」概念消解：来源下沉到字段级 —— 每个占位符单独选来源，并给预览值。
   · 工作台新增第 5 步「总览」：生成前逐人核对最终附件包与邮件样子。
 
@@ -56,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.3"
+APP_VERSION = "3.4.4"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.3"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.4"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -1582,6 +1589,16 @@ class App:
             return
         self._update_wm_summary()
 
+    def _persist_settings(self):
+        """只把 self.settings 落盘（不依赖「设置」页的 tk 变量）。
+
+        供流水线参数区等非设置页的开关使用（v3.4.4：统一密码勾选原来调
+        `_save_settings()`，在非设置页会因 set_outdir 等变量不存在而崩）。
+        """
+        ok, err = self.store.save_settings(self.settings)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+
     # ================= 帮助 =================
 
     def _build_help(self, parent=None):
@@ -1607,25 +1624,28 @@ class App:
             "一次分发 = 一个「事件」，整个流程就三段：\n"
             "    ① 收件人 —— 谁收、多少人、发几封（发送模式）\n"
             "    ② 文档流水线 —— 一张表，每一行 = 一个要附上的东西\n"
-            "         · 生成文档：用 Word 模板给每人生成一份内容不同的文档\n"
+            "         · Word-MailMerge：用 Word 模板给每位收件人生成内容不同的文档\n"
             "         · 附加文件：把磁盘上已有的文件放进附件包\n"
-            "         每一行还能勾选「转 PDF / 加水印 / 加密」，并单独设「产出粒度」\n"
+            "         每行可勾选「转 PDF / 加水印 / 加密」，并单独设「产出颗粒度」\n"
             "    ③ 邮件模板 —— 主题与正文，{{字段}} 按每位收件人替换\n\n"
+            "流水线页是左右分栏：\n"
+            "    左栏 = 条目表 + 选中条目的参数区\n"
+            "    右栏 = 📎 统一附件（可折叠）+「▶ 处理」按钮 + 收件人↔文件对应表\n"
+            "    「▶ 处理」按当前参数全量重跑，生成文件并回填每位收件人的产物路径\n\n"
             "每个人的附件从哪来（三处，作用不同）：\n"
-            "    · 收件人页「附件路径」列 —— 这一位专属要附的文件，\n"
-            "      导入模板里的同名列会进这里；它自动进这个人的附件包\n"
-            "    · 流水线的「附加文件」条目 —— 可以选「路径来源」：\n"
-            "      手填路径 / 收件人清单的附件路径 / 收件人字段 / 外部数据表列\n"
-            "    · 附件页 —— 事件级静态文件（全部 / 指定收件人 / 按组）\n\n"
+            "    · 流水线的 Word-MailMerge 条目 —— 每人一份、内容各异的文档\n"
+            "    · 流水线的「附加文件」条目 —— 手填路径清单，或从 Excel 导入路径（与收件人一一对应）\n"
+            "    · 统一附件 / 「附件」页 —— 所有人或指定的人收到的同一份静态文件\n\n"
             "两个「模式」别搞混：\n"
             "    发送模式（事件级）→ 决定几封邮件：每人一份 / 按组合并 / 全部合并\n"
-            "    产出粒度（条目级）→ 决定这一条产出几份文件：每人一份 / 每组合并一份 / 全员共用一份\n\n"
+            "    产出颗粒度（条目级）→ 决定这一条产出几份文件：每人一份 / 每组合并一份 / 全员共用一份\n\n"
             "操作顺序：\n"
             "1. 事件库 → 新建事件（或从「场景模板」复制一份配置）\n"
             "2. 收件人：先「下载导入模板」发给业务方填，填好导回来；\n"
             "    导入会先做数据校验，逐行列出问题，确认后才写入\n"
-            "3. 文档流水线：点「＋ 生成文档」或「＋ 附加文件」加行；\n"
-            "    单击行在下方改参数，按住行上下拖动改顺序，Ctrl/Shift 多选批量删除\n"
+            "3. 文档流水线：点「＋ Word-MailMerge」或「＋ 附加文件」加行；\n"
+            "    单击行在左侧改参数；Word-MailMerge 参数区有「说明」「导出要素模板」\n"
+            "    「下载示例 Word 模板」；按住行上下拖动改顺序，Ctrl/Shift 多选批量删除\n"
             "4. 附件：不想走流水线时，用它快捷挂载静态文件（全部 / 指定收件人 / 按组）\n"
             "5. 邮件模板：写主题与正文\n"
             "6. 总览：核对每位收件人最终收到什么、邮件长什么样\n"
@@ -1882,13 +1902,11 @@ class App:
         self._wb_rec_tree = tree
 
         for r in ev.get("recipients", []):
-            atts = [str(p) for p in (r.get("attachments") or []) if str(p).strip()]
-            # 不存在的文件在名字前加 ⚠（只标这一格，不整行标红）
-            att_txt = "；".join(
-                (Path(p).name if Path(p).exists() else "⚠ " + Path(p).name)
-                for p in atts)
+            # v3.4.4：收件人页不再露出附件路径列，values 必须与 columns 一一对应。
+            # （v3.4.0~3.4.3 这里多塞了一个 att_txt，Tk 会丢弃最后一个值
+            #  → 权限口令的 •••• 被丢掉 + 整行错位 + 明文口令外泄。）
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
-                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""), att_txt]
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", "")]
             vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
             vals += [r.get("open_pw", ""),
                      "••••" if r.get("owner_pw") else ""]
@@ -2292,15 +2310,11 @@ class App:
     # ---------- 模板下载 ----------
 
     def _wb_export_template(self):
-        """下载收件人清单导入模板（含填写说明页）。"""
-        # 表头顺序与导出的收件人清单（EXPORT_BASE_HEADERS）保持一致，
-        # 这样「导入 → 导出」能原样往返，不会少列。
-        headers = list(lp_v3.EXPORT_BASE_HEADERS) + ["Call_Amount", "Unfunded", "Due_Date"]
+        """下载收件人清单导入模板（v3.4.4：不再含「附件路径」列）。"""
+        headers = lp_v3.import_template_headers(["Call_Amount", "Unfunded", "Due_Date"])
         row = ["示例：苏州某某科技有限公司", "（留空=同收件人名称）", "a@x.com;b@x.com",
                "cc@x.com", "bcc@x.com", "（留空=用邮件模板）",
-               "C:\\Document\\补充说明.pdf（每人专属；多个用;分隔，可留空）",
-               "（留空=不合并）",
-               "（留空=自动生成）", "（留空=自动生成，勿发给LP）",
+               "（留空=不合并）", "（留空=自动生成）", "（留空=自动生成，勿发给LP）",
                "200,000", "800,000", "2026-11-15"]
         guide = [
             ["列名", "必填", "说明"],
@@ -2309,23 +2323,20 @@ class App:
             ["收件人", "是", "收件邮箱；多个用 ; 分隔（英文逗号是文件名的一部分，不做分隔）"],
             ["抄送 / 密送", "否", "邮箱；多个用 ; 分隔"],
             ["邮件标题", "否", "留空 = 用邮件模板里的主题"],
-            ["附件路径", "否", "这一位收件人专属要附的文件（本地路径，多个用 ; 分隔）；"
-                              "会自动进这个人的附件包"],
             ["打开口令", "否", "留空 = 自动生成随机口令（收件人打开文件用）"],
             ["权限口令", "否", "留空 = 自动生成（控制打印权限，绝不会进入邮件）"],
             ["合并组", "否", "仅「按组合并」发送模式生效；同组共用一封邮件、附件包合并"],
             ["其它任意列", "否", "作为自定义字段收进收件人，可在流水线的字段映射里用到"],
         ]
+        widths = [36, 20, 28, 16, 16, 22, 14, 14, 24, 14, 14, 14]
         self._write_xlsx_sheets(
             "收件人清单导入模板.xlsx",
-            [("收件人清单", [headers, row], [36, 20, 28, 16, 16, 22, 34, 14, 14, 14, 14, 14, 14]),
+            [("收件人清单", [headers, row], widths),
              ("填写说明", guide, [18, 8, 78])],
             "模板已导出",
             "把模板发给业务方填写，填完再导回来。\n"
             "表头列名即识别依据；未识别的列会作为自定义字段收进来，"
             "可在流水线里映射到 Word 占位符。\n"
-            "「附件路径」是这一位收件人专属要附的文件，"
-            "会自动进这个人的附件包。\n"
             "口令列留空会自动生成随机口令。")
 
     def _write_xlsx(self, default_name, rows, ok_title, ok_msg):
@@ -2391,10 +2402,7 @@ class App:
         for i, (label, key) in enumerate(rows):
             ttk.Label(win, text=label).grid(row=i, column=0, sticky="e", padx=6, pady=4)
             e = ttk.Entry(win, width=52, show="*" if key == "owner_pw" else "")
-            val = rec.get(key, "")
-            if key == "attachments":
-                val = ";".join(rec.get("attachments") or [])
-            e.insert(0, val)
+            e.insert(0, rec.get(key, ""))
             e.grid(row=i, column=1, padx=6, pady=4)
             entries[key] = e
         r0 = len(rows)
@@ -2421,7 +2429,9 @@ class App:
                 messagebox.showwarning("口令", "权限口令不能与打开口令相同", parent=win)
                 return
             out["wm"] = out["wm"] or out["name"]
-            out["attachments"] = split_paths(out.get("attachments", ""))
+            # v3.4.4：附件路径不再在对话框里维护，保存时原样保留旧数据
+            # （流水线「路径来源=收件人附件」仍兼容旧数据，不能在这里被清空）。
+            out["attachments"] = list(rec.get("attachments") or [])
             out["fields"] = {k: e.get().strip() for k, e in field_entries.items()}
             if on_save(out):
                 win.destroy()
@@ -2608,8 +2618,8 @@ class App:
                 if not Path(path).exists():
                     missing.append("%s：%s" % (rec.get("name", ""), path))
         fp = self._fingerprint_notice()
-        fp_text = ("\n\n【内容重复提示】同一封邮件内以下文件内容完全相同"
-                   "（不同路径），两份都会发送，请确认是否有意如此：\n"
+        fp_text = ("\n\n[附件重复提示] 同一封邮件内以下文件内容完全相同"
+                   "（不同路径），两份都会保留，请人工确认：\n"
                    + "\n".join(fp)) if fp else ""
         if not missing:
             (messagebox.showwarning if fp else messagebox.showinfo)(
@@ -2723,15 +2733,21 @@ class App:
         holder = getattr(self, "_uni_btn_holder", None)
         if uni is None or holder is None:
             return
+        anchor = getattr(self, "_uni_anchor", None)
         shown = getattr(self, "_uni_shown", False)
         if shown:
             uni.pack_forget()
-            holder.pack(fill="x", pady=(0, 4))
+            if anchor is not None:
+                holder.pack(fill="x", pady=(0, 4), before=anchor)
+            else:
+                holder.pack(fill="x", pady=(0, 4))
             self._uni_shown = False
         else:
             holder.pack_forget()
-            pw2 = uni.master
-            uni.pack(fill="x", pady=(0, 4))
+            if anchor is not None:
+                uni.pack(fill="x", pady=(0, 4), before=anchor)
+            else:
+                uni.pack(fill="x", pady=(0, 4))
             self._uni_shown = True
 
     def _wb_map_edit(self, event):
@@ -2748,29 +2764,46 @@ class App:
         e = tk.Entry(tree, width=max(10, w // 8))
         e.place(x=x, y=y, width=w, height=h)
         e.insert(0, cur)
-        e.focus_set()
+        try:
+            e.focus_force()     # v3.4.4：部分环境 focus_set 不生效 → Return 不提交
+        except Exception:
+            e.focus_set()
 
         def commit(_e=None):
-            tree.set(iid, col, e.get().strip())
-            e.destroy()
+            try:
+                tree.set(iid, col, e.get().strip())
+            finally:
+                try:
+                    e.destroy()
+                except Exception:
+                    pass
 
-        e.bind("<Return>", commit)
-        e.bind("<FocusOut>", commit)
+        for _seq in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+            e.bind(_seq, commit)
 
     def _wb_map_save_edits(self):
-        """把人工改过的路径存进事件 process_overrides（总览页实际生成优先用）。"""
+        """把人工改过的路径存进事件 process_overrides。
+
+        单文件存字符串；多文件存路径列表（不要把 " / ".join 的展示串当路径存进去）。
+        """
         tree = self._wb_map_tree
         overrides = {}
         for iid in tree.get_children():
             vals = tree.item(iid)["values"]
-            if len(vals) >= 3 and str(vals[2]).strip() and str(vals[2]) != "—":
-                overrides[str(vals[0])] = str(vals[2])
+            if len(vals) < 3:
+                continue
+            raw = str(vals[2]).strip()
+            if not raw or raw == "—":
+                continue
+            paths = [p.strip() for p in raw.split(" / ") if p.strip() and p.strip() != "—"]
+            if not paths:
+                continue
+            overrides[str(vals[0])] = paths[0] if len(paths) == 1 else paths
         self._wb_event["process_overrides"] = overrides
         self._wb_save()
         messagebox.showinfo("已保存",
                             "自定义路径已保存（%d 条）。\n"
-                            "「总览」页生成草稿时将优先使用这些路径。"
-                            % len(overrides))
+                            "「总览」页生成草稿时将优先使用这些路径。" % len(overrides))
 
     def _wb_process(self):
         """④⑤「处理」按钮：按上方条目参数全量重跑流水线（不用历史数据），
@@ -2892,7 +2925,7 @@ class App:
             "每一行 = 一个要附上的东西，只有两种：\n"
             "    ① Word-MailMerge —— 用 Word 模板给每位收件人生成内容各异的文档\n"
             "    ② 附加文件 —— 把磁盘上已有的文件放进附件包\n"
-            "单击行 → 下方参数区；按住行上下拖动 → 改顺序；Ctrl/Shift 多选 → 批量删除。"),
+            "单击行 → 左侧参数区；按住行上下拖动 → 改顺序；Ctrl/Shift 多选 → 批量删除。"),
             style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
 
         bar = ttk.Frame(parent)
@@ -2907,58 +2940,41 @@ class App:
         self._wb_pipe_count = ttk.Label(bar, foreground="#888", text="")
         self._wb_pipe_count.pack(side="left", padx=10)
 
-        # ③ 统一附件：点按钮才展开
-        self._uni_btn_holder = ttk.Frame(parent)
-        self._uni_btn_holder.pack(fill="x", pady=(0, 4))
-        ttk.Button(self._uni_btn_holder, text="统一附件（所有人收同一份文件）…",
-                   command=self._toggle_uni).pack(side="left")
-        uni = ttk.LabelFrame(parent, text=" 统一附件（所有收件人都收到的同一份文件） ",
-                             style="Card.TLabelframe")
-        self._uni_frame = uni
-        self._uni_shown = False
-        uni.pack_forget()   # 点「统一附件…」按钮展开
-        uni_row = ttk.Frame(uni)
-        uni_row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(
-            side="left", anchor="n")
-        self._wb_uni_text = tk.Text(uni_row, height=3, width=70, wrap="none")
-        self._wb_uni_text.pack(side="left", padx=4)
-        for _a in ((self._wb_event or {}).get("attachments") or []):
-            self._wb_uni_text.insert("end", str(_a.get("path") or "") + "\n")
-        uni_btns = ttk.Frame(uni_row)
-        uni_btns.pack(side="left", anchor="n", padx=4)
-        ttk.Button(uni_btns, text="添加文件…", width=12,
-                   command=self._wb_uni_add_file).pack(side="left")
-        ttk.Button(uni_btns, text="保存", width=6,
-                   command=self._wb_uni_save).pack(side="left", pady=4)
-        ttk.Label(uni, foreground="#888", wraplength=860, justify="left",
-                  text="每人专属的内容（如带各自水印/口令的 PDF）用上方流水线条目处理；"
-                       "这里只放所有人同一份的文件，会进入每位收件人的附件包。"
-                       ).pack(anchor="w", padx=8, pady=(0, 4))
+        # ④ 左右分栏：v3.4.4 起所有控件**直接建在对应栏里**。
+        # （v3.4.3 用 pack(in_=left_col) 只是把窗口塞进左栏的打包列表，父窗口
+        #  仍是 parent，PanedWindow 又后创建、z 序在上，结果左栏内容被整个盖住。）
+        pw2 = ttk.PanedWindow(parent, orient="horizontal")
+        pw2.pack(fill="both", expand=True, pady=(0, 4))
+        left_col = ttk.Frame(pw2)
+        pw2.add(left_col, weight=3)
+        right_col = ttk.Frame(pw2)
+        pw2.add(right_col, weight=2)
 
-
-
-        frame = ttk.Frame(parent)
-        frame.pack(fill="both", expand=True, pady=(0, 6))
+        # ---------- 左栏：条目表 + 参数区 ----------
+        frame = ttk.Frame(left_col)
+        frame.pack(fill="both", expand=True, pady=(0, 4))
         cols = ["no", "name", "kind", "source", "proc", "gran", "on"]
         heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "产出颗粒度", "启用"]
         tree = ttk.Treeview(frame, columns=cols, show="headings",
-                            selectmode="extended", height=8)
+                            selectmode="extended", height=6)
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
         tree.column("no", width=36, stretch=False, anchor="center")
-        tree.column("name", width=170)
+        tree.column("name", width=150)
         tree.column("kind", width=78, stretch=False)
-        tree.column("source", width=250)
-        tree.column("proc", width=108, stretch=False)
-        tree.column("gran", width=108, stretch=False)
+        tree.column("source", width=190)
+        tree.column("proc", width=96, stretch=False)
+        tree.column("gran", width=104, stretch=False)
         tree.column("on", width=44, stretch=False, anchor="center")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
+        # ⑥ v3.4.4：补上横向滚动条（列宽被窗口截断时可以拖）
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
         self._wb_pipe_tree = tree
-
+        self._wb_pipe_hsb = hsb
 
         tree.bind("<<TreeviewSelect>>", self._wb_on_pipe_select)
         tree.bind("<Double-1>", self._wb_on_pipe_double)
@@ -2966,38 +2982,53 @@ class App:
         tree.bind("<B1-Motion>", self._wb_pipe_motion)
         tree.bind("<ButtonRelease-1>", self._wb_pipe_release)
 
-        # 参数区（单独一个 frame：切换选中行时只重画这里，表格不闪）
-        self._wb_params_frame = ttk.Frame(parent)
+        self._wb_params_frame = ttk.Frame(left_col)
         self._wb_params_frame.pack(fill="both", expand=True, pady=(0, 4))
 
-        # ④⑤ 处理按钮 + 收件人↔文件对应表 —— 右半边（与左栏条目/参数并排）
-        pw2 = ttk.PanedWindow(parent, orient="horizontal")
-        pw2.pack(fill="both", expand=True, pady=(0, 4))
-        left_col = ttk.Frame(pw2)
-        pw2.add(left_col, weight=1)
-        right_col = ttk.Frame(pw2)
-        pw2.add(right_col, weight=1)
-        # 条目表 frame 与参数区改挂到左栏
-        frame.pack_forget()
-        self._wb_params_frame.pack_forget()
-        frame.pack(in_=left_col, fill="both", expand=True, pady=(0, 4))
-        self._wb_params_frame.pack(in_=left_col, fill="both", expand=True, pady=(0, 4))
+        # ---------- 右栏：统一附件（可折叠）+ 处理按钮 + 对应表 ----------
+        self._uni_btn_holder = ttk.Frame(right_col)
+        self._uni_btn_holder.pack(fill="x", pady=(0, 4))
+        ttk.Button(self._uni_btn_holder, text="📎 统一附件（所有人收同一份文件）…",
+                   command=self._toggle_uni).pack(side="left")
 
         proc = ttk.LabelFrame(right_col, text=" 处理与文件对应（收件人 → 将收到的文件） ",
                               style="Card.TLabelframe")
         proc.pack(fill="both", expand=True)
+        self._uni_anchor = proc      # 统一附件展开时排在处理区上方
+
+        uni = ttk.LabelFrame(right_col, text=" 统一附件（所有收件人都收到的同一份文件） ",
+                             style="Card.TLabelframe")
+        self._uni_frame = uni
+        self._uni_shown = False
+        uni_row = ttk.Frame(uni)
+        uni_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(side="left", anchor="n")
+        self._wb_uni_text = tk.Text(uni_row, height=3, width=40, wrap="none")
+        self._wb_uni_text.pack(side="left", padx=4)
+        for _a in ((self._wb_event or {}).get("attachments") or []):
+            self._wb_uni_text.insert("end", str(_a.get("path") or "") + "\n")
+        uni_btns = ttk.Frame(uni_row)
+        uni_btns.pack(side="left", anchor="n", padx=4)
+        ttk.Button(uni_btns, text="添加文件…", width=10,
+                   command=self._wb_uni_add_file).pack(side="left")
+        ttk.Button(uni_btns, text="保存", width=6,
+                   command=self._wb_uni_save).pack(side="left", pady=4)
+        ttk.Label(uni, foreground="#888", wraplength=560, justify="left",
+                  text="每人专属的内容（如带各自水印/口令的 PDF）用左侧流水线条目处理；"
+                       "这里只放所有人同一份的文件，会进入每位收件人的附件包。"
+                  ).pack(anchor="w", padx=8, pady=(0, 4))
+
         prow = ttk.Frame(proc)
         prow.pack(fill="x", padx=8, pady=4)
         self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
                                           command=self._wb_process)
         self._wb_process_btn.pack(side="left")
-        ttk.Label(prow, foreground="#888", wraplength=560, justify="left",
-                  text="每次点击都按当前参数全量重跑，覆盖上次结果；"
-                       "完成后在下表更新每位收件人的文件路径。"
-                       "只生成文件，Outlook 草稿在「预览与生成」步骤。"
-                       ).pack(side="left", padx=8)
-        self._wb_progress2 = ttk.Progressbar(prow, length=140, mode="determinate")
+        self._wb_progress2 = ttk.Progressbar(prow, length=110, mode="determinate")
         self._wb_progress2.pack(side="right")
+        ttk.Label(proc, foreground="#888", wraplength=520, justify="left",
+                  text="每次点击都按当前参数全量重跑，覆盖上次结果；完成后在下表更新"
+                       "每位收件人的文件路径。只生成文件，Outlook 草稿在「预览与生成」步骤。"
+                  ).pack(anchor="w", padx=8, pady=(0, 4))
 
         mframe = ttk.Frame(proc)
         mframe.pack(fill="both", expand=True, padx=8, pady=(0, 6))
@@ -3007,15 +3038,11 @@ class App:
                                           height=10, selectmode="browse")
         for c, h in zip(mcols, mheads):
             self._wb_map_tree.heading(c, text=h)
-            self._wb_map_tree.column(c,
-                                     width=150 if c == "name"
-                                     else (230 if c in ("files", "paths") else 70))
-        mvsb = ttk.Scrollbar(mframe, orient="vertical",
-                              command=self._wb_map_tree.yview)
-        mhsb = ttk.Scrollbar(mframe, orient="horizontal",
-                              command=self._wb_map_tree.xview)
-        self._wb_map_tree.configure(yscrollcommand=mvsb.set,
-                                     xscrollcommand=mhsb.set)
+            self._wb_map_tree.column(
+                c, width=130 if c == "name" else (180 if c in ("files", "paths") else 64))
+        mvsb = ttk.Scrollbar(mframe, orient="vertical", command=self._wb_map_tree.yview)
+        mhsb = ttk.Scrollbar(mframe, orient="horizontal", command=self._wb_map_tree.xview)
+        self._wb_map_tree.configure(yscrollcommand=mvsb.set, xscrollcommand=mhsb.set)
         self._wb_map_tree.grid(row=0, column=0, sticky="nsew")
         mvsb.grid(row=0, column=1, sticky="ns")
         mhsb.grid(row=1, column=0, sticky="ew")
@@ -3027,10 +3054,10 @@ class App:
         ttk.Button(save_row, text="保存自定义编辑",
                    command=self._wb_map_save_edits).pack(side="left")
         ttk.Label(save_row, foreground="#888",
-                  text="双击「文件路径」可手动改；保存后「总览」页实际草稿生成优先使用。"
+                  text="双击「文件路径」可手动改；保存后写入事件 process_overrides。"
                   ).pack(side="left", padx=8)
-        self._wb_render_mapping_table()
 
+        self._wb_render_mapping_table()
         self._wb_fill_pipe_table()
         if not self._wb_pipeline_items():
             ttk.Label(self._wb_params_frame,
@@ -3267,13 +3294,16 @@ class App:
     # ---------- 条目参数区 ----------
 
     def _wb_download_word_example(self):
-        """生成并保存示例 Word 模板（含占位符），供测试 MailMerge。"""
-        outdir = filedialog.askdirectory(title="选择保存示例模板的目录")
-        if not outdir:
+        """生成并保存示例 Word 模板（含 6 个占位符），供 MailMerge 实测。"""
+        path = filedialog.asksaveasfilename(
+            title="保存示例 Word 模板", defaultextension=".docx",
+            initialfile="示例通知模板.docx",
+            filetypes=[("Word 文档", "*.docx")])
+        if not path:
             return
         try:
             wbatch = lp_v3.default_word_batch()
-            tpl = Path(outdir) / "示例通知模板.docx"
+            tpl = Path(path)
             wbatch.create_docx(str(tpl),
                                "Capital Call Notice\n\n"
                                "Dear {{Client_Name}},\n\n"
@@ -3291,6 +3321,70 @@ class App:
                 "点「检测占位符」→ 点「导出要素模板」填好值 → 处理。" % tpl)
         except Exception as e:
             messagebox.showerror("生成失败", str(e))
+
+    def _wb_field_value_for(self, item, rec, ph):
+        """按条目的字段映射（缺省时用自动猜测）算出某个占位符在某人身上的值。"""
+        ev = self._wb_event
+        mapping = item.get("mapping") or {}
+        eff = dict(mapping)
+        if ph not in eff:
+            src = lp_v3.auto_map_placeholder(ph, ev, rec)
+            if src:
+                eff[ph] = src
+        fmap = lp_v3.build_field_map(rec, ev)
+        lp_v3.apply_mapping_overrides(fmap, eff, rec, ev)
+        return str(fmap.get(ph, "") or "")
+
+    def _wb_export_field_template(self, item):
+        """导出要素模板：列 = 模板里的占位符，行 = 本事件收件人（值按当前映射预填）。"""
+        params = item.get("params") or {}
+        tpl = (params.get("template_path") or "").strip()
+        if not tpl or not Path(tpl).exists():
+            messagebox.showwarning("导出要素模板", "请先为这个条目选择有效的 .docx 模板")
+            return
+        try:
+            phs = wm.detect_placeholders(tpl)
+        except Exception as e:
+            messagebox.showerror("导出要素模板", "读取模板占位符失败：\n%s" % e)
+            return
+        if not phs:
+            messagebox.showinfo("导出要素模板",
+                                "模板里没有检测到占位符。\n支持两种写法：{{字段}} 或 ?字段?")
+            return
+        ev = self._wb_event
+        recips = ev.get("recipients") or []
+        rows = [["收件人名称"] + list(phs)]
+        for rec in recips:
+            rows.append([rec.get("name", "")] +
+                        [self._wb_field_value_for(item, rec, ph) for ph in phs])
+        widths = [30] + [18] * len(phs)
+        self._write_xlsx_sheets(
+            "要素模板_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 30),
+            [("要素模板", rows, widths)],
+            "要素模板已导出",
+            "已按模板里的 %d 个占位符生成要素模板（%d 位收件人）。\n"
+            "每列填好后可作为外部数据表使用。" % (len(phs), len(recips)))
+
+    def _wb_export_attach_path_template(self, item):
+        """导出路径模板：收件人 + 该收件人在这条附加文件条目下会取到的路径。"""
+        ev = self._wb_event
+        rows = [["收件人名称", "附件路径"]]
+        for rec in ev.get("recipients") or []:
+            unit = {"rep": rec, "recipients": [rec],
+                    "lp_name": rec.get("name", ""), "group_key": rec.get("name", ""),
+                    "group": (rec.get("group") or "").strip()}
+            try:
+                paths, _label = lp_v3.resolve_item_paths(item, unit, ev)
+            except Exception:
+                paths = []
+            rows.append([rec.get("name", ""), ";".join(str(p) for p in paths)])
+        self._write_xlsx_sheets(
+            "附件路径模板_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 30),
+            [("附件路径", rows, [30, 80])],
+            "路径模板已导出",
+            "已导出 %d 位收件人的附件路径。\n"
+            "手填路径条目所有人相同；按「收件人附件/字段/外部表」取值的会逐人不同。"
+            % (len(rows) - 1))
 
     def _show_mailmerge_help(self):
         messagebox.showinfo(
@@ -3340,7 +3434,12 @@ class App:
             ttk.Label(hrow, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
                       foreground="#888").pack(side="left")
             ttk.Button(hrow, text="Word-MailMerge 说明", width=18,
-                       command=self._show_mailmerge_help).pack(side="left", padx=8)
+                       command=self._show_mailmerge_help).pack(side="left", padx=(8, 0))
+            ttk.Button(hrow, text="导出要素模板", width=12,
+                       command=lambda: self._wb_export_field_template(item)
+                       ).pack(side="left", padx=(4, 0))
+            ttk.Button(hrow, text="下载示例 Word 模板", width=17,
+                       command=self._wb_download_word_example).pack(side="left", padx=(4, 0))
         else:
 
             r1 = ttk.Frame(box)
@@ -3361,6 +3460,9 @@ class App:
             b_save = ttk.Button(btns, text="保存", width=6,
                                 command=lambda: self._wb_save_attach_files(item, files_text))
             b_save.pack(side="left")
+            b_tpl = ttk.Button(btns, text="导出路径模板", width=12,
+                               command=lambda: self._wb_export_attach_path_template(item))
+            b_tpl.pack(side="left", pady=4)
             ttk.Label(box, text=(
                 "每行一个文件路径。从 Excel 导入时路径与收件人一一对应；"
                 "所有人同一份文件用「统一附件」按钮设置。"
@@ -3395,15 +3497,29 @@ class App:
         if params.get("encrypt"):
             r_gp = ttk.Frame(box)
             r_gp.pack(fill="x", padx=8, pady=(0, 4))
-            gp_mode_var = self._wb_keep_var(
-                tk.BooleanVar(value=bool(self.settings.get("gp_owner_mode"))))
-            gp_pw_var = self._wb_keep_var(
-                tk.StringVar(value=self.settings.get("gp_owner_pw", "")))
+            _ev_opts = (self._wb_event or {}).get("options") or {}
+            gp_mode_var = self._wb_keep_var(tk.BooleanVar(
+                value=bool(_ev_opts.get("gp_owner_mode",
+                                        self.settings.get("gp_owner_mode")))))
+            gp_pw_var = self._wb_keep_var(tk.StringVar(
+                value=_ev_opts.get("gp_owner_pw", self.settings.get("gp_owner_pw", ""))))
 
             def _gp_changed(mode_v=gp_mode_var, pw_v=gp_pw_var):
-                self.settings["gp_owner_mode"] = bool(mode_v.get())
-                self.settings["gp_owner_pw"] = pw_v.get().strip()
-                self.save_data()
+                mode = bool(mode_v.get())
+                pw = pw_v.get().strip()
+                self.settings["gp_owner_mode"] = mode
+                self.settings["gp_owner_pw"] = pw
+                self._persist_settings()        # v3.4.4：原为不存在的 save_data()
+                # 引擎/预检只读 event["options"]，这里必须同步过去，否则勾了等于没勾
+                ev = self._wb_event
+                if ev is not None:
+                    eopts = ev.setdefault("options", {})
+                    eopts["gp_owner_mode"] = mode
+                    eopts["gp_owner_pw"] = pw
+                    self._wb_save()
+
+            # v3.4.4：输入口令时 StringVar 一变化就保存（真实键入 / 测试都可靠）
+            gp_pw_var.trace_add("write", lambda *_a: _gp_changed())
 
             ttk.Checkbutton(r_gp, text="发送人统一密码（所有文件用同一口令打开，"
                                       "方便发送人核对；收件人仍用各自口令）",
@@ -3411,7 +3527,8 @@ class App:
                             command=_gp_changed).pack(side="left")
             e_gp = ttk.Entry(r_gp, textvariable=gp_pw_var, width=20, show="*")
             e_gp.pack(side="left", padx=6)
-            e_gp.bind("<KeyRelease>", lambda _e: _gp_changed())
+            for _seq in ("<KeyRelease>", "<Return>", "<FocusOut>"):
+                e_gp.bind(_seq, lambda _e: _gp_changed())
             ToolTip(e_gp, "统一打开口令（收件人口令之外，发送人自己核对用）。"
                           "不能与任何收件人的打开口令相同。留空则生成时自动创建。")
 
@@ -3958,7 +4075,7 @@ class App:
         ttk.Label(parent, text="附件（快捷挂载）", style="Head.TLabel").pack(anchor="w")
         ttk.Label(parent, text=(
             "不想走流水线时的快捷入口：直接把磁盘上的文件挂给收件人。\n"
-            "（要每人一份的内容，请用「文档流水线」里的「生成文档」条目）\n"
+            "（要每人一份的内容，请用「文档流水线」里的「Word-MailMerge」条目）\n"
             "静态文件按范围分配：全部收件人 / 指定收件人 / 按合并组。"),
             style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
 
@@ -4031,8 +4148,8 @@ class App:
                    if not (a.get("path") and Path(a["path"]).exists())]
         total = len(self._wb_event.get("attachments", []))
         fp = self._fingerprint_notice()
-        fp_text = ("\n\n【内容重复提示】同一封邮件内以下文件内容完全相同"
-                   "（不同路径），两份都会发送，请确认是否有意如此：\n"
+        fp_text = ("\n\n[附件重复提示] 同一封邮件内以下文件内容完全相同"
+                   "（不同路径），两份都会保留，请人工确认：\n"
                    + "\n".join(fp)) if fp else ""
         if not missing:
             (messagebox.showwarning if fp else messagebox.showinfo)(
