@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_347():
-    assert lp_tool.APP_VERSION == "3.4.7"
-    assert lp_v3.APP_VERSION == "3.4.7"
+def test_version_is_348():
+    assert lp_tool.APP_VERSION == "3.4.8"
+    assert lp_v3.APP_VERSION == "3.4.8"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -628,3 +628,51 @@ def test_ver_tuple_is_static_and_show_update_works(app):
     a._show_update(info, False)     # 不应抛异常
     hits = [m for m in mb.calls if m[1] == "检查更新"]
     assert hits and "已是最新版本" in hits[-1][2]
+
+def test_mapping_dialog_lists_all_placeholders_and_preselects_row(app, tmp_path):
+    """回归：映射弹窗的占位符下拉曾漏传 values（只显示第一个），且双击哪行都编辑第一个。"""
+    a, _mb, _fd, _err = app
+    tpl = tmp_path / "t.docx"
+    _mini_docx(tpl, "{{Client_Name}} {{Call_Amount}} {{Due_Date}}")
+    ev = _save_event(a, "映射弹窗", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456",
+                                      "fields": {"Call_Amount": "100"}}],
+                     pipeline=[{"kind": "generate", "params": {"template_path": str(tpl)}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    item = a._wb_event["pipeline"][0]
+    item["mapping"] = {"{{Client_Name}}": "name",
+                       "{{Call_Amount}}": "fields.Call_Amount",
+                       "{{Due_Date}}": "date"}
+    a._wb_render_params(item)
+    a.root.update()
+    # 指定第二个占位符打开弹窗（模拟双击第二行）
+    a._wb_edit_mapping(item, "{{Call_Amount}}")
+    a.root.update()
+    dlg = _find_toplevel(a.root, "占位符来源")
+    assert dlg is not None
+    boxes = [w for w in _walk(dlg) if _cls(w) == "TCombobox"]
+    assert len(boxes) == 2
+    ph_box, src_box = boxes
+    values = list(ph_box.cget("values"))
+    assert set(values) == set(item["mapping"].keys()), values
+    assert len(values) == 3
+    assert ph_box.get() == "{{Call_Amount}}", "应按双击行预选对应占位符"
+    assert "收件人字段：Call_Amount" in src_box.get()
+    # 切换到第三个占位符 → 来源下拉要联动
+    ph_box.set("{{Due_Date}}")
+    ph_box.event_generate("<<ComboboxSelected>>")
+    a.root.update()
+    assert "日期" in src_box.get(), "切换占位符后来源下拉应跟着刷新，实际=%r" % src_box.get()
+    # 选一个来源并确定
+    want = [v for v in src_box.cget("values") if "收件人字段：Call_Amount" in v][0]
+    src_box.set(want)
+    for t, b in _buttons(dlg):
+        if t == "确定":
+            b.invoke()
+            break
+    a.root.update()
+    assert item["mapping"]["{{Due_Date}}"] == "fields.Call_Amount"
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["pipeline"][0]["mapping"]["{{Due_Date}}"] == "fields.Call_Amount"

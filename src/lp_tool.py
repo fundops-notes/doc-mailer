@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.7"
+APP_VERSION = "3.4.8"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.7"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.8"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -3733,13 +3733,15 @@ class App:
         thsb.grid(row=1, column=0, sticky="ew")
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
-        tree.bind("<Double-1>", lambda e, it=item: self._wb_edit_mapping(it))
         self._wb_map_iids = {}
         for i, (ph, src, val) in enumerate(rows):
             iid = "m%d" % i
             self._wb_map_iids[iid] = ph
             tree.insert("", "end", iid=iid,
                         values=(ph, self._wb_src_label(src, opts), val))
+        # v3.4.8：双击哪一行就编辑哪个占位符（原来永远传 item、弹窗固定第一个）
+        tree.bind("<Double-1>", lambda e, it=item: self._wb_edit_mapping(
+            it, (getattr(self, "_wb_map_iids", None) or {}).get(tree.identify_row(e.y))))
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=8, pady=(0, 4))
@@ -3814,7 +3816,14 @@ class App:
         self._wb_save()
         self._wb_render_params(item)
 
-    def _wb_edit_mapping(self, item):
+    def _wb_edit_mapping(self, item, initial_ph=None):
+        """占位符来源弹窗。
+
+        v3.4.8 修复：
+          · 占位符下拉必须带 values（原来没传 → 只能看到第一个/无法选其他）；
+          · 切换占位符时，来源下拉要跟着刷新成该占位符当前的映射；
+          · 双击映射表哪一行，就预选那一行的占位符（原来永远第一个）。
+        """
         ev = self._wb_event
         recips = ev.get("recipients") or []
         rec0 = recips[0] if recips else {}
@@ -3824,22 +3833,35 @@ class App:
         opts = self._wb_field_source_options(item, rec0)
         src_keys = [k for k, _c, _l in opts]
         src_labels = ["%s：%s" % (c, l) for _k, c, l in opts]
+        ph_list = list(mapping.keys())
+        initial = initial_ph if initial_ph in mapping else ph_list[0]
 
         win = tk.Toplevel(self.root)
         win.title("占位符来源")
         win.grab_set()
         ttk.Label(win, text="选择占位符，再选它的数据来源：", justify="left").pack(
             anchor="w", padx=12, pady=(10, 4))
-        ph_var = tk.StringVar(value=list(mapping.keys())[0])
-        ph_box = ttk.Combobox(win, textvariable=ph_var, state="readonly", width=40)
+        ph_var = tk.StringVar(value=initial)
+        ph_box = ttk.Combobox(win, textvariable=ph_var, state="readonly", width=40,
+                              values=ph_list)
         ph_box.pack(anchor="w", padx=12)
         ttk.Label(win, text="来源：", justify="left").pack(anchor="w", padx=12, pady=(10, 4))
-        cur = mapping.get(ph_var.get(), "")
-        idx = src_keys.index(cur) if cur in src_keys else 0
-        src_var = tk.StringVar(value=src_labels[idx] if src_labels else "")
+        src_var = tk.StringVar(value="")
         src_box = ttk.Combobox(win, textvariable=src_var, state="readonly", width=40,
                                values=src_labels)
         src_box.pack(anchor="w", padx=12)
+
+        def _src_label_of(ph):
+            cur = mapping.get(ph, "")
+            idx = src_keys.index(cur) if cur in src_keys else 0
+            return src_labels[idx] if src_labels else ""
+
+        def _sync_source(_evt=None):
+            src_var.set(_src_label_of(ph_var.get()))
+
+        ph_box.bind("<<ComboboxSelected>>", _sync_source)
+        _sync_source()
+
         ttk.Label(win, foreground="#666", justify="left", wraplength=430, text=(
             "· 收件人名称 / 水印名称 / 打开口令 / 日期 —— 内置\n"
             "· 收件人字段 —— 收件人表里你自己加的列（可临时加列）\n"
