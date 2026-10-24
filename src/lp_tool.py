@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.7.1"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -1090,6 +1090,8 @@ class App:
                 ("新增", self._pool_new, "在收件人库里新增一条"),
                 ("编辑", self._pool_edit, "编辑选中的收件人"),
                 ("标签…", self._pool_tags, "给选中收件人批量加/移除标签"),
+                ("清理库内字段", self._pool_clean_fields,
+                 "删除收件人库里历史遗留的自定义字段（字段属于事件，不应存在库里）"),
                 ("删除", self._pool_delete, "从库里删除选中的收件人"),
                 ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
                 ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
@@ -1127,15 +1129,10 @@ class App:
         if tree is None:
             return
         pool = self.store.list_pool()
-        fcols = []
-        for r in pool:
-            for k in (r.get("fields") or {}):
-                if k not in fcols:
-                    fcols.append(k)
-        cols = ["name", "to", "cc", "bcc", "wm", "group", "tags"] + \
-            ["f%d" % i for i in range(len(fcols))] + ["open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "标签"] + fcols + \
-            ["打开口令", "权限口令(勿发)"]
+        cols = ["name", "to", "cc", "bcc", "wm", "group", "tags",
+                "open_pw", "owner_pw"]
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "标签",
+                 "打开口令", "权限口令(勿发)"]
         tree.delete(*tree.get_children())
         self._pool_iids = {}
         try:
@@ -1152,10 +1149,9 @@ class App:
         for i, r in enumerate(pool):
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
                     r.get("bcc", ""), r.get("wm", ""), r.get("group", ""),
-                    "、".join(r.get("tags") or [])]
-            vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
-            vals += [r.get("open_pw", ""),
-                     "••••" if r.get("owner_pw") else ""]
+                    "、".join(r.get("tags") or []),
+                    r.get("open_pw", ""),
+                    "••••" if r.get("owner_pw") else ""]
             iid = "p%d" % i
             self._pool_iids[iid] = r.get("id", "")
             tree.insert("", "end", iid=iid, values=vals)
@@ -1184,15 +1180,11 @@ class App:
 
         self._recipient_dialog(rec, self._pool_field_cols(),
                                "新增收件人（收件人库）", save,
-                               "（库里还没有自定义字段列）")
+                               "（收件人库不保存自定义字段；字段在事件里维护）")
 
     def _pool_field_cols(self):
-        cols = []
-        for r in self.store.list_pool():
-            for k in (r.get("fields") or {}):
-                if k not in cols:
-                    cols.append(k)
-        return cols
+        """v3.7.1：收件人库不保存/显示自定义字段（字段属于事件，避免跨事件累积）。"""
+        return []
 
     def _pool_edit(self):
         tree = getattr(self, "_pool_tree", None)
@@ -1220,7 +1212,7 @@ class App:
 
         self._recipient_dialog(rec, self._pool_field_cols(),
                                "编辑收件人（收件人库）", save,
-                               "（库里还没有自定义字段列）")
+                               "（收件人库不保存自定义字段；字段在事件里维护）")
 
     def _pool_tags(self):
         ids = self._pool_selected()
@@ -1332,6 +1324,29 @@ class App:
             side="left", padx=6)
         ttk.Button(btns, text="关闭", command=win.destroy).pack(side="left", padx=6)
 
+    def _pool_clean_fields(self):
+        """清除收件人库里历史遗留的自定义字段（字段属于事件，不应在库中累积）。"""
+        pool = self.store.list_pool()
+        affected = [r for r in pool if r.get("fields")]
+        if not affected:
+            messagebox.showinfo("清理库内字段", "收件人库里没有自定义字段，无需清理。")
+            return
+        if not messagebox.askyesno(
+                "清理库内字段",
+                "收件人库有 %d 位带自定义字段（历史遗留）。\n\n"
+                "这些字段是事件数据，不属于收件人本身；清理只动收件人库，\n"
+                "不会影响任何事件。确定清理？" % len(affected)):
+            return
+        for rec in affected:
+            rec2 = dict(rec)
+            rec2["fields"] = {}
+            ok, err, _saved = self.store.save_pool_recipient(rec2)
+            if not ok:
+                messagebox.showerror("清理失败", err)
+                return
+        self._refresh_pool_tab()
+        messagebox.showinfo("清理库内字段", "已清理 %d 位收件人的历史字段。" % len(affected))
+
     def _pool_delete(self):
         ids = self._pool_selected()
         if not ids:
@@ -1400,6 +1415,7 @@ class App:
         for rec in recips:
             src = dict(rec)
             src.pop("id", None)
+            src["fields"] = {}      # v3.7.1：事件字段不进入收件人库
             pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, src)
             if new_rec is not None:
                 ok, err, _saved = self.store.save_pool_recipient(new_rec)
@@ -1469,7 +1485,8 @@ class App:
         for item in result.get("items") or []:
             if action == "ok_only" and item.get("status") == "error":
                 continue
-            rec = item.get("record") or {}
+            rec = dict(item.get("record") or {})
+            rec["fields"] = {}      # v3.7.1：库不保存事件自定义字段
             if not rec.get("name"):
                 continue
             pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, rec)
@@ -1773,7 +1790,9 @@ class App:
             "收件人库：\n"
             "    · 可给收件人打标签；「标签…」支持批量添加、批量移除共有标签；\n"
             "    · 只属于部分收件人的特异标签不会被批量移除；\n"
-            "    · 「从事件导入…」收进库后会提示给这批收件人打标签。\n\n"
+            "    · 「从事件导入…」收进库后会提示给这批收件人打标签；\n"
+            "    · 自定义字段只属于事件，收件人库不保存/显示字段；\n"
+            "      旧库可用「清理库内字段」清掉历史字段。\n\n"
             "输出目录：\n"
             "    以「设置 → 默认输出目录」为准；未设置时用程序所在文件夹。\n"
             "    处理与生成草稿都用同一个目录，事件里不再单独保存输出路径。\n\n"
@@ -2040,6 +2059,8 @@ class App:
             ("添加自定义字段列", self._wb_add_field_column,
              "给收件人表加一个自定义字段列（Call_Amount / Unfunded 这类），\n"
              "之后在编辑对话框里给每位收件人填值。"),
+            ("删除字段列", self._wb_del_field_column,
+             "从当前事件所有收件人里删除一个自定义字段列（同时去掉指向它的映射）。"),
             ("套用字段模板", self._wb_apply_field_template,
              "用设置里预定义的字段模板（如「催缴场景字段」）一次性铺开多列。"),
             ("检查附件", self._wb_check_attachments, "检查收件人专属附件文件是否存在。"),
@@ -2713,6 +2734,7 @@ class App:
         for rec in recips:
             src = dict(rec)
             src.pop("id", None)
+            src["fields"] = {}      # v3.7.1：事件字段不进入收件人库
             pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, src)
             if new_rec is not None:
                 ok, err, _saved = self.store.save_pool_recipient(new_rec)
@@ -2724,7 +2746,8 @@ class App:
                 updated += 1
         self._refresh_pool_tab()
         messagebox.showinfo("已存入收件人库",
-                            "新增 %d 位，按名称合并 %d 位（库里已有的口令保留）。"
+                            "新增 %d 位，按名称合并 %d 位（库里已有的口令保留）。\n"
+                            "自定义字段属于事件数据，未存入收件人库。"
                             % (added, updated))
 
     def _wb_delete_recipients(self):
@@ -2741,6 +2764,37 @@ class App:
                 del ev["recipients"][i]
             self._wb_save()
             self._wb_show_step(self._wb_step)
+
+    def _wb_del_field_column(self):
+        ev = self._wb_event
+        fcols = self._wb_field_columns()
+        if not fcols:
+            messagebox.showinfo("删除字段列", "当前事件没有自定义字段列。")
+            return
+        pick = simpledialog.askstring(
+            "删除字段列",
+            "当前字段：\n  %s\n\n要删除哪个字段列？\n"
+            "（会从本事件所有收件人里删除，并移除以它为来源的字段映射）"
+            % "、".join(fcols), initialvalue=fcols[0])
+        if not pick or pick.strip() not in fcols:
+            return
+        name = pick.strip()
+        if not messagebox.askyesno(
+                "删除字段列",
+                "确认删除当前事件的字段列「%s」？\n\n"
+                "只影响当前事件，不会影响收件人库。" % name):
+            return
+        for r in ev.get("recipients") or []:
+            (r.get("fields") or {}).pop(name, None)
+        src_key = "fields." + name
+        for it in ev.get("pipeline") or []:
+            mp = it.get("mapping") or {}
+            for ph in [k for k, v in mp.items() if v == src_key]:
+                mp.pop(ph, None)
+        self._wb_save()
+        self._wb_show_step(self._wb_step)
+        messagebox.showinfo("删除字段列",
+                            "已删除字段「%s」及其映射。" % name)
 
     def _wb_add_field_column(self):
         name = simpledialog.askstring("添加自定义字段列",

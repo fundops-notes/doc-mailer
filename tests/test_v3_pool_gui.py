@@ -175,10 +175,45 @@ def test_pool_tab_masks_owner_password(app):
     assert found, "测试插入的甲公司应在列表里"
 
 
-def test_pool_field_columns_collected_from_all_records(app):
+def test_pool_does_not_collect_event_fields(app):
+    """v3.7.1：自定义字段属于事件，收件人库不再收集/显示历史字段。"""
     _pool_rec(app, "甲公司", fields={"Call_Amount": "200,000"})
     _pool_rec(app, "乙公司", fields={"Call_Amount": "1", "Due_Date": "2026-11-15"})
-    assert app._pool_field_cols() == ["Call_Amount", "Due_Date"]
+    assert app._pool_field_cols() == []
+    app.show_screen("home")
+    app._refresh_pool_tab()
+    heads = [str(app._pool_tree.heading(c)["text"]) for c in app._pool_tree["columns"]]
+    assert "Call_Amount" not in heads and "Due_Date" not in heads
+
+
+def test_pool_clean_fields_removes_legacy_fields(app):
+    _pool_rec(app, "甲公司", fields={"Call_Amount": "200,000"})
+    app.show_screen("home")
+    app._refresh_pool_tab()
+    app._pool_clean_fields()
+    app.root.update()
+    assert all(not r.get("fields") for r in app.store.list_pool())
+
+
+def test_add_event_field_then_delete_column(app):
+    ev = _event(app, "字段事件", [{"name": "甲公司", "to": "a@x.com",
+                                   "open_pw": "op1", "owner_pw": "ow1"}])
+    app.open_event(ev["id"])
+    app._wb_show_step(0)
+    app.root.update()
+    # 直接加字段（跳过 simpledialog 交互）
+    app._wb_event["recipients"][0].setdefault("fields", {})["Call_Amount"] = "200,000"
+    app._wb_save()
+    assert "Call_Amount" in app._wb_field_columns()
+    # 删除字段列：用 stub 回答 simpledialog
+    old = lp_tool.simpledialog.askstring
+    lp_tool.simpledialog.askstring = lambda *a, **k: "Call_Amount"
+    try:
+        app._wb_del_field_column()
+    finally:
+        lp_tool.simpledialog.askstring = old
+    app.root.update()
+    assert "Call_Amount" not in app._wb_field_columns()
 
 
 def test_pool_from_event_pulls_recipients_into_pool(app):

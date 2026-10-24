@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_370():
-    assert lp_tool.APP_VERSION == "3.7.0"
-    assert lp_v3.APP_VERSION == "3.7.0"
+def test_version_is_371():
+    assert lp_tool.APP_VERSION == "3.7.1"
+    assert lp_v3.APP_VERSION == "3.7.1"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
