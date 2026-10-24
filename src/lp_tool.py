@@ -986,12 +986,8 @@ class App:
             except Exception:
                 pass
         for i, r in enumerate(pool):
-            atts = [str(p) for p in (r.get("attachments") or []) if str(p).strip()]
-            att_txt = "；".join(
-                (Path(p).name if Path(p).exists() else "⚠ " + Path(p).name)
-                for p in atts)
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
-                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""), att_txt]
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", "")]
             vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
             vals += [r.get("open_pw", ""),
                      "••••" if r.get("owner_pw") else ""]

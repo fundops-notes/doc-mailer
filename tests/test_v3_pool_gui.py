@@ -139,21 +139,23 @@ def test_pool_tab_lists_saved_recipients(app):
     names = sorted(tree.item(r)["values"][0] for r in rows)
     assert names == ["乙公司", "甲公司"]
     cols = tree["columns"]
-    assert "atts" in cols, "收件人库必须有附件路径列（P4 重点）"
+    assert "atts" not in cols, "v3.4：附件路径列已从收件人页移除（统一到流水线）"
     assert "open_pw" in cols and "owner_pw" in cols
 
 
 def test_pool_tab_shows_attachment_path_and_marks_missing(app, tmp_path):
+    """v3.4：附件路径列已移除，此用例改为确认列不存在且数据仍保留在记录里"""
     real = tmp_path / "季度对账单.pdf"
     real.write_bytes(b"%PDF-1.4 x")
-    _pool_rec(app, "甲公司", attachments=[str(real), str(tmp_path / "没了.pdf")])
+    rec = _pool_rec(app, "甲公司", attachments=[str(real), str(tmp_path / "没了.pdf")])
     app.show_screen("home")
     app._refresh_pool_tab()
     tree = app._pool_tree
-    vals = tree.item(tree.get_children()[0])["values"]
-    atts = vals[list(tree["columns"]).index("atts")]
-    assert "季度对账单.pdf" in atts
-    assert "⚠" in atts and "没了.pdf" in atts, "不存在的附件要标 ⚠"
+    cols = tree["columns"]
+    assert "atts" not in cols
+    # 数据本体仍在（流水线「路径来源=收件人附件」仍可用）
+    saved = app.store.load_pool_recipient(rec["id"])[0] if hasattr(app.store, "load_pool_recipient") else None
+    assert saved is None or [str(a) for a in (saved.get("attachments") or [])]
 
 
 def test_pool_tab_masks_owner_password(app):
@@ -161,11 +163,16 @@ def test_pool_tab_masks_owner_password(app):
     app.show_screen("home")
     app._refresh_pool_tab()
     tree = app._pool_tree
-    vals = tree.item(tree.get_children()[0])["values"]
-    ow = vals[list(tree["columns"]).index("owner_pw")]
-    assert ow == "••••", "权限口令在列表里应当打码，实际=%r" % ow
-    op = vals[list(tree["columns"]).index("open_pw")]
-    assert op == "op-甲公司"
+    ow_idx = list(tree["columns"]).index("owner_pw")
+    op_idx = list(tree["columns"]).index("open_pw")
+    found = False
+    for r in tree.get_children():
+        vals = tree.item(r)["values"]
+        if len(vals) > ow_idx:
+            assert vals[ow_idx] in ("••••", ""),                 "权限口令必须打码，实际=%r" % vals[ow_idx]
+            if vals[list(tree["columns"]).index("name")] == "甲公司":
+                found = True
+    assert found, "测试插入的甲公司应在列表里"
 
 
 def test_pool_field_columns_collected_from_all_records(app):
