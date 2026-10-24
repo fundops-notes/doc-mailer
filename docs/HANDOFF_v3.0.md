@@ -1279,5 +1279,8 @@ HEAD/GET 均 200（跟随 302 到 `/releases/tag/vX.Y.Z`，约 0.3~1s）——
 
 ### 28.5 发布结果
 
-- commit：`待回填`；tag：`v3.4.8`；CI run：`待回填`。
-- Release：`待回填`。
+- commit：`64d6bb5`；tag：`v3.4.8`（已 push）；CI run **40096450266** conclusion=**success**。
+- Release：**id=422736913**（https://github.com/fundops-notes/doc-mailer/releases/tag/v3.4.8）；
+  两资产从 Release 下载回来做 SHA256 复核，与本地构建产物**字节级一致**：
+  `doc-mailer_v3.4.8_portable.zip` 46,416,489 B sha256 `26ED6EDA…77679D`；
+  `doc-mailer_win64.zip` 46,828,965 B sha256 `1893BDFA…A5278`（内含签名 Valid 的 exe）。
