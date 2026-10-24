@@ -2,11 +2,10 @@
 
 > 交接文档。给接手实现的 agent / 同事。
 > **文件名沿用 `HANDOFF_v3.0.md`（历史沿革，改名会打断各处引用），内容已覆盖到 v3.2.0。**
-> 最后更新：2026-10-24（**v3.4.4 已实施并本地构建/验证通过，见 §24；GitHub 网络不可达，尚未 push/发 Release**）
+> 最后更新：2026-10-24（**v3.4.4 已实施、验证、构建并发版**，见 §24；Release id=422697613，CI run 40090967585 success）
 >
 > **当前代码版本：`3.4.4`**（`lp_tool.py` 与 `lp_v3.py` 两处一致；使用说明三处同步）。
-> 已发布：v2.2.0（旧）、v3.1.0 / v3.1.1、v3.2.0、v3.3.0、v3.3.1、v3.3.2、v3.4.0/v3.4.1、v3.4.2、v3.4.3（历史，见 §18~§23）。
-> v3.4.4 为 v3.4.3 独立验收问题的修复版；本地已构建 exe/便携包，远端 push 待网络恢复后执行。
+> 已发布：v2.2.0（旧）、v3.1.0 / v3.1.1、v3.2.0、v3.3.0、v3.3.1、v3.3.2、v3.4.0/v3.4.1、v3.4.2、v3.4.3、**v3.4.4**（v3.4.3 独立验收问题修复版，见 §24）。
 
 ---
 
@@ -1075,7 +1074,12 @@ Release v3.4.2（id=422627074），两资产 302，CI run 40080833442 success。
   zip 内 exe 与 dist 同哈希、签名 Valid。
 - 受限沙箱内 Word COM 无法初始化（0x800a13e9），上述 pytest/e2e/打包均在无沙箱环境执行；验收后已清理
   全部无头 WINWORD.EXE。
-- **未发布**：GitHub 网络不可达，`git push` / Release 上传未执行；本地 commit + tag `v3.4.4` 已打。
+- **已发版（2026-10-24）**：commit `f76ed56` + tag `v3.4.4` 已 push（`fa19847..f76ed56 main -> main`；
+  `* [new tag] v3.4.4 -> v3.4.4`）；CI run **40090967585**（branch v3.4.4）conclusion=**success**；
+  Release **id=422697613**（https://github.com/fundops-notes/doc-mailer/releases/tag/v3.4.4）；
+  两资产均为本地构建产物，字节级复核一致：
+  `doc-mailer_v3.4.4_portable.zip` 46,413,265 B sha256 `FB46DEEA…F5FA9`；
+  `doc-mailer_win64.zip` 46,822,910 B sha256 `58ADAF9B…8A971`（内含签名 Valid 的 exe）。
 
 ### 24.4 已知遗留（本轮未做）
 
