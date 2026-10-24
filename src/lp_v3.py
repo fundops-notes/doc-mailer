@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.4.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.4.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -678,6 +678,9 @@ def normalize_event(ev):
     pr = ev.get("process_results")
     if isinstance(pr, dict):
         out["process_results"] = pr
+    po = ev.get("process_overrides")
+    if isinstance(po, dict):
+        out["process_overrides"] = po
     for k in ("id", "name", "biz_type", "due_date", "notes",
               "created_at", "updated_at", "status", "scenario_id", "scenario_name"):
         v = ev.get(k)

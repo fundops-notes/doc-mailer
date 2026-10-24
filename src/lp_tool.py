@@ -56,9 +56,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.4.3"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.3"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -2718,6 +2718,60 @@ class App:
 
     # ---------- 流水线页 ----------
 
+    def _toggle_uni(self):
+        uni = getattr(self, "_uni_frame", None)
+        holder = getattr(self, "_uni_btn_holder", None)
+        if uni is None or holder is None:
+            return
+        shown = getattr(self, "_uni_shown", False)
+        if shown:
+            uni.pack_forget()
+            holder.pack(fill="x", pady=(0, 4))
+            self._uni_shown = False
+        else:
+            holder.pack_forget()
+            pw2 = uni.master
+            uni.pack(fill="x", pady=(0, 4))
+            self._uni_shown = True
+
+    def _wb_map_edit(self, event):
+        """双击对应表「文件路径」列 → 行内 Entry 编辑。"""
+        tree = self._wb_map_tree
+        if tree.identify_column(event.x) not in ("#3", "#4"):
+            return
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        col = tree.identify_column(event.x)
+        x, y, w, h = tree.bbox(iid, col)
+        cur = tree.set(iid, col)
+        e = tk.Entry(tree, width=max(10, w // 8))
+        e.place(x=x, y=y, width=w, height=h)
+        e.insert(0, cur)
+        e.focus_set()
+
+        def commit(_e=None):
+            tree.set(iid, col, e.get().strip())
+            e.destroy()
+
+        e.bind("<Return>", commit)
+        e.bind("<FocusOut>", commit)
+
+    def _wb_map_save_edits(self):
+        """把人工改过的路径存进事件 process_overrides（总览页实际生成优先用）。"""
+        tree = self._wb_map_tree
+        overrides = {}
+        for iid in tree.get_children():
+            vals = tree.item(iid)["values"]
+            if len(vals) >= 3 and str(vals[2]).strip() and str(vals[2]) != "—":
+                overrides[str(vals[0])] = str(vals[2])
+        self._wb_event["process_overrides"] = overrides
+        self._wb_save()
+        messagebox.showinfo("已保存",
+                            "自定义路径已保存（%d 条）。\n"
+                            "「总览」页生成草稿时将优先使用这些路径。"
+                            % len(overrides))
+
     def _wb_process(self):
         """④⑤「处理」按钮：按上方条目参数全量重跑流水线（不用历史数据），
         完成后把每位收件人的产出文件路径回填到下方对应表。只生成文件，
@@ -2849,16 +2903,20 @@ class App:
                    command=lambda: self._wb_add_item("attach")).pack(side="left", padx=4)
         ttk.Button(bar, text="删除选中",
                    command=self._wb_del_selected_items).pack(side="left")
-        ttk.Button(bar, text="插入示例链路",
-                   command=self._wb_add_example_chain).pack(side="left", padx=4)
         ttk.Button(bar, text="清空", command=self._wb_clear_items).pack(side="left")
         self._wb_pipe_count = ttk.Label(bar, foreground="#888", text="")
         self._wb_pipe_count.pack(side="left", padx=10)
 
-        # ④ 统一附件（所有人发一样的文件也在这里设置——替代「附件」页）
+        # ③ 统一附件：点按钮才展开
+        self._uni_btn_holder = ttk.Frame(parent)
+        self._uni_btn_holder.pack(fill="x", pady=(0, 4))
+        ttk.Button(self._uni_btn_holder, text="统一附件（所有人收同一份文件）…",
+                   command=self._toggle_uni).pack(side="left")
         uni = ttk.LabelFrame(parent, text=" 统一附件（所有收件人都收到的同一份文件） ",
                              style="Card.TLabelframe")
-        uni.pack(fill="x", pady=(0, 4))
+        self._uni_frame = uni
+        self._uni_shown = False
+        uni.pack_forget()   # 点「统一附件…」按钮展开
         uni_row = ttk.Frame(uni)
         uni_row.pack(fill="x", padx=8, pady=4)
         ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(
@@ -2878,44 +2936,7 @@ class App:
                        "这里只放所有人同一份的文件，会进入每位收件人的附件包。"
                        ).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # ④⑤ 处理按钮 + 收件人↔文件对应表
-        proc = ttk.LabelFrame(parent, text=" 处理与文件对应（收件人 → 将收到的文件） ",
-                              style="Card.TLabelframe")
-        proc.pack(fill="both", expand=True, pady=(0, 6))
-        prow = ttk.Frame(proc)
-        prow.pack(fill="x", padx=8, pady=4)
-        self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
-                                          command=self._wb_process)
-        self._wb_process_btn.pack(side="left")
-        ttk.Label(prow, foreground="#888", wraplength=620, justify="left",
-                  text="每次点击都按当前参数全量重跑，覆盖上次结果；"
-                       "完成后在下表更新每位收件人的文件路径。"
-                       "只生成文件，Outlook 草稿在「预览与生成」步骤。"
-                       ).pack(side="left", padx=8)
-        self._wb_progress2 = ttk.Progressbar(prow, length=140, mode="determinate")
-        self._wb_progress2.pack(side="right")
 
-        mframe = ttk.Frame(proc)
-        mframe.pack(fill="both", expand=True, padx=8, pady=(0, 6))
-        mcols = ["name", "files", "paths", "state"]
-        mheads = ["收件人名称", "将收到的文件", "文件路径", "状态"]
-        self._wb_map_tree = ttk.Treeview(mframe, columns=mcols, show="headings",
-                                          height=6)
-        for c, h in zip(mcols, mheads):
-            self._wb_map_tree.heading(c, text=h)
-            self._wb_map_tree.column(c,
-                                     width=170 if c == "name"
-                                     else (220 if c == "files" else 100))
-        mvsb = ttk.Scrollbar(mframe, orient="vertical",
-                              command=self._wb_map_tree.yview)
-        mhsb = ttk.Scrollbar(mframe, orient="horizontal",
-                              command=self._wb_map_tree.xview)
-        self._wb_map_tree.configure(yscrollcommand=mvsb.set,
-                                     xscrollcommand=mhsb.set)
-        self._wb_map_tree.pack(side="left", fill="both", expand=True)
-        mvsb.pack(side="right", fill="y")
-        mhsb.pack(side="bottom", fill="x")
-        self._wb_render_mapping_table()
 
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True, pady=(0, 6))
@@ -2938,6 +2959,7 @@ class App:
         vsb.pack(side="right", fill="y")
         self._wb_pipe_tree = tree
 
+
         tree.bind("<<TreeviewSelect>>", self._wb_on_pipe_select)
         tree.bind("<Double-1>", self._wb_on_pipe_double)
         tree.bind("<ButtonPress-1>", self._wb_pipe_press)
@@ -2947,6 +2969,67 @@ class App:
         # 参数区（单独一个 frame：切换选中行时只重画这里，表格不闪）
         self._wb_params_frame = ttk.Frame(parent)
         self._wb_params_frame.pack(fill="both", expand=True, pady=(0, 4))
+
+        # ④⑤ 处理按钮 + 收件人↔文件对应表 —— 右半边（与左栏条目/参数并排）
+        pw2 = ttk.PanedWindow(parent, orient="horizontal")
+        pw2.pack(fill="both", expand=True, pady=(0, 4))
+        left_col = ttk.Frame(pw2)
+        pw2.add(left_col, weight=1)
+        right_col = ttk.Frame(pw2)
+        pw2.add(right_col, weight=1)
+        # 条目表 frame 与参数区改挂到左栏
+        frame.pack_forget()
+        self._wb_params_frame.pack_forget()
+        frame.pack(in_=left_col, fill="both", expand=True, pady=(0, 4))
+        self._wb_params_frame.pack(in_=left_col, fill="both", expand=True, pady=(0, 4))
+
+        proc = ttk.LabelFrame(right_col, text=" 处理与文件对应（收件人 → 将收到的文件） ",
+                              style="Card.TLabelframe")
+        proc.pack(fill="both", expand=True)
+        prow = ttk.Frame(proc)
+        prow.pack(fill="x", padx=8, pady=4)
+        self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
+                                          command=self._wb_process)
+        self._wb_process_btn.pack(side="left")
+        ttk.Label(prow, foreground="#888", wraplength=560, justify="left",
+                  text="每次点击都按当前参数全量重跑，覆盖上次结果；"
+                       "完成后在下表更新每位收件人的文件路径。"
+                       "只生成文件，Outlook 草稿在「预览与生成」步骤。"
+                       ).pack(side="left", padx=8)
+        self._wb_progress2 = ttk.Progressbar(prow, length=140, mode="determinate")
+        self._wb_progress2.pack(side="right")
+
+        mframe = ttk.Frame(proc)
+        mframe.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        mcols = ["name", "files", "paths", "state"]
+        mheads = ["收件人名称", "将收到的文件", "文件路径", "状态"]
+        self._wb_map_tree = ttk.Treeview(mframe, columns=mcols, show="headings",
+                                          height=10, selectmode="browse")
+        for c, h in zip(mcols, mheads):
+            self._wb_map_tree.heading(c, text=h)
+            self._wb_map_tree.column(c,
+                                     width=150 if c == "name"
+                                     else (230 if c in ("files", "paths") else 70))
+        mvsb = ttk.Scrollbar(mframe, orient="vertical",
+                              command=self._wb_map_tree.yview)
+        mhsb = ttk.Scrollbar(mframe, orient="horizontal",
+                              command=self._wb_map_tree.xview)
+        self._wb_map_tree.configure(yscrollcommand=mvsb.set,
+                                     xscrollcommand=mhsb.set)
+        self._wb_map_tree.grid(row=0, column=0, sticky="nsew")
+        mvsb.grid(row=0, column=1, sticky="ns")
+        mhsb.grid(row=1, column=0, sticky="ew")
+        mframe.rowconfigure(0, weight=1)
+        mframe.columnconfigure(0, weight=1)
+        self._wb_map_tree.bind("<Double-1>", self._wb_map_edit)
+        save_row = ttk.Frame(proc)
+        save_row.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Button(save_row, text="保存自定义编辑",
+                   command=self._wb_map_save_edits).pack(side="left")
+        ttk.Label(save_row, foreground="#888",
+                  text="双击「文件路径」可手动改；保存后「总览」页实际草稿生成优先使用。"
+                  ).pack(side="left", padx=8)
+        self._wb_render_mapping_table()
 
         self._wb_fill_pipe_table()
         if not self._wb_pipeline_items():
@@ -3154,27 +3237,6 @@ class App:
         self._wb_fill_pipe_table()
         self._wb_render_params(None)
 
-    def _wb_add_example_chain(self):
-        # 一键插入示例链路：一个「生成文档」条目（转 PDF + 水印 + 加密）
-        items = self._wb_pipeline_items()
-        if items:
-            if not messagebox.askyesno("插入示例链路",
-                                       "当前已有条目，示例链路会追加在后面。\n继续？"):
-                return
-        it = new_item("generate", "示例：对账单")
-        it["params"]["to_pdf"] = True
-        it["params"]["watermark"] = True
-        it["params"]["encrypt"] = True
-        it["granularity"] = "per_lp"
-        items.append(it)
-        self._wb_sel_item = it.get("id")
-        self._wb_save()
-        self._wb_fill_pipe_table(keep_sel=it.get("id"))
-        self._wb_render_params(it)
-        messagebox.showinfo("已插入",
-                            "已追加一个「生成文档」条目：\n"
-                            "Word 模板 → 转 PDF → 加水印 → 加密（权限默认仅打印）。\n"
-                            "记得给它选一个 .docx 模板。")
 
     def _wb_rename_item(self, item):
         win = tk.Toplevel(self.root)
@@ -3203,6 +3265,32 @@ class App:
         e.bind("<Return>", lambda _e2: ok())
 
     # ---------- 条目参数区 ----------
+
+    def _wb_download_word_example(self):
+        """生成并保存示例 Word 模板（含占位符），供测试 MailMerge。"""
+        outdir = filedialog.askdirectory(title="选择保存示例模板的目录")
+        if not outdir:
+            return
+        try:
+            wbatch = lp_v3.default_word_batch()
+            tpl = Path(outdir) / "示例通知模板.docx"
+            wbatch.create_docx(str(tpl),
+                               "Capital Call Notice\n\n"
+                               "Dear {{Client_Name}},\n\n"
+                               "Please note the following capital call:\n\n"
+                               "  Call Amount: USD {{Call_Amount}}\n"
+                               "  Unfunded Commitment: USD {{Unfunded}}\n"
+                               "  Due Date: {{Due_Date}}\n\n"
+                               "Please remit to {{Bank_Name}} account {{Account_No}}.\n\n"
+                               "Sincerely,\nFund Manager")
+            messagebox.showinfo(
+                "示例模板已生成",
+                "已保存：\n%s\n\n占位符：{{Client_Name}} {{Call_Amount}} "
+                "{{Unfunded}} {{Due_Date}} {{Bank_Name}} {{Account_No}}\n\n"
+                "测试方法：流水线加一条 Word-MailMerge → 选这个模板 → "
+                "点「检测占位符」→ 点「导出要素模板」填好值 → 处理。" % tpl)
+        except Exception as e:
+            messagebox.showerror("生成失败", str(e))
 
     def _show_mailmerge_help(self):
         messagebox.showinfo(
@@ -3254,33 +3342,6 @@ class App:
             ttk.Button(hrow, text="Word-MailMerge 说明", width=18,
                        command=self._show_mailmerge_help).pack(side="left", padx=8)
         else:
-            # --- 路径来源：手填路径 / 按收件人取（每人一份不同的文件）---
-            recips = (self._wb_event or {}).get("recipients") or []
-            rec0 = recips[0] if recips else {}
-            src_opts = lp_v3.path_source_options(self._wb_event, rec0,
-                                                 self._wb_sheet_cols(item))
-            src_keys = [k for k, _g, _l in src_opts]
-            src_labels = [l for _k, _g, l in src_opts]
-            cur_src = str(params.get("path_source") or lp_v3.PATH_SOURCE_MANUAL)
-            if cur_src not in src_keys:
-                cur_src = lp_v3.PATH_SOURCE_MANUAL
-            r0b = ttk.Frame(box)
-            r0b.pack(fill="x", padx=8, pady=(4, 2))
-            ttk.Label(r0b, text="路径来源：").pack(side="left")
-            src_var = self._wb_keep_var(
-                tk.StringVar(value=lp_v3.path_source_label(cur_src)))
-            src_cb = ttk.Combobox(r0b, textvariable=src_var, state="readonly",
-                                  width=30, values=src_labels)
-            src_cb.pack(side="left", padx=4)
-            src_cb.bind("<<ComboboxSelected>>",
-                        lambda _e: self._wb_set_item_path_source(item, src_var.get(),
-                                                                 src_opts))
-            ToolTip(src_cb, "「手填路径」= 下面这份清单，所有人一样。\n"
-                            "「收件人清单的附件路径」= 收件人表里「附件路径」列，"
-                            "每人取自己的。\n"
-                            "「收件人字段」/「外部数据表」= 从对应的那一列取值。")
-            ttk.Label(r0b, foreground="#888", text=self._wb_path_preview(item, rec0)
-                      ).pack(side="left", padx=8)
 
             r1 = ttk.Frame(box)
             r1.pack(fill="x", padx=8, pady=4)
@@ -3300,22 +3361,13 @@ class App:
             b_save = ttk.Button(btns, text="保存", width=6,
                                 command=lambda: self._wb_save_attach_files(item, files_text))
             b_save.pack(side="left")
-            if cur_src != lp_v3.PATH_SOURCE_MANUAL:
-                # 文本框禁用后 insert 会抛 TclError，所以这几个按钮也要一起禁用
-                files_text.config(state="disabled")
-                for b in (b_add, b_imp, b_save):
-                    b.config(state="disabled")
-                ttk.Label(box, text=(
-                    "当前按「%s」取路径，下面的手填清单不生效（切回「手填路径」才会用）。"
-                    % lp_v3.path_source_label(cur_src)),
-                    foreground="#b8860b", wraplength=880, justify="left").pack(
-                        anchor="w", padx=8, pady=(0, 4))
             ttk.Label(box, text=(
-                "同一个文件会被复制进附件包；内容相同、文件名相同则所有收件人共用一份"
-                "（把「产出粒度」改成「每人一份」可让每人的文件名带上自己的名字）。"),
+                "每行一个文件路径。从 Excel 导入时路径与收件人一一对应；"
+                "所有人同一份文件用「统一附件」按钮设置。"
+                if False else
+                "每行一个文件路径，从 Excel 导入时与收件人一一对应；"
+                "全员共用同一份文件请用「统一附件」按钮。"),
                 foreground="#888", wraplength=880, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
-            if cur_src.startswith(lp_v3.PATH_SOURCE_SHEET_PREFIX):
-                self._wb_sheet_panel(parent, item)
 
         # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
         r2 = ttk.Frame(box)
