@@ -1770,5 +1770,8 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 
 ### 37.4 发布结果
 
-- commit：`待回填`；tag：`v3.8.0`；CI run：`待回填`。
-- Release：`待回填`。
+- commit：`0bf1d03`；tag：`v3.8.0`（已 push）；CI run **40118326426** conclusion=**success**。
+- Release：**id=422891824**（https://github.com/fundops-notes/doc-mailer/releases/tag/v3.8.0）；
+  两资产从 Release 下载回来做 SHA256 复核，与本地构建产物**字节级一致**：
+  `doc-mailer_v3.8.0_portable.zip` 46,428,092 B sha256 `DEF24081…38EDE2A0`；
+  `doc-mailer_win64.zip` 46,849,342 B sha256 `978E3F12…3BFA4C84`（内含签名 Valid 的 exe）。
