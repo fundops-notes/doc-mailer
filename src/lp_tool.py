@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.7.2"
+APP_VERSION = "3.7.3"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.2"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.3"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -1778,7 +1778,8 @@ class App:
             "    · 只属于部分收件人的特异标签不会被批量移除；\n"
             "    · 「从事件导入…」收进库后会提示给这批收件人打标签；\n"
             "    · 自定义字段只属于事件，收件人库/收件人信息都不显示字段；\n"
-            "      字段由 Excel/要素模板导入，只用于文档映射。\n\n"
+            "      字段由 Excel/要素模板导入，只用于文档映射；\n"
+            "      日期默认按 Excel 显示文本导入，数字日期会弹窗选格式。\n\n"
             "输出目录：\n"
             "    以「设置 → 默认输出目录」为准；未设置时用程序所在文件夹。\n"
             "    处理与生成草稿都用同一个目录，事件里不再单独保存输出路径。\n\n"
@@ -3593,6 +3594,58 @@ class App:
             "已按模板里的 %d 个占位符生成要素模板（%d 位收件人）。\n"
             "每列填好后可作为外部数据表使用。" % (len(phs), len(recips)))
 
+    def _date_import_mode(self, columns, count):
+        """日期类列出现 Excel 数字时，让用户选择“保持显示文本 / 转成某种格式”。"""
+        win = tk.Toplevel(self.root)
+        win.title("日期列格式")
+        win.grab_set()
+        ttk.Label(win, justify="left", text=(
+            "检测到这些日期列是 Excel 数字（单元格格式不是日期）：\n  %s\n"
+            "共 %d 个单元格。\n\n"
+            "默认保持 Excel 显示文本；也可以在 Excel 里把列格式设成想要的\n"
+            "日期样式后重新导入。若现在就想转成日期，请选择一种格式："
+            % ("、".join(columns), count))).pack(anchor="w", padx=12, pady=(10, 6))
+        mode_var = tk.StringVar(value="keep")
+        opts = [("保持 Excel 显示文本（推荐；先在 Excel 设置样式）", "keep"),
+                ("转成 2026-06-20", "iso"),
+                ("转成 2026年06月20日", "cn"),
+                ("转成 2026/06/20", "slash")]
+        for label, val in opts:
+            ttk.Radiobutton(win, text=label, variable=mode_var,
+                            value=val).pack(anchor="w", padx=16, pady=1)
+        picked = {"mode": None}
+
+        def ok():
+            picked["mode"] = mode_var.get()
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="导入", command=ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+        win.wait_window(win)
+        return picked["mode"]
+
+    def _format_serial_date(self, value, mode):
+        if mode == "keep":
+            return value
+        txt = str(value).strip()
+        if not re.fullmatch(r"\d{5}(\.\d+)?", txt):
+            return value
+        try:
+            num = float(txt)
+            if not (20000 <= num <= 90000):
+                return value
+            from openpyxl.utils.datetime import from_excel
+            dt = from_excel(num)
+        except Exception:
+            return value
+        if mode == "cn":
+            return "%d年%02d月%02d日" % (dt.year, dt.month, dt.day)
+        if mode == "slash":
+            return "%04d/%02d/%02d" % (dt.year, dt.month, dt.day)
+        return "%04d-%02d-%02d" % (dt.year, dt.month, dt.day)
+
     def _wb_import_field_template(self, item):
         """导入要素模板：Excel 回填「收件人名称 + 占位符列」到收件人字段。
 
@@ -3634,6 +3687,24 @@ class App:
             messagebox.showinfo("导入要素模板",
                                 "除了「收件人名称」外没有可导入的占位符列。")
             return
+        # 日期类列的数字 → 询问保持显示文本还是转换格式
+        date_mode = "keep"
+        date_cols, date_cells = [], 0
+        for i, key in col_keys.items():
+            hname = header[i] if i < len(header) else key
+            if not lp_v3.DATE_HEADER_RE.search(str(hname or "")):
+                continue
+            for row in rows[1:]:
+                val = row[i] if i < len(row) else None
+                if val is not None and re.fullmatch(r"\d{5}(\.\d+)?",
+                                                    str(val).strip()):
+                    date_cells += 1
+            if date_cells:
+                date_cols.append(hname or key)
+        if date_cells:
+            date_mode = self._date_import_mode(date_cols, date_cells)
+            if date_mode is None:
+                return
         ev = self._wb_event
         by_name = {str(r.get("name", "")).strip(): r
                    for r in (ev.get("recipients") or [])}
@@ -3650,8 +3721,10 @@ class App:
             fields = rec.setdefault("fields", {})
             for i, key in col_keys.items():
                 val = row[i] if i < len(row) else None
-                # 日期类列（Due_Date / 日期）的 Excel 序列号转可读日期
-                val = lp_v3.coerce_date_like_value(header[i] if i < len(header) else key, val)
+                if date_mode != "keep":
+                    hname = header[i] if i < len(header) else key
+                    if lp_v3.DATE_HEADER_RE.search(str(hname or "")):
+                        val = self._format_serial_date(val, date_mode)
                 val = "" if val is None else str(val).strip()
                 if val == "":
                     continue      # 空单元格不覆盖已有值

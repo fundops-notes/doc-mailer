@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_372():
-    assert lp_tool.APP_VERSION == "3.7.2"
-    assert lp_v3.APP_VERSION == "3.7.2"
+def test_version_is_373():
+    assert lp_tool.APP_VERSION == "3.7.3"
+    assert lp_v3.APP_VERSION == "3.7.3"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -499,6 +499,7 @@ def test_import_field_template_applies_values_and_mapping(app, tmp_path):
     ws.append(["查无此人", 999, "X", "2027-01-01"])
     wb.save(str(src))
     fd.open_path = str(src)
+    a._date_import_mode = lambda cols, count: "iso"
     a._wb_import_field_template(item)
     a.root.update()
     saved, _e = a.store.load_event(ev["id"])
@@ -1198,3 +1199,46 @@ def test_inserted_image_is_visible_in_editor(app, tmp_path):
     lp_tool.load_html(a.body_text, html)
     a.root.update()
     assert a.body_text.image_names(), "重新加载后图片仍可见"
+
+# ---------------------------------------------------------------- v3.7.3
+
+def _field_template_with_serial(app, tmp_path):
+    import openpyxl
+    tpl = tmp_path / "t3.docx"
+    _mini_docx(tpl, "{{Due_Date}}")
+    ev = _save_event(app, "日期选择", [
+        {"name": "甲公司", "to": "a@x.com", "open_pw": "Open123456",
+         "owner_pw": "Owner123456"}],
+        pipeline=[{"kind": "generate", "params": {"template_path": str(tpl)}}])
+    app.open_event(ev["id"])
+    app._wb_show_step(1)
+    app.root.update()
+    src = tmp_path / "日期.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["收件人名称", "{{Due_Date}}"])
+    ws.append(["甲公司", 46193])
+    wb.save(str(src))
+    return ev, app._wb_event["pipeline"][0], src
+
+
+def test_import_field_template_keep_excel_display_text(app, tmp_path):
+    a, _mb, fd, _err = app
+    ev, item, src = _field_template_with_serial(a, tmp_path)
+    fd.open_path = str(src)
+    a._date_import_mode = lambda cols, count: "keep"
+    a._wb_import_field_template(item)
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["recipients"][0]["fields"]["Due_Date"] == "46193"
+
+
+def test_import_field_template_date_format_options(app, tmp_path):
+    from pathlib import Path as _P
+    a, _mb, fd, _err = app
+    # 直接验证格式化函数
+    assert a._format_serial_date("46193", "iso") == "2026-06-20"
+    assert a._format_serial_date("46193", "cn") == "2026年06月20日"
+    assert a._format_serial_date("46193", "slash") == "2026/06/20"
+    assert a._format_serial_date("46193", "keep") == "46193"
+    assert a._format_serial_date("1222", "iso") == "1222"

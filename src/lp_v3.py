@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.7.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.7.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -360,7 +360,7 @@ def parse_import_rows_v3(rows):
         fields = {}
         for idx, col in field_cols:
             if idx < len(row):
-                v = coerce_date_like_value(col, row[idx])
+                v = row[idx]
                 if v is not None and str(v).strip():
                     fields[col] = str(v).strip()
         recips.append(normalize_recipient({
