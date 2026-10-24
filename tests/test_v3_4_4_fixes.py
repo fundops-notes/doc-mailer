@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_360():
-    assert lp_tool.APP_VERSION == "3.6.0"
-    assert lp_v3.APP_VERSION == "3.6.0"
+def test_version_is_370():
+    assert lp_tool.APP_VERSION == "3.7.0"
+    assert lp_v3.APP_VERSION == "3.7.0"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -1039,3 +1039,102 @@ def test_event_info_send_mode_actually_effective(app):
     saved, _e = a.store.load_event(ev["id"])
     assert saved["options"]["send_mode"] == "per_group"
     assert len(lp_v3.draft_units(saved)) == 1, "同组合并应产生 1 封"
+
+# ---------------------------------------------------------------- v3.7.0
+
+def test_no_progress_bars_anymore(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "无进度条", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    assert not hasattr(a, "wb_progress")
+    assert not hasattr(a, "_wb_progress2")
+    a._wb_show_step(3)
+    a.root.update()
+
+
+def test_mail_editor_wysiwyg_toolbar_no_preview(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "编辑器", [{"name": "甲", "to": "a@x.com",
+                                    "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a.root.update()
+    assert not hasattr(a, "preview_label"), "右侧预览已删除"
+    assert hasattr(a, "body_text")
+    labels = [str(w.cget("text")) for w in _walk(a._wb_content)
+              if _cls(w) in ("TLabel", "TButton", "TCombobox", "TMenubutton", "Button")]
+    for need in ("字体", "字号", "文字色", "背景色", "左对齐", "居中",
+                 "右对齐", "插入图片…", "插入字段"):
+        assert any(need in x for x in labels), "缺少编辑器控件：%s" % need
+    assert not any(str(w.cget("text")) == "设定" for w in _walk(a._wb_content)
+                   if _cls(w) == "TButton"), "「设定」按钮应删除"
+
+
+def test_editor_image_insert_and_html_roundtrip(app, tmp_path):
+    a, _mb, _fd, _err = app
+    from PIL import Image
+    png = tmp_path / "pic.png"
+    Image.new("RGB", (40, 30), (200, 100, 50)).save(str(png))
+    ev = _save_event(a, "图片", [{"name": "甲", "to": "a@x.com",
+                                  "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a.root.update()
+    a.body_text.insert("end", "文字")
+    lp_tool._editor_insert_image(a.body_text, str(png))
+    a.root.update()
+    html = lp_tool.text_to_html(a.body_text)
+    assert "<img" in html and "data:image/png;base64," in html
+    assert a.body_text.image_names(), "编辑器中应显示图片"
+    lp_tool.load_html(a.body_text, html)
+    a.root.update()
+    assert a.body_text.image_names(), "从 HTML 重新加载后图片仍应显示"
+
+
+def test_overview_editor_saves_per_email_override(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "单封编辑", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(3)
+    a.root.update()
+    assert hasattr(a, "_ov_body_text")
+    key = a._wb_ov_cur_key
+    a._ov_subject_var.set("个性化主题")
+    a._ov_body_text.delete("1.0", "end")
+    a._ov_body_text.insert("1.0", "个性化正文")
+    a._wb_ov_save()
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    ov = (saved.get("mail_overrides") or {}).get(key)
+    assert ov and ov["subject"] == "个性化主题"
+    assert "个性化正文" in ov["body"]
+
+
+def test_run_event_uses_per_email_override(tmp_path, monkeypatch):
+    import fitz
+    pdf = tmp_path / "a.pdf"
+    doc = fitz.open(); doc.new_page(); doc.save(str(pdf)); doc.close()
+    ev = lp_v3.new_event("覆盖生成")
+    ev["recipients"] = [lp_v3.normalize_recipient(
+        {"name": "甲", "to": "a@x.com", "open_pw": "Open123456", "owner_pw": "Owner123456"})]
+    ev["pipeline"] = [lp_v3.normalize_item({"kind": "attach",
+                                             "params": {"files": [str(pdf)]}})]
+    key = next(iter(dict(lp_v3.draft_units(ev))))
+    ev["mail_overrides"] = {key: {"subject": "单独主题", "body": "<p>单独正文</p>"}}
+    calls = []
+    monkeypatch.setattr(lp_v3, "create_outlook_draft",
+                        lambda rec, files, subject, body, *a, **k: calls.append((subject, body)))
+    store = lp_v3.Store(tmp_path / "data")
+    run = lp_v3.run_event(store, ev, outdir=tmp_path / "out",
+                          create_drafts=True, word=object())
+    assert run is not None
+    assert calls and calls[0][0] == "单独主题"
+    assert "单独正文" in calls[0][1]

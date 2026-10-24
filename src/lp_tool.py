@@ -34,6 +34,7 @@ v3.0 相对 v2.x 的结构变化：
 数据文件：程序同目录的 lp_data/（含全部口令，属敏感文件，请妥善保管）
 """
 
+import base64
 import html as _htmlmod
 import json
 import os
@@ -62,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.6.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.0"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -174,6 +175,9 @@ def _normalize_word_html(html):
 # ---------- 内置富文本编辑器：HTML ↔ tk Text 双向转换 ----------
 
 _TAG_STYLE = {}  # tk 标签名 -> 样式 dict（导出时反查）
+_IMG_TOKEN_RE = re.compile("\uf8ffIMG[0-9a-f]+\uf8ff")
+_EDITOR_IMG_DATA = {}    # token -> data:image/...;base64,...
+_EDITOR_IMG_PHOTOS = {}  # token -> PhotoImage（保活）
 
 
 def _style_key(st):
@@ -183,7 +187,7 @@ def _style_key(st):
 def _ensure_tag(tw, st):
     name = _style_key(st)
     if name not in _TAG_STYLE:
-        fam = "Microsoft YaHei"
+        fam = st.get("f") or "Microsoft YaHei"
         size = st.get("s") or 12
         styles = []
         if st.get("b"):
@@ -239,10 +243,16 @@ class _HTML2Runs(_HTMLParser):
                             st["s"] = int(float(num))
                     except ValueError:
                         pass
+                elif k == "font-family":
+                    f = v.split(",")[0].strip().strip('"').strip("'")
+                    if f:
+                        st["f"] = f
                 elif k == "text-align" and v in ("center", "right"):
                     st["al"] = v
             if tag == "font" and (a.get("color") or "").startswith("#"):
                 st["c"] = a["color"]
+            if tag == "font" and a.get("face"):
+                st["f"] = str(a["face"]).split(",")[0].strip()
             if tag == "h1":
                 st.update(b=1, s=20)
             elif tag == "h2":
@@ -290,7 +300,78 @@ def html_to_runs(html_str):
     return text, runs
 
 
+def _replace_img_tags(html_str):
+    """<img> → 隐藏 token；返回 (new_html, [token...])，data URI 存全局表。"""
+    tokens = []
+
+    def _sub(m):
+        tag = m.group(0)
+        sm = (re.search(r'src\s*=\s*"([^"]*)"', tag, re.I)
+              or re.search(r"src\s*=\s*'([^']*)'", tag, re.I))
+        uri = _htmlmod.unescape(sm.group(1)) if sm else ""
+        if not uri:
+            return ""
+        token = "\uf8ffIMG%x\uf8ff" % len(_EDITOR_IMG_DATA)
+        _EDITOR_IMG_DATA[token] = uri
+        tokens.append(token)
+        return token
+
+    return re.sub(r"<img\b[^>]*>", _sub, html_str or "", flags=re.I), tokens
+
+
+def _editor_photo(token):
+    photo = _EDITOR_IMG_PHOTOS.get(token)
+    if photo is not None:
+        return photo
+    uri = _EDITOR_IMG_DATA.get(token) or ""
+    try:
+        import io
+        from PIL import Image, ImageTk
+        if uri.startswith("data:") and "," in uri:
+            uri = uri.split(",", 1)[1]
+        img = Image.open(io.BytesIO(base64.b64decode(uri)))
+        img.thumbnail((360, 360))
+        photo = ImageTk.PhotoImage(img)
+        _EDITOR_IMG_PHOTOS[token] = photo
+        return photo
+    except Exception:
+        return None
+
+
+def _editor_place_image(tw, index, token):
+    photo = _editor_photo(token)
+    if photo is None:
+        return
+    tw.image_create(index, image=photo)
+    tag = "__elide_%s" % token
+    try:
+        tw.tag_configure(tag, elide=True)
+        tw.tag_add(tag, index, "%s+%dc" % (index, len(token)))
+    except tk.TclError:
+        pass
+
+
+def _editor_insert_image(tw, path):
+    """插入图片：文件转 data URI，显示图片 + 隐藏 token，导出 HTML 时还原 <img>。"""
+    try:
+        raw = Path(path).read_bytes()
+    except Exception as e:
+        messagebox.showerror("插入图片", "读取失败：%s" % e)
+        return
+    ext = Path(path).suffix.lower().lstrip(".") or "png"
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
+            "bmp": "bmp", "webp": "webp"}.get(ext, "png")
+    uri = "data:image/%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
+    token = "\uf8ffIMG%x\uf8ff" % len(_EDITOR_IMG_DATA)
+    _EDITOR_IMG_DATA[token] = uri
+    idx = tw.index("insert")
+    tw.insert(idx, token)
+    _editor_place_image(tw, idx, token)
+    tw.mark_set("insert", "%s+%dc" % (idx, len(token)))
+
+
 def load_html(tw, html_str):
+    html_str, img_tokens = _replace_img_tags(html_str)
     text, runs = html_to_runs(html_str)
     lead = len(text) - len(text.lstrip("\n"))  # 去掉段首累积出的空行
     text = text[lead:]
@@ -300,6 +381,13 @@ def load_html(tw, html_str):
         a, b = max(0, a - lead), max(0, b - lead)
         if a < b:
             tw.tag_add(_ensure_tag(tw, st), f"1.0+{a}c", f"1.0+{b}c")
+    for token in img_tokens:
+        try:
+            idx = tw.search(token, "1.0", "end")
+            if idx:
+                _editor_place_image(tw, idx, token)
+        except tk.TclError:
+            pass
     # 对齐标签扩展到整行（tk 的 justify 需要覆盖整行才生效）
     n_lines = int(tw.index("end-1c").split(".")[0])
     for ln in range(1, n_lines + 1):
@@ -326,38 +414,53 @@ def text_to_html(tw, base=(14, "#333333")):
     out = []
     for ln in range(1, n_lines + 1):
         raw = tw.get(f"{ln}.0", f"{ln}.end")
-        parts = []
-        for i in range(len(raw)):
-            st = _style_at(tw, f"{ln}.{i}")
-            k = _style_key(st)
-            if parts and parts[-1][2] == k:
-                parts[-1][0] += raw[i]
-            else:
-                parts.append([raw[i], st, k])
-        align = parts[0][1].get("al") if parts else None
+        align = _style_at(tw, f"{ln}.0").get("al")
+
+        def _render_text(txt_, offset):
+            parts = []
+            for i, ch in enumerate(txt_):
+                st = _style_at(tw, f"{ln}.{offset + i}")
+                k = _style_key(st)
+                if parts and parts[-1][2] == k:
+                    parts[-1][0] += ch
+                else:
+                    parts.append([ch, st, k])
+            seg = ""
+            for text_, st, _k in parts:
+                esc = _htmlmod.escape(text_)
+                if not any(st.get(x) for x in ("b", "i", "u", "c", "s", "bg", "f")):
+                    seg += esc
+                    continue
+                inner = esc
+                if st.get("b"):
+                    inner = f"<b>{inner}</b>"
+                if st.get("i"):
+                    inner = f"<i>{inner}</i>"
+                if st.get("u"):
+                    inner = f"<u>{inner}</u>"
+                style = ""
+                if st.get("c") and st["c"].lower() != base[1].lower():
+                    style += f"color:{st['c']};"
+                if st.get("s") and st["s"] != base[0]:
+                    style += f"font-size:{st['s']}px;"
+                if st.get("f") and st["f"] != "Microsoft YaHei":
+                    style += f"font-family:{st['f']};"
+                if st.get("bg"):
+                    style += f"background:{st['bg']};"
+                if style:
+                    inner = f'<span style="{style[:-1]}">{inner}</span>'
+                seg += inner
+            return seg
+
         seg = ""
-        for txt_, st, _k in parts:
-            esc = _htmlmod.escape(txt_)
-            if not any(st.get(x) for x in ("b", "i", "u", "c", "s", "bg")):
-                seg += esc
-                continue
-            inner = esc
-            if st.get("b"):
-                inner = f"<b>{inner}</b>"
-            if st.get("i"):
-                inner = f"<i>{inner}</i>"
-            if st.get("u"):
-                inner = f"<u>{inner}</u>"
-            style = ""
-            if st.get("c") and st["c"].lower() != base[1].lower():
-                style += f"color:{st['c']};"
-            if st.get("s") and st["s"] != base[0]:
-                style += f"font-size:{st['s']}px;"
-            if st.get("bg"):
-                style += f"background:{st['bg']};"
-            if style:
-                inner = f'<span style="{style[:-1]}">{inner}</span>'
-            seg += inner
+        pos = 0
+        for m in _IMG_TOKEN_RE.finditer(raw):
+            seg += _render_text(raw[pos:m.start()], pos)
+            uri = _EDITOR_IMG_DATA.get(m.group(0), "")
+            if uri:
+                seg += '<img src="%s" style="max-width:100%%">' % _htmlmod.escape(uri, quote=True)
+            pos = m.end()
+        seg += _render_text(raw[pos:], pos)
         alattr = f' align="{align}"' if align else ""
         out.append(f"<p{alattr}>{seg}</p>" if seg else "<p><br></p>")
     return ('<div style="font-family:微软雅黑,Segoe UI,Arial;'
@@ -986,6 +1089,7 @@ class App:
         for text, cmd, tip in (
                 ("新增", self._pool_new, "在收件人库里新增一条"),
                 ("编辑", self._pool_edit, "编辑选中的收件人"),
+                ("标签…", self._pool_tags, "给选中收件人批量加/移除标签"),
                 ("删除", self._pool_delete, "从库里删除选中的收件人"),
                 ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
                 ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
@@ -1028,9 +1132,9 @@ class App:
             for k in (r.get("fields") or {}):
                 if k not in fcols:
                     fcols.append(k)
-        cols = ["name", "to", "cc", "bcc", "wm", "group"] + \
+        cols = ["name", "to", "cc", "bcc", "wm", "group", "tags"] + \
             ["f%d" % i for i in range(len(fcols))] + ["open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组"] + fcols + \
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "标签"] + fcols + \
             ["打开口令", "权限口令(勿发)"]
         tree.delete(*tree.get_children())
         self._pool_iids = {}
@@ -1041,12 +1145,14 @@ class App:
         for c, h in zip(cols, heads):
             try:
                 tree.heading(c, text=h)
-                tree.column(c, width=150 if c in ("to", "cc", "bcc") else 110)
+                tree.column(c, width=180 if c == "tags" else (
+                    150 if c in ("to", "cc", "bcc") else 110))
             except Exception:
                 pass
         for i, r in enumerate(pool):
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
-                    r.get("bcc", ""), r.get("wm", ""), r.get("group", "")]
+                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""),
+                    "、".join(r.get("tags") or [])]
             vals += [(r.get("fields") or {}).get(k, "") for k in fcols]
             vals += [r.get("open_pw", ""),
                      "••••" if r.get("owner_pw") else ""]
@@ -1116,6 +1222,116 @@ class App:
                                "编辑收件人（收件人库）", save,
                                "（库里还没有自定义字段列）")
 
+    def _pool_tags(self):
+        ids = self._pool_selected()
+        if not ids:
+            messagebox.showinfo("提示", "请先选中一位或多位收件人")
+            return
+        self._pool_tag_dialog(ids, "批量修改标签（%d 位）" % len(ids))
+
+    def _pool_tag_dialog(self, ids, title="收件人标签"):
+        """标签编辑：添加全量加；移除只能移除所有选中记录共有的标签。"""
+        pool = {r.get("id"): r for r in self.store.list_pool()}
+        recs = [pool[i] for i in ids if i in pool]
+        if not recs:
+            return
+        union = []
+        for r in recs:
+            for t in r.get("tags") or []:
+                if t not in union:
+                    union.append(t)
+        common = set(recs[0].get("tags") or [])
+        for r in recs[1:]:
+            common &= set(r.get("tags") or [])
+
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.grab_set()
+        ttk.Label(win, justify="left", text=(
+            "勾选已有标签可批量添加；移除只能移除选中记录都有的（共有）标签，\n"
+            "只属于部分记录的标签不会被批量移除，避免误删。\n"
+            "也可以在下方输入新标签（逗号或分号分隔）。")).pack(
+            anchor="w", padx=12, pady=(10, 6))
+        cb_frame = ttk.Frame(win)
+        cb_frame.pack(fill="both", expand=True, padx=12)
+        vars_ = {}
+        for j, t in enumerate(union):
+            v = tk.BooleanVar(value=False)
+            mark = "（共有）" if t in common else ""
+            ttk.Checkbutton(cb_frame, text=t + mark, variable=v).grid(
+                row=j // 2, column=j % 2, sticky="w", padx=4, pady=2)
+            vars_[t] = v
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(row, text="新标签：").pack(side="left")
+        new_var = tk.StringVar()
+        ttk.Entry(row, textvariable=new_var, width=40).pack(side="left", padx=4)
+        ttk.Label(row, foreground="#888", text="多个用 , 或 ; 分隔").pack(side="left")
+
+        def checked():
+            return [t for t, v in vars_.items() if v.get()]
+
+        def save_one(rec, tags):
+            rec2 = dict(rec)
+            rec2["tags"] = tags
+            ok, err, _saved = self.store.save_pool_recipient(rec2)
+            if not ok:
+                messagebox.showerror("保存失败", err, parent=win)
+                return False
+            return True
+
+        def apply_add():
+            add = checked()
+            for t in re.split(r"[,，;；]", new_var.get()):
+                t = t.strip()
+                if t and t not in add:
+                    add.append(t)
+            if not add:
+                messagebox.showinfo("标签", "没有勾选/输入要添加的标签", parent=win)
+                return
+            for rec in recs:
+                tags = list(rec.get("tags") or [])
+                for t in add:
+                    if t not in tags:
+                        tags.append(t)
+                if not save_one(rec, tags):
+                    return
+            self._refresh_pool_tab()
+            messagebox.showinfo("标签", "已给 %d 位收件人添加标签：%s"
+                                % (len(recs), "、".join(add)), parent=win)
+            win.destroy()
+
+        def apply_remove():
+            picked = checked()
+            if not picked:
+                messagebox.showinfo("标签", "请先勾选要移除的标签", parent=win)
+                return
+            removable = [t for t in picked if t in common]
+            skipped = [t for t in picked if t not in common]
+            if not removable:
+                messagebox.showwarning(
+                    "不能批量移除",
+                    "勾选的标签不是所有选中记录都有的，无法批量移除：\n%s"
+                    % "、".join(skipped), parent=win)
+                return
+            for rec in recs:
+                tags = [t for t in (rec.get("tags") or []) if t not in removable]
+                if not save_one(rec, tags):
+                    return
+            self._refresh_pool_tab()
+            msg = "已移除共有标签：%s" % "、".join(removable)
+            if skipped:
+                msg += "\n以下特异标签未移除：%s" % "、".join(skipped)
+            messagebox.showinfo("标签", msg, parent=win)
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="添加勾选标签", command=apply_add).pack(side="left", padx=6)
+        ttk.Button(btns, text="移除勾选（仅共有）", command=apply_remove).pack(
+            side="left", padx=6)
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="left", padx=6)
+
     def _pool_delete(self):
         ids = self._pool_selected()
         if not ids:
@@ -1160,6 +1376,11 @@ class App:
         btns.pack(pady=8)
         ttk.Button(btns, text="确定", command=ok).pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
+        lb.bind("<Double-1>", lambda _e: ok())
+        # v3.7.0 修复：原实现建完窗口立刻 return，用户还没选就拿到 None，
+        # 导致「添加到事件…」「从事件导入…」静默失败（用户反馈的问题）。
+        win.transient(self.root)
+        win.wait_window(win)
         return picked["id"]
 
     def _pool_from_event(self):
@@ -1175,6 +1396,7 @@ class App:
             return
         pool = self.store.list_pool()
         added = updated = 0
+        touched = []
         for rec in recips:
             src = dict(rec)
             src.pop("id", None)
@@ -1184,12 +1406,21 @@ class App:
                 if not ok:
                     messagebox.showerror("保存失败", err)
                     return
+                touched.append(new_rec.get("id"))
                 added += 1
             elif is_update:
+                hit = next((r for r in pool
+                            if r.get("name") == src.get("name")), None)
+                if hit and hit.get("id"):
+                    touched.append(hit["id"])
                 updated += 1
         self._refresh_pool_tab()
         messagebox.showinfo("已收入收件人库",
-                            "新增 %d 位，按名称合并 %d 位（库里的口令保留）。" % (added, updated))
+                            "新增 %d 位，按名称合并 %d 位（库里的口令保留）。"
+                            % (added, updated))
+        if touched:
+            self._pool_tag_dialog(
+                touched, "给刚导入收件人库的 %d 位打标签" % len(touched))
 
     def _pool_to_event(self):
         ids = self._pool_selected()
@@ -1533,10 +1764,16 @@ class App:
             "         「▶ 处理」在当前页右下角显示处理进度与日志（带日期+时间），\n"
             "         不再跳转到其它页面。统一附件就在本页右栏。\n"
             "    ③ 邮件模板 —— 统一的主题与正文，{{字段}} 按每位收件人替换；\n"
-            "         保存后点「预生成 →」进入总览。\n"
+            "         编辑器即时所见即所得：字体、字号、文字色、背景色、\n"
+            "         左/中/右对齐、插入图片、插入字段；保存后点「预生成 →」。\n"
             "    ④ 总览 —— 左侧是所有要发的邮件清单（收件人 / 合并组），\n"
-            "         点一行右侧看邮件预览；下方附件可点文件名直接打开预览；\n"
-            "         确认后点「生成全部 Outlook 草稿」（只建草稿，不发送）。\n\n"
+            "         点一行右侧是编辑器，可单独改这一封并「保存这封邮件」；\n"
+            "         下方附件可点文件名直接打开；确认后生成全部 Outlook 草稿\n"
+            "         （生成时会使用保存的单封修改）。\n\n"
+            "收件人库：\n"
+            "    · 可给收件人打标签；「标签…」支持批量添加、批量移除共有标签；\n"
+            "    · 只属于部分收件人的特异标签不会被批量移除；\n"
+            "    · 「从事件导入…」收进库后会提示给这批收件人打标签。\n\n"
             "输出目录：\n"
             "    以「设置 → 默认输出目录」为准；未设置时用程序所在文件夹。\n"
             "    处理与生成草稿都用同一个目录，事件里不再单独保存输出路径。\n\n"
@@ -1556,9 +1793,8 @@ class App:
             "    导入会先做数据校验，逐行列出问题，确认后才写入\n"
             "3. 文档流水线：加条目、配参数，点「▶ 处理」生成文件；\n"
             "    右栏日志会显示进度与每条结果\n"
-            "4. 邮件模板：写统一主题与正文，点「预生成 →」\n"
-            "5. 总览：逐行核对邮件与附件，点文件名可打开预览；\n"
-            "    确认后点「生成全部 Outlook 草稿」\n\n"
+            "4. 邮件模板：写统一主题与正文（字体/图片/颜色/对齐均可），点「预生成 →」\n"
+            "5. 总览：逐行核对；右侧可直接编辑单封并保存，确认后生成全部草稿\n\n"
             "生成完成后到 Outlook 草稿箱逐封复核，人工发送。")        ).pack(anchor="w", padx=10, pady=8)
 
     # ================= 事件工作台 =================
@@ -2768,7 +3004,6 @@ class App:
         self._wb_run_mode = "process"
         self._cancel = threading.Event()
         self._wb_clear_log()
-        self._wb_set_progress(0)
         self.log("===== 处理开始：按当前参数全量生成 =====")
         self.log("输出目录：%s" % outdir)
 
@@ -2966,8 +3201,6 @@ class App:
         self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
                                           command=self._wb_process)
         self._wb_process_btn.pack(side="left")
-        self._wb_progress2 = ttk.Progressbar(prow, length=110, mode="determinate")
-        self._wb_progress2.pack(side="right")
         ttk.Label(proc, foreground="#888", wraplength=520, justify="left",
                   text="每次点击都按当前参数全量重跑，覆盖上次结果；完成后在下表更新"
                        "每位收件人的文件路径。这里只生成文件，Outlook 草稿在「总览」页生成。"
@@ -4220,7 +4453,8 @@ class App:
         ev = self._wb_event
         mail = ev.setdefault("mail", {})
         ttk.Label(parent, text="邮件模板", style="Head.TLabel").pack(anchor="w")
-        ttk.Label(parent, text="与流水线字段共用同一套字段表。",
+        ttk.Label(parent, text=("统一的主题与正文；编辑器就是所见即所得，"
+                                "可设字体/字号/颜色/背景/对齐、插图片与字段。"),
                   style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
 
         top = ttk.Frame(parent)
@@ -4243,28 +4477,8 @@ class App:
 
         self._build_editor_toolbar(parent)
 
-        bot = ttk.Frame(parent)
-        bot.pack(side="bottom", fill="x", pady=4)
-        ttk.Button(bot, text="保存模板", command=self._wb_save_mail).pack(side="left")
-        ttk.Button(bot, text="预生成 →", command=self._wb_mail_preview_next
-                   ).pack(side="left", padx=6)
-        ttk.Button(bot, text="导入HTML文件…", command=self._wb_import_html).pack(side="left", padx=6)
-        ttk.Button(bot, text="恢复默认", command=self._wb_reset_mail).pack(side="left")
-        ttk.Button(bot, text="刷新预览", command=self._wb_refresh_preview).pack(side="left", padx=6)
-        ttk.Label(bot, foreground="#888", text=(
-            "可用字段：收件人名称 / 水印名称 / 打开口令 / 日期"
-            " + 收件人自定义字段 + 事件常量（无权限口令字段）")).pack(side="left", padx=8)
-
-        pw = ttk.PanedWindow(parent, orient="horizontal")
-        pw.pack(fill="both", expand=True, pady=4)
-        pvpane = tk.Frame(pw, width=340, background="#ffffff")
-        pvpane.pack_propagate(False)
-        ttk.Label(pvpane, text="预览（近似渲染，可拖中缝调整）", foreground="#666",
-                  background="#ffffff").pack(anchor="w", padx=4, pady=2)
-        self.preview_label = tk.Label(pvpane, anchor="nw", background="#ffffff")
-        self.preview_label.pack(fill="both", expand=True)
-
-        editpane = ttk.Frame(pw)
+        editpane = ttk.Frame(parent)
+        editpane.pack(fill="both", expand=True, pady=4)
         t = tk.Text(editpane, undo=True, wrap="word", font=("Microsoft YaHei", 12),
                     spacing1=4, spacing3=4, padx=12, pady=8,
                     relief="solid", borderwidth=1)
@@ -4275,14 +4489,23 @@ class App:
         t.configure(yscrollcommand=sb.set)
         t.bind("<<Paste>>", self._ed_rich_paste)
         t.bind("<KeyRelease>", self._ed_on_key)
-        pw.add(editpane, weight=1)
-        pw.add(pvpane, weight=0)
-        pw.bind("<ButtonRelease-1>", lambda _e: self._wb_refresh_preview())
+
+        self._build_editor_toolbar(parent)
+
+        bot = ttk.Frame(parent)
+        bot.pack(side="bottom", fill="x", pady=4)
+        ttk.Button(bot, text="保存模板", command=self._wb_save_mail).pack(side="left")
+        ttk.Button(bot, text="预生成 →", command=self._wb_mail_preview_next
+                   ).pack(side="left", padx=6)
+        ttk.Button(bot, text="导入HTML文件…", command=self._wb_import_html).pack(side="left", padx=6)
+        ttk.Button(bot, text="恢复默认", command=self._wb_reset_mail).pack(side="left")
+        ttk.Label(bot, foreground="#888", text=(
+            "可用字段：收件人名称 / 水印名称 / 打开口令 / 日期"
+            " + 收件人自定义字段 + 事件常量（无权限口令字段）")).pack(side="left", padx=8)
 
         load_html(t, mail.get("body", "") or DEFAULT_BODY)
         if not mail.get("subject"):
             self.mail_subject_var.set(DEFAULT_SUBJECT)
-        self._wb_refresh_preview()
 
     def _wb_collect_mail(self):
         body = (text_to_html(self.body_text)
@@ -4297,7 +4520,6 @@ class App:
         mail["cc_default"] = self.mail_cc_var.get().strip()
         mail["bcc_default"] = self.mail_bcc_var.get().strip()
         self._wb_save()
-        self._wb_refresh_preview()
         if not quiet:
             messagebox.showinfo("模板", "已保存")
 
@@ -4316,7 +4538,6 @@ class App:
         if getattr(self, "body_text", None) is not None:
             load_html(self.body_text, DEFAULT_BODY)
         self._wb_save()
-        self._wb_refresh_preview()
 
     def _wb_import_html(self):
         path = filedialog.askopenfilename(title="导入正文 HTML",
@@ -4336,31 +4557,13 @@ class App:
         mail = self._wb_event.setdefault("mail", {})
         mail["body"] = text_to_html(self.body_text)
         self._wb_save()
-        self._wb_refresh_preview()
         messagebox.showinfo("导入完成", "已导入并保存为当前模板。")
 
     def _wb_refresh_preview(self):
-        try:
-            import io
-            from PIL import Image, ImageTk
-            recips = self._wb_event.get("recipients", [])
-            rec = recips[0] if recips else {
-                "name": "【示例收件人名称】", "wm": "【示例水印名称】", "open_pw": "【示例口令】"}
-            subject, body = self._wb_collect_mail()
-            html = ('<div style="font-family:sans-serif;">'
-                    '<p><b>标题：</b>%s</p><hr>%s</div>'
-                    % (_htmlmod.escape(subject), body))
-            png = render_preview_pixmap(html)
-            img = Image.open(io.BytesIO(png))
-            w = max(self.preview_label.winfo_width(), 200) - 4
-            if w > 20 and img.width > w:
-                img = img.resize((w, int(img.height * w / img.width)))
-            self._preview_img = ImageTk.PhotoImage(img)
-            self.preview_label.configure(image=self._preview_img, text="")
-            self.preview_label.image = self._preview_img
-        except Exception as e:
-            self.preview_label.configure(
-                image="", text="预览渲染失败：%s\n（可点「刷新预览」重试）" % e)
+        """v3.7.0：编辑器改为所见即所得，不再维护右侧预览；保留空实现兼容旧调用。"""
+        if not hasattr(self, "preview_label"):
+            return
+        return
 
     # ---------- 步骤 4：总览（预生成核对 / 生成草稿） ----------
 
@@ -4385,8 +4588,6 @@ class App:
         self.btn_rerun = ttk.Button(act, text="只重跑失败项",
                                     command=self._wb_rerun_failed)
         self.btn_rerun.pack(side="left")
-        self.wb_progress = ttk.Progressbar(act, length=180, mode="determinate")
-        self.wb_progress.pack(side="right")
         self.wb_status = ttk.Label(act, text="", style="Sub.TLabel")
         self.wb_status.pack(side="right", padx=8)
         ttk.Label(act, foreground="#b00",
@@ -4455,18 +4656,46 @@ class App:
             tree.selection_set(sorted(self._wb_ov_iids.keys(),
                                       key=lambda x: int(x[2:]))[0])
 
-        ttk.Label(rightpane, text="邮件预览（按左侧选中行）：",
+        ttk.Label(rightpane, text="邮件内容（可单独修改这一封）：",
                   style="Sub.TLabel").pack(anchor="w")
-        self._wb_ov_subject = tk.Label(rightpane, anchor="w", justify="left",
-                                       wraplength=440, background="#ffffff")
-        self._wb_ov_subject.pack(fill="x", pady=(2, 2))
-        self._wb_ov_body = tk.Label(rightpane, anchor="nw", justify="left",
-                                    background="#ffffff")
-        self._wb_ov_body.pack(fill="both", expand=True)
-        ttk.Label(rightpane, text="所需附件（点文件名打开预览）：",
-                  style="Sub.TLabel").pack(anchor="w", pady=(6, 0))
-        self._wb_ov_files_frame = ttk.Frame(rightpane)
+        subj = ttk.Frame(rightpane)
+        subj.pack(fill="x", pady=(2, 2))
+        ttk.Label(subj, text="主题：").pack(side="left")
+        self._ov_subject_var = tk.StringVar(value="")
+        ttk.Entry(subj, textvariable=self._ov_subject_var, width=46).pack(
+            side="left", fill="x", expand=True, padx=4)
+
+        self._build_editor_toolbar(rightpane)
+
+        _attach_holder = ttk.Frame(rightpane)
+        _attach_holder.pack(side="bottom", fill="x", pady=(4, 0))
+        ttk.Label(_attach_holder, text="所需附件（点文件名打开预览）：",
+                  style="Sub.TLabel").pack(anchor="w")
+        self._wb_ov_files_frame = ttk.Frame(_attach_holder)
         self._wb_ov_files_frame.pack(fill="x", pady=(2, 0))
+
+        edframe = ttk.Frame(rightpane)
+        edframe.pack(fill="both", expand=True, pady=(2, 2))
+        self._ov_body_text = tk.Text(
+            edframe, undo=True, wrap="word", font=("Microsoft YaHei", 11),
+            spacing1=3, spacing3=3, padx=10, pady=6,
+            relief="solid", borderwidth=1)
+        self.body_text = self._ov_body_text
+        self._ov_body_text.pack(side="left", fill="both", expand=True)
+        _sb = ttk.Scrollbar(edframe, command=self._ov_body_text.yview)
+        _sb.pack(side="left", fill="y")
+        self._ov_body_text.configure(yscrollcommand=_sb.set)
+        self._ov_body_text.bind("<<Paste>>", self._ed_rich_paste)
+        self._ov_body_text.bind("<KeyRelease>", self._ed_on_key)
+
+        ovbtns = ttk.Frame(rightpane)
+        ovbtns.pack(fill="x", pady=(2, 2))
+        ttk.Button(ovbtns, text="保存这封邮件", command=self._wb_ov_save).pack(side="left")
+        ttk.Button(ovbtns, text="恢复统一模板", command=self._wb_ov_reset).pack(
+            side="left", padx=6)
+        self._ov_status = ttk.Label(ovbtns, text="", style="Sub.TLabel")
+        self._ov_status.pack(side="left", padx=6)
+
         self._wb_overview_show(tree)
 
         # 生成日志（底部）
@@ -4493,33 +4722,64 @@ class App:
         rows = getattr(self, "_wb_ov_rows", [])
         if idx is None or idx >= len(rows):
             return
-        _key, unit, names = rows[idx]
+        key, unit, names = rows[idx]
+        self._wb_ov_cur_key = key
         ev = self._wb_event
         mail = ev.get("mail") or {}
-        subject_tpl = mail.get("subject") or DEFAULT_SUBJECT
-        body_tpl = mail.get("body") or DEFAULT_BODY
         rep = unit.get("rep") or {}
         fmap = lp_v3.build_field_map(rep, ev)
         owner_pw = rep.get("owner_pw", "")
-        subject = lp_v3.render_with_fields(subject_tpl, fmap, owner_pw)
-        body = lp_v3.render_with_fields(body_tpl, fmap, owner_pw, escape=True)
+        base_subject = mail.get("subject") or DEFAULT_SUBJECT
+        base_body = mail.get("body") or DEFAULT_BODY
+        subject = lp_v3.render_with_fields(base_subject, fmap, owner_pw)
+        body = lp_v3.render_with_fields(base_body, fmap, owner_pw, escape=True)
+        ov = (ev.get("mail_overrides") or {}).get(key) or {}
+        if ov:
+            subject = ov.get("subject") or subject
+            body = ov.get("body") or body
+        self._ov_subject_var.set(subject)
+        load_html(self._ov_body_text, body)
         who = unit.get("group") or rep.get("name", "")
-        self._wb_ov_subject.configure(text="【%s】主题：%s" % (who, subject))
-        try:
-            import io
-            from PIL import Image, ImageTk
-            html = ('<div style="font-family:sans-serif;">%s</div>' % body)
-            png = render_preview_pixmap(html)
-            img = Image.open(io.BytesIO(png))
-            w = max(self._wb_ov_body.winfo_width(), 220) - 4
-            if w > 20 and img.width > w:
-                img = img.resize((w, int(img.height * w / img.width)))
-            self._wb_ov_img = ImageTk.PhotoImage(img)
-            self._wb_ov_body.configure(image=self._wb_ov_img, text="")
-            self._wb_ov_body.image = self._wb_ov_img
-        except Exception:
-            self._wb_ov_body.configure(image="", text=body)
+        state = "已单独修改" if ov else "跟随统一模板"
+        self._ov_status.configure(text="【%s】%s" % (who, state))
         self._wb_ov_show_files(unit, names)
+
+    def _wb_ov_save(self):
+        key = getattr(self, "_wb_ov_cur_key", None)
+        if not key:
+            return
+        ev = self._wb_event
+        body = text_to_html(self._ov_body_text)
+        subject = self._ov_subject_var.get().strip()
+        ev.setdefault("mail_overrides", {})[key] = {
+            "subject": subject, "body": body}
+        self._wb_save()
+        self._ov_status.configure(text="已保存：%s" % self._ov_status.cget("text"))
+        self._wb_log("已保存单封邮件修改：%s" % key)
+
+    def _wb_ov_reset(self):
+        key = getattr(self, "_wb_ov_cur_key", None)
+        if not key:
+            return
+        ev = self._wb_event
+        (ev.get("mail_overrides") or {}).pop(key, None)
+        self._wb_save()
+        ev = self._wb_event
+        rows = getattr(self, "_wb_ov_rows", [])
+        idx = next((i for i, r in enumerate(rows) if r[0] == key), None)
+        if idx is not None:
+            # 重新载入统一模板内容
+            _k, unit, names = rows[idx]
+            mail = ev.get("mail") or {}
+            rep = unit.get("rep") or {}
+            fmap = lp_v3.build_field_map(rep, ev)
+            owner_pw = rep.get("owner_pw", "")
+            self._ov_subject_var.set(lp_v3.render_with_fields(
+                mail.get("subject") or DEFAULT_SUBJECT, fmap, owner_pw))
+            load_html(self._ov_body_text, lp_v3.render_with_fields(
+                mail.get("body") or DEFAULT_BODY, fmap, owner_pw, escape=True))
+            who = unit.get("group") or rep.get("name", "")
+            self._ov_status.configure(text="【%s】跟随统一模板" % who)
 
     def _wb_ov_show_files(self, unit, names):
         """总览右下附件：优先显示真实文件路径，点击文件名打开预览。"""
@@ -4644,7 +4904,6 @@ class App:
         self._wb_run_mode = "drafts"
         self._cancel = threading.Event()
         self._wb_set_running(True)
-        self._wb_set_progress(0)
         self._wb_clear_log()
 
         def job(get_word):
@@ -4703,6 +4962,9 @@ class App:
 
     # ================= 富文本编辑器（复用 v2 实现） =================
 
+    EDITOR_FONTS = ("微软雅黑", "宋体", "黑体", "楷体", "仿宋",
+                    "Arial", "Times New Roman", "Courier New")
+
     def _build_editor_toolbar(self, parent):
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(4, 2))
@@ -4711,37 +4973,66 @@ class App:
                       font=("", 10, "bold" if opt == "b" else "normal"),
                       relief="groove",
                       command=lambda o=opt: self._ed_toggle(o)).pack(side="left", padx=1)
+
+        ttk.Label(bar, text=" 字体").pack(side="left")
+        self._ed_font = ttk.Combobox(bar, width=11, state="readonly",
+                                     values=list(self.EDITOR_FONTS))
+        self._ed_font.set("微软雅黑")
+        self._ed_font.pack(side="left", padx=2)
+        self._ed_font.bind("<<ComboboxSelected>>",
+                           lambda _e: self._ed_restyle(f=self._ed_font.get()))
+
         ttk.Label(bar, text=" 字号").pack(side="left")
         self._ed_size = ttk.Combobox(bar, width=3, state="readonly",
-                                     values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24)])
+                                     values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24, 28)])
         self._ed_size.set("14")
         self._ed_size.pack(side="left", padx=2)
-        self._ed_size.bind("<Return>", lambda _e: self._ed_restyle(s=int(self._ed_size.get())))
-        ttk.Button(bar, text="设定", width=4,
-                   command=lambda: self._ed_restyle(s=int(self._ed_size.get()))).pack(side="left", padx=1)
+        self._ed_size.bind("<<ComboboxSelected>>",
+                           lambda _e: self._ed_restyle(s=int(self._ed_size.get())))
+        self._ed_size.bind("<Return>",
+                           lambda _e: self._ed_restyle(s=int(self._ed_size.get())))
+
         ttk.Button(bar, text="文字色", width=6, command=self._ed_pick_fg).pack(side="left", padx=2)
-        ttk.Button(bar, text="高亮", width=5, command=self._ed_pick_bg).pack(side="left", padx=1)
-        ttk.Button(bar, text="居中", width=4,
-                   command=lambda: self._ed_align("center")).pack(side="left", padx=2)
+        ttk.Button(bar, text="背景色", width=6, command=self._ed_pick_bg).pack(side="left", padx=1)
         ttk.Button(bar, text="左对齐", width=6,
-                   command=lambda: self._ed_align(None)).pack(side="left", padx=1)
+                   command=lambda: self._ed_align(None)).pack(side="left", padx=(6, 1))
+        ttk.Button(bar, text="居中", width=4,
+                   command=lambda: self._ed_align("center")).pack(side="left", padx=1)
+        ttk.Button(bar, text="右对齐", width=6,
+                   command=lambda: self._ed_align("right")).pack(side="left", padx=1)
+        ttk.Button(bar, text="插入图片…", width=10,
+                   command=self._ed_insert_image).pack(side="left", padx=4)
         ttk.Button(bar, text="清除格式", width=8,
                    command=lambda: self._ed_restyle(b=None, i=None, u=None, c=None,
-                                                    s=None, bg=None)).pack(side="left", padx=8)
+                                                    s=None, bg=None, f=None)).pack(side="left", padx=4)
         flds = ttk.Menubutton(bar, text="插入字段 ▾")
         m = tk.Menu(flds, tearoff=0)
         for fld in FIELDS:
-            m.add_command(label=fld, command=lambda x=fld: self.body_text.insert("insert", x))
+            m.add_command(label=fld, command=lambda x=fld: self._insert_editor_text(x))
         for fld in self._wb_field_columns():
             ph = "{{%s}}" % fld
-            m.add_command(label=ph, command=lambda x=ph: self.body_text.insert("insert", x))
+            m.add_command(label=ph, command=lambda x=ph: self._insert_editor_text(x))
         consts = ((self._wb_event or {}).get("options") or {}).get("constants") or {}
         for fld in consts:
             ph = "{{%s}}" % fld
             m.add_command(label=ph + "（常量）",
-                          command=lambda x=ph: self.body_text.insert("insert", x))
+                          command=lambda x=ph: self._insert_editor_text(x))
         flds["menu"] = m
         flds.pack(side="left", padx=2)
+
+    def _insert_editor_text(self, text):
+        tw = getattr(self, "body_text", None)
+        if tw is not None:
+            tw.insert("insert", text)
+
+    def _ed_insert_image(self):
+        from tkinter import filedialog as _fd
+        path = _fd.askopenfilename(
+            title="插入图片",
+            filetypes=[("图片", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp"),
+                       ("所有文件", "*.*")])
+        if path:
+            _editor_insert_image(self.body_text, path)
 
     def _ed_need_sel(self):
         try:
@@ -4814,9 +5105,7 @@ class App:
         return "break"
 
     def _ed_on_key(self, _e=None):
-        if getattr(self, "_ed_after", None):
-            self.root.after_cancel(self._ed_after)
-        self._ed_after = self.root.after(1200, self._wb_refresh_preview)
+        pass
 
     # ================= 水印设置 =================
 
@@ -5190,16 +5479,7 @@ class App:
                 if kind == "log":
                     self._wb_log(payload)
                 elif kind == "prog":
-                    try:
-                        self.wb_progress.configure(value=payload)
-                    except Exception:
-                        pass
-                    bar2 = getattr(self, "_wb_progress2", None)
-                    if bar2 is not None:
-                        try:
-                            bar2.configure(value=payload)
-                        except Exception:
-                            pass
+                    pass
                 elif kind == "run_done":
                     if isinstance(payload, tuple):
                         run_obj, run_ev = payload
@@ -5279,15 +5559,6 @@ class App:
                 box.configure(state="disabled")
             except Exception:
                 pass
-
-    def _wb_set_progress(self, value):
-        for name in ("wb_progress", "_wb_progress2"):
-            bar = getattr(self, name, None)
-            if bar is not None:
-                try:
-                    bar.configure(value=value)
-                except Exception:
-                    pass
 
     def _wb_log(self, msg, no_stamp=False):
         """写日志到当前页的日志框（带日期+时间；附件重复提示用橙色）。"""

@@ -389,3 +389,89 @@ def test_workbench_recipients_step_has_pool_buttons(app):
     walk(app._wb_content)
     assert any("从收件人库添加" in t for t in labels), labels
     assert any("存入收件人库" in t for t in labels), labels
+
+# ---------------------------------------------------------------- v3.7.0
+
+def test_pool_tags_saved_and_filtered(app):
+    _pool_rec(app, "甲公司", tags=["重点", "华东"])
+    _pool_rec(app, "乙公司", tags=["重点"])
+    app.show_screen("home")
+    app._refresh_pool_tab()
+    pool = {r["name"]: r for r in app.store.list_pool()}
+    assert pool["甲公司"]["tags"] == ["重点", "华东"]
+    assert pool["乙公司"]["tags"] == ["重点"]
+
+
+def test_pool_batch_tags_only_remove_common(app):
+    _pool_rec(app, "甲公司", tags=["重点", "华东"])
+    _pool_rec(app, "乙公司", tags=["重点"])
+    app.show_screen("home")
+    app._refresh_pool_tab()
+    tree = app._pool_tree
+    tree.selection_set(tree.get_children())
+    app._pool_tags()
+    dlg = _new_toplevel(app)
+    assert dlg is not None
+
+    # 添加：输入新标签并应用
+    entry = next(w for w in _walk(dlg) if w.winfo_class() == "TEntry")
+    entry.insert(0, "新标签")
+    btn = next(w for w in _walk(dlg) if w.winfo_class() == "TButton"
+               and "添加勾选" in str(w.cget("text")))
+    btn.invoke()
+    app.root.update()
+    pool = {r["name"]: r for r in app.store.list_pool()}
+    assert "新标签" in pool["甲公司"]["tags"] and "新标签" in pool["乙公司"]["tags"]
+
+    # 移除特有标签：勾选「华东」应被拒绝（不是共有）
+    tree.selection_set(tree.get_children())
+    app._pool_tags()
+    dlg = _new_toplevel(app)
+    cbs = [w for w in _walk(dlg) if w.winfo_class() == "TCheckbutton"]
+    east = next(w for w in cbs if "华东" in str(w.cget("text")))
+    east.invoke()
+    remove_btn = next(w for w in _walk(dlg) if w.winfo_class() == "TButton"
+                      and "移除勾选" in str(w.cget("text")))
+    remove_btn.invoke()
+    app.root.update()
+    pool = {r["name"]: r for r in app.store.list_pool()}
+    assert "华东" in pool["甲公司"]["tags"], "特异标签不能被批量移除"
+
+    # 移除共有标签「重点」：两人都应移除
+    tree.selection_set(tree.get_children())
+    app._pool_tags()
+    dlg = _new_toplevel(app)
+    cbs = [w for w in _walk(dlg) if w.winfo_class() == "TCheckbutton"]
+    common = next(w for w in cbs if "重点" in str(w.cget("text")))
+    common.invoke()
+    remove_btn = next(w for w in _walk(dlg) if w.winfo_class() == "TButton"
+                      and "移除勾选" in str(w.cget("text")))
+    remove_btn.invoke()
+    app.root.update()
+    pool = {r["name"]: r for r in app.store.list_pool()}
+    assert "重点" not in pool["甲公司"]["tags"]
+    assert "重点" not in pool["乙公司"]["tags"]
+
+
+def test_pick_event_waits_for_user_selection(app):
+    """回归：_pick_event 旧实现建窗后立即 return None，导致「添加到事件」静默失效。"""
+    ev = _event(app, "目标事件")
+    app.show_screen("home")
+    app.root.update()
+    picked = []
+
+    def choose():
+        dlg = _new_toplevel(app)
+        if dlg is None:
+            return
+        lb = next(w for w in _walk(dlg) if w.winfo_class() == "Listbox")
+        labels = [lb.get(i) for i in range(lb.size())]
+        idx = next(i for i, txt in enumerate(labels) if "目标事件" in txt)
+        lb.selection_set(idx)
+        b = next(w for w in _walk(dlg) if w.winfo_class() == "TButton"
+                 and str(w.cget("text")) == "确定")
+        b.invoke()
+
+    app.root.after(200, choose)
+    eid = app._pick_event("选择事件")
+    assert eid == ev["id"], "对话框应等用户选择后返回事件 id，实际=%r" % eid

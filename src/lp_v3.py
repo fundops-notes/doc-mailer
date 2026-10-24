@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.6.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.7.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -755,6 +755,7 @@ def normalize_event(ev):
         "recipients": [], "pipeline": [], "attachments": [],
         "mail": dict(DEFAULT_MAIL), "options": dict(DEFAULT_OPTIONS),
         "process_results": {},
+        "mail_overrides": {},
     }
     if not isinstance(ev, dict):
         return out
@@ -764,6 +765,13 @@ def normalize_event(ev):
     po = ev.get("process_overrides")
     if isinstance(po, dict):
         out["process_overrides"] = po
+    mo = ev.get("mail_overrides")
+    if isinstance(mo, dict):
+        out["mail_overrides"] = {
+            str(k): {"subject": str(v.get("subject") or ""),
+                     "body": str(v.get("body") or "")}
+            for k, v in mo.items() if isinstance(v, dict)
+        }
     for k in ("id", "name", "biz_type", "due_date", "notes",
               "created_at", "updated_at", "status", "scenario_id", "scenario_name"):
         v = ev.get(k)
@@ -909,11 +917,20 @@ def normalize_pool_recipient(rec):
     out = dict(normalize_recipient(rec))
     out["id"] = ""
     out["updated_at"] = ""
+    out["tags"] = []
     if isinstance(rec, dict):
         for k in ("id", "updated_at"):
             v = rec.get(k)
             if isinstance(v, str):
                 out[k] = v
+        tags = rec.get("tags")
+        if isinstance(tags, list):
+            seen = set()
+            for t in tags:
+                t = str(t).strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    out["tags"].append(t)
     if not out["id"]:
         out["id"] = _new_id("rcp")
     return out
@@ -977,6 +994,13 @@ def pool_merge_recipient(pool, rec):
     for r in pool:
         if (r or {}).get("name", "") == name:
             merged, _a, _u = merge_recipient_into_list(pool, src)
+            # 已存在：标签取并集（导入/合并不丢标签）
+            cur = r
+            tags = list(cur.get("tags") or [])
+            for t in src.get("tags") or []:
+                if t not in tags:
+                    tags.append(t)
+            cur["tags"] = tags
             return merged, None, True
     pool.append(src)
     return pool, src, False
@@ -2309,13 +2333,52 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None
     if bcc:
         mail.BCC = ";".join(bcc)
     mail.Subject = render_with_fields(subject_tpl, field_map, owner_pw)
-    mail.HTMLBody = render_with_fields(body_tpl, field_map, owner_pw, escape=True)
+    html = render_with_fields(body_tpl, field_map, owner_pw, escape=True)
+    # v3.7.0：编辑器插入的图片是 data URI；Outlook 桌面版不显示 data URI，
+    # 这里转成 cid 内嵌附件（附件先加，再给 HTMLBody 用 cid: 引用）。
+    temp_imgs = []
+    if "data:image/" in html:
+        import base64
+        import re as _re
+        import tempfile
+
+        def _inline(m):
+            mime = (m.group(1) or "png").lower()
+            b64 = m.group(2)
+            cid = "docmailer_img_%d@local" % len(temp_imgs)
+            try:
+                raw = base64.b64decode(b64)
+            except Exception:
+                return m.group(0)
+            fd = tempfile.NamedTemporaryFile(delete=False, suffix="." + mime)
+            fd.write(raw)
+            fd.close()
+            temp_imgs.append(fd.name)
+            att = mail.Attachments.Add(fd.name)
+            try:
+                att.PropertyAccessor.SetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid)
+            except Exception:
+                pass
+            return "cid:" + cid
+
+        html = _re.sub(r'data:image/([a-zA-Z0-9+.-]+);base64,([A-Za-z0-9+/=\s]+)',
+                       _inline, html)
+    mail.HTMLBody = html
     from_addr = rec.get("from_addr", "")
     if from_addr:
         mail.SentOnBehalfOfName = from_addr
     for f in attachments:
         mail.Attachments.Add(str(Path(f).resolve()))  # Outlook 是独立进程，必须绝对路径
-    mail.Save()  # 只存草稿；不调用 Send
+    try:
+        mail.Save()  # 只存草稿；不调用 Send
+    finally:
+        # 草稿保存后内嵌附件已复制进邮件，临时图片文件可以清理
+        for _p in temp_imgs:
+            try:
+                Path(_p).unlink(missing_ok=True)
+            except Exception:
+                pass
     return mail
 
 
@@ -2642,10 +2705,14 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         return files
 
     mail = event.get("mail") or {}
-    subject_tpl = mail.get("subject") or DEFAULT_SUBJECT_V3
-    body_tpl = mail.get("body") or DEFAULT_BODY_V3
+    base_subject = mail.get("subject") or DEFAULT_SUBJECT_V3
+    base_body = mail.get("body") or DEFAULT_BODY_V3
+    overrides = event.get("mail_overrides") or {}
 
     for key, unit in draft_units(event):
+        _ov = overrides.get(key) or {}
+        subject_tpl = _ov.get("subject") or base_subject
+        body_tpl = _ov.get("body") or base_body
         names = [r.get("name", "") for r in unit.get("recipients") or []]
         if only_recips is not None and not (set(names) & set(only_recips)):
             continue
