@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_351():
-    assert lp_tool.APP_VERSION == "3.5.1"
-    assert lp_v3.APP_VERSION == "3.5.1"
+def test_version_is_360():
+    assert lp_tool.APP_VERSION == "3.6.0"
+    assert lp_v3.APP_VERSION == "3.6.0"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -380,9 +380,10 @@ def test_help_page_text_updated(app):
             texts.append(str(w.cget("text")))
     joined = "\n".join(texts)
     # v3.5.0：颗粒度设置已移除，帮助页改为说明「按分组」
-    assert "按分组" in joined
-    assert "产出颗粒度" not in joined
-    for stale in ("产出粒度", "附件路径", "路径来源", "生成文档"):
+    assert "预生成" in joined
+    assert "生成全部 Outlook 草稿" in joined
+    assert "预览与生成" not in joined
+    for stale in ("产出粒度", "路径来源", "生成文档"):
         assert stale not in joined, "帮助页仍有旧文案：%s" % stale
 
 
@@ -857,3 +858,184 @@ def test_filename_template_per_word_mailmerge_item(app):
     assert name == "甲_专属账单"
     saved, _e = a.store.load_event(ev["id"])
     assert saved["pipeline"][0]["params"]["filename_tpl"] == "{{LP名称}}_专属账单"
+
+# ---------------------------------------------------------------- v3.6.0
+
+def test_workbench_four_steps_no_attachments_or_run_page(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "四步流程", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a.root.update()
+    titles = [str(b.cget("text")).splitlines()[0] for b in a._wb_step_buttons]
+    assert len(titles) == 4, titles
+    assert "附件" not in titles[2] and "预览与生成" not in titles
+    assert "邮件模板" in titles[2] and "总览" in titles[3]
+    assert not hasattr(a, "_wb_step_attachments")
+    assert not hasattr(a, "_wb_step_run")
+
+
+def test_process_stays_on_pipeline_and_uses_default_outdir(app, tmp_path, monkeypatch):
+    a, _mb, _fd, _err = app
+    pdf = tmp_path / "附件.pdf"
+    import fitz
+    doc = fitz.open(); doc.new_page(); doc.save(str(pdf)); doc.close()
+    outdir = tmp_path / "统一输出"
+    a.settings["outdir"] = str(outdir)
+    a.store.save_settings(a.settings)
+    ev = _save_event(a, "处理日志", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": [str(pdf)]}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    a._wb_process()
+    for _ in range(600):
+        a.root.update()
+        if not a.running:
+            break
+        import time as _t
+        _t.sleep(0.02)
+    for _ in range(20):
+        a.root.update()
+    assert a._wb_step == 1, "处理不应跳到总览/其它页面"
+    logtxt = a._wb_pipe_log.get("1.0", "end")
+    assert "[附件重复提示]" not in logtxt
+    assert any(line.startswith("[20") for line in logtxt.splitlines() if line)
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["options"]["outdir"] == str(outdir)
+    paths = [p for v in (saved.get("process_results") or {}).values() for p in v]
+    assert paths and all(str(outdir) in p for p in paths), paths
+
+
+def test_log_duplicate_notice_orange(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "日志颜色", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    a._wb_log("[附件重复提示] 文件 A 与 B 内容相同")
+    a.root.update()
+    box = a._wb_pipe_log
+    assert box.tag_cget("dup", "foreground") == "#c25e00"
+    assert box.tag_ranges("dup"), "重复提示应打上橙色 tag"
+
+
+def test_mail_pregen_enters_overview(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "预生成", [{"name": "甲", "to": "a@x.com",
+                                    "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a.root.update()
+    a._wb_mail_preview_next()
+    a.root.update()
+    assert a._wb_step == 3
+    assert hasattr(a, "_wb_ov_rows")
+
+
+def test_overview_attachment_filename_opens(app, tmp_path, monkeypatch):
+    a, _mb, _fd, _err = app
+    pdf = tmp_path / "打开我.pdf"
+    import fitz
+    doc = fitz.open(); doc.new_page(); doc.save(str(pdf)); doc.close()
+    ev = _save_event(a, "附件打开", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": [str(pdf)]}}])
+    ev["process_results"] = {"甲": [str(pdf)]}
+    a.store.save_event(ev)
+    a.open_event(ev["id"])
+    a._wb_show_step(3)
+    a.root.update()
+    opened = []
+    monkeypatch.setattr(lp_tool.os, "startfile", lambda p: opened.append(p))
+    labels = [w for w in _walk(a._wb_ov_files_frame)
+              if _cls(w) == "Label" and str(w.cget("text")).startswith("· ")]
+    assert labels, "总览附件栏应显示文件名"
+    assert labels[0].bind("<Button-1>"), "附件文件名应绑定点击打开"
+    a._wb_open_file(str(pdf))
+    a.root.update()
+    assert opened == [str(pdf)]
+
+
+def test_top_actions_only_in_event(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "顶部按钮", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}])
+    a.show_screen("home")
+    a.root.update()
+    assert a._ev_actions.winfo_manager() == ""
+    a.open_event(ev["id"])
+    a.root.update()
+    assert a._ev_actions.winfo_manager() == "pack"
+    texts = [str(w.cget("text")) for w in _walk(a._ev_actions) if _cls(w) == "TButton"]
+    assert "返回列表" in texts and "事件信息…" in texts
+
+
+def test_home_edit_event_dialog_renames(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "旧名字", [{"name": "甲", "to": "a@x.com",
+                                    "open_pw": "Open123456", "owner_pw": "Owner123456"}])
+    a.show_screen("home")
+    a.root.update()
+    ids = a.ev_tree.get_children()
+    target = next(i for i in ids if a.ev_tree.item(i)["values"][0] == "旧名字")
+    a.ev_tree.selection_set(target)
+    a._edit_event_dialog()
+    a.root.update()
+    dlg = _find_toplevel(a.root, "事件信息")
+    assert dlg is not None
+    ents = [w for w in _walk(dlg) if _cls(w) == "TEntry"]
+    ents[0].delete(0, "end")
+    ents[0].insert(0, "首页新名字")
+    for t, b in _buttons(dlg):
+        if t == "保存":
+            b.invoke()
+            break
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["name"] == "首页新名字"
+
+
+def test_event_info_send_mode_actually_effective(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "模式确认", [
+        {"name": "甲", "to": "a@x.com", "group": "G1",
+         "open_pw": "Open123456", "owner_pw": "Owner123456"},
+        {"name": "乙", "to": "b@x.com", "group": "G1",
+         "open_pw": "Open223456", "owner_pw": "Owner223456"},
+    ], pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_event_info()
+    a.root.update()
+    dlg = _find_toplevel(a.root, "事件信息")
+    combo = next(w for w in _walk(dlg) if _cls(w) == "TCombobox")
+    combo.set("每人一份")
+    combo.event_generate("<<ComboboxSelected>>")
+    for t, b in _buttons(dlg):
+        if t == "保存":
+            b.invoke()
+            break
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["options"]["send_mode"] == "per_lp"
+    assert len(lp_v3.draft_units(saved)) == 2, "每人一份应产生 2 封"
+    # 切回按组合并
+    a._wb_event_info()
+    a.root.update()
+    dlg = _find_toplevel(a.root, "事件信息")
+    combo = next(w for w in _walk(dlg) if _cls(w) == "TCombobox")
+    combo.set("按组合并")
+    combo.event_generate("<<ComboboxSelected>>")
+    for t, b in _buttons(dlg):
+        if t == "保存":
+            b.invoke()
+            break
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["options"]["send_mode"] == "per_group"
+    assert len(lp_v3.draft_units(saved)) == 1, "同组合并应产生 1 封"

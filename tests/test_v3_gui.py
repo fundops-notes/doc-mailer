@@ -162,7 +162,7 @@ def test_new_event_from_home_no_scenario(app):
     assert new and new[0].get("scenario_id") == ""
 
 
-def test_workbench_all_five_steps(app):
+def test_workbench_all_four_steps(app):
     app.show_screen("home")
     ev = lp_v3.new_event("测试事件")
     ev["recipients"].append(lp_v3.normalize_recipient(
@@ -170,7 +170,7 @@ def test_workbench_all_five_steps(app):
     app.store.save_event(ev)
     app.open_event(ev["id"])
     assert app._wb_event is not None
-    for i in range(5):
+    for i in range(4):
         app._wb_show_step(i)
         assert app._wb_content.winfo_children(), "步骤 %d 没有内容" % (i + 1)
     # 步骤1 的收件人表里能看到刚加的人
@@ -306,7 +306,7 @@ def test_pipeline_item_params_keep_tk_variables_alive(app):
 def test_run_panel_shows_preflight_errors(app):
     ev = _event_with(app, recips=[{"name": "甲", "to": "a@x.com",
                                    "open_pw": "", "owner_pw": ""}])
-    app._wb_show_step(5)
+    app._wb_show_step(3)
     assert app._wb_content.winfo_children(), "预检面板应该有内容"
 
 
@@ -322,7 +322,7 @@ def test_run_panel_lists_expected_outputs(app, tmp_path):
                                                 "encrypt": True}}],
                      recips=[{"name": "甲公司", "to": "a@x.com",
                               "open_pw": "op12345678", "owner_pw": "ow12345678"}])
-    app._wb_show_step(5)
+    app._wb_show_step(3)
     labels = []
     for c in app._wb_content.winfo_children():
         for sub in c.winfo_children():
