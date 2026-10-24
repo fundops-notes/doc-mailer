@@ -63,28 +63,36 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.7.3"
+APP_VERSION = "3.8.0"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.7.3"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.8.0"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
 
-# v3.5.0：莫兰迪浅色系（顶部导航 + 功能色块）
-MORANDI_BG = "#F4F1EC"
-MORANDI_TOP = "#E8E2D7"
-MORANDI_CARD = "#FBF8F3"
-MORANDI_LINE = "#D8D0C4"
-MORANDI_TEXT = "#3F3C37"
-MORANDI_MUTED = "#77726A"
-MORANDI_HOME = "#CBD8C4"
-MORANDI_HOME_ON = "#B7C9AD"
-MORANDI_SET = "#DFD1C2"
-MORANDI_SET_ON = "#CDBBA8"
-MORANDI_HELP = "#C7D3DC"
-MORANDI_HELP_ON = "#B3C4D0"
-MORANDI_STEP = "#E9E3D9"
-MORANDI_STEP_ON = "#DDD4C6"
+# v3.8.0：Modern Enterprise SaaS 设计令牌
+MORANDI_BG = "#F8FAFC"        # 主背景
+MORANDI_TOP = "#FFFFFF"       # 表面/顶栏
+MORANDI_CARD = "#FFFFFF"      # 卡片
+MORANDI_LINE = "#E2E8F0"      # 分割线/边框
+MORANDI_TEXT = "#0F172A"      # 主文字
+MORANDI_MUTED = "#64748B"     # 次级文字
+MORANDI_HOME = "#EFF6FF"      # 导航选中底色
+MORANDI_HOME_ON = "#DBEAFE"
+MORANDI_SET = "#FFFFFF"
+MORANDI_SET_ON = "#F1F5F9"
+MORANDI_HELP = "#FFFFFF"
+MORANDI_HELP_ON = "#F1F5F9"
+MORANDI_STEP = "#FFFFFF"
+MORANDI_STEP_ON = "#EFF6FF"
+SAAS_ACCENT = "#2563EB"
+SAAS_ACCENT_HOVER = "#1D4ED8"
+SAAS_SUCCESS = "#16A34A"
+SAAS_WARN = "#D97706"
+SAAS_ERROR = "#DC2626"
+SAAS_SUBTLE = "#F1F5F9"
+SAAS_BORDER_STRONG = "#CBD5E1"
+SAAS_FONT = "Microsoft YaHei UI"
 
 # 邮件模板里永远可用的内置字段（**没有权限口令**，这是架构保证不是靠自觉）
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -632,6 +640,12 @@ class App:
         self._poll_id = None
         self._shell_widgets = []
         self._wb_last_run = None
+        self._mail_dirty = False
+        self._ov_dirty = False
+        self._ov_dirty_key = None
+        self._suppress_dirty = False
+        self._current_screen = "home"
+        self._ov_ignore_select = False
 
         self._build_shell()
         if getattr(self, "_boot_error", None):
@@ -679,76 +693,132 @@ class App:
     # ================= 外壳 =================
 
     def _build_shell(self):
-        """v3.5.0：主导航移到顶部（按钮形式），整体莫兰迪浅色块。"""
+        """v3.8.0：Modern Enterprise SaaS 外壳（左侧导航 + 顶栏 + 统一 Design System）。"""
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except Exception:
             pass
+        root = self.root
+        try:
+            root.configure(bg=MORANDI_BG)
+            root.option_add("*Background", MORANDI_BG)
+            root.option_add("*Font", (SAAS_FONT, 10))
+        except Exception:
+            pass
+        style.configure(".", background=MORANDI_BG, foreground=MORANDI_TEXT,
+                        font=(SAAS_FONT, 10))
         style.configure("TFrame", background=MORANDI_BG)
+        style.configure("Surface.TFrame", background=MORANDI_TOP)
         style.configure("TLabel", background=MORANDI_BG, foreground=MORANDI_TEXT)
-        style.configure("TButton", padding=(8, 5))
-        style.configure("TNotebook", background=MORANDI_BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background="#E4DFD4", foreground=MORANDI_TEXT,
-                        padding=(14, 6))
-        style.map("TNotebook.Tab", background=[("selected", MORANDI_CARD)])
         style.configure("Head.TLabel", background=MORANDI_BG, foreground=MORANDI_TEXT,
-                        font=("", 15, "bold"))
-        style.configure("Sub.TLabel", background=MORANDI_BG, foreground=MORANDI_MUTED)
+                        font=(SAAS_FONT, 18, "bold"))
+        style.configure("Sub.TLabel", background=MORANDI_BG, foreground=MORANDI_MUTED,
+                        font=(SAAS_FONT, 9))
+        style.configure("TButton", padding=(12, 7), background=MORANDI_TOP,
+                        foreground=MORANDI_TEXT, borderwidth=1, relief="solid")
+        style.map("TButton",
+                  background=[("active", SAAS_SUBTLE), ("disabled", SAAS_SUBTLE)],
+                  foreground=[("disabled", "#94A3B8")])
+        style.configure("Accent.TButton", background=SAAS_ACCENT,
+                        foreground="#FFFFFF", borderwidth=0, padding=(14, 8),
+                        font=(SAAS_FONT, 10, "bold"))
+        style.map("Accent.TButton",
+                  background=[("active", SAAS_ACCENT_HOVER),
+                              ("pressed", SAAS_ACCENT_HOVER),
+                              ("disabled", "#93C5FD")])
+        style.configure("Danger.TButton", foreground=SAAS_ERROR)
+        style.configure("Nav.TButton", background=MORANDI_TOP, foreground=MORANDI_MUTED,
+                        padding=(16, 10), anchor="w", borderwidth=0, relief="flat",
+                        font=(SAAS_FONT, 10))
+        style.map("Nav.TButton", background=[("active", SAAS_SUBTLE)],
+                  foreground=[("active", MORANDI_TEXT)])
+        style.configure("NavOn.TButton", background=MORANDI_HOME,
+                        foreground=SAAS_ACCENT, padding=(16, 10), anchor="w",
+                        borderwidth=0, relief="flat",
+                        font=(SAAS_FONT, 10, "bold"))
+        style.map("NavOn.TButton", background=[("active", MORANDI_HOME_ON)])
+        style.configure("TNotebook", background=MORANDI_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=MORANDI_BG,
+                        foreground=MORANDI_MUTED, padding=(14, 8),
+                        font=(SAAS_FONT, 10))
+        style.map("TNotebook.Tab",
+                  background=[("selected", MORANDI_TOP)],
+                  foreground=[("selected", MORANDI_TEXT)])
         style.configure("Card.TLabelframe", background=MORANDI_CARD,
-                        bordercolor=MORANDI_LINE)
+                        bordercolor=MORANDI_LINE, relief="solid", padding=12)
         style.configure("Card.TLabelframe.Label", background=MORANDI_CARD,
-                        foreground="#5A564E", font=("", 10, "bold"))
-        style.configure("Treeview", background="#FFFDFA", fieldbackground="#FFFDFA",
-                        foreground=MORANDI_TEXT, rowheight=24)
-        style.configure("Treeview.Heading", background="#E7E1D6",
-                        foreground=MORANDI_TEXT)
-        style.map("Treeview.Heading", background=[("active", "#DDD5C7")])
-        style.configure("Step.TButton", background=MORANDI_STEP,
-                        foreground=MORANDI_TEXT, padding=(10, 7), anchor="w",
-                        borderwidth=0, relief="flat")
-        style.map("Step.TButton", background=[("active", MORANDI_STEP_ON)])
-        for key, col, on in (("Home", MORANDI_HOME, MORANDI_HOME_ON),
-                             ("Settings", MORANDI_SET, MORANDI_SET_ON),
-                             ("Help", MORANDI_HELP, MORANDI_HELP_ON)):
-            style.configure("Nav%s.TButton" % key, background=col,
-                            foreground="#33402F", padding=(20, 8), borderwidth=0,
-                            relief="flat", font=("", 10, "bold"))
-            style.map("Nav%s.TButton" % key,
-                      background=[("active", on), ("pressed", on)])
-            style.configure("Nav%sOn.TButton" % key, background=on,
-                            foreground="#22301F", padding=(20, 8), borderwidth=0,
-                            relief="flat", font=("", 10, "bold"))
-            style.map("Nav%sOn.TButton" % key,
-                      background=[("active", on), ("pressed", on)])
+                        foreground=MORANDI_TEXT, font=(SAAS_FONT, 10, "bold"))
+        style.configure("Treeview", background=MORANDI_TOP,
+                        fieldbackground=MORANDI_TOP, foreground=MORANDI_TEXT,
+                        rowheight=28, borderwidth=0, font=(SAAS_FONT, 9))
+        style.configure("Treeview.Heading", background=SAAS_SUBTLE,
+                        foreground="#475569", relief="flat",
+                        font=(SAAS_FONT, 9, "bold"), padding=(8, 6))
+        style.map("Treeview.Heading", background=[("active", "#E2E8F0")])
+        style.map("Treeview", background=[("selected", "#DBEAFE")],
+                  foreground=[("selected", "#0F172A")])
+        style.configure("TEntry", padding=(8, 6), fieldbackground=MORANDI_TOP,
+                        bordercolor=MORANDI_LINE)
+        style.configure("TCombobox", padding=(8, 5), fieldbackground=MORANDI_TOP)
+        style.configure("Step.TButton", background=MORANDI_TOP,
+                        foreground=MORANDI_TEXT, padding=(10, 9), anchor="w",
+                        borderwidth=0, relief="flat", font=(SAAS_FONT, 9))
+        style.map("Step.TButton", background=[("active", SAAS_SUBTLE)])
+        style.configure("StepOn.TButton", background=MORANDI_HOME,
+                        foreground=SAAS_ACCENT, padding=(10, 9), anchor="w",
+                        borderwidth=0, relief="flat",
+                        font=(SAAS_FONT, 9, "bold"))
+        style.map("StepOn.TButton", background=[("active", MORANDI_HOME_ON)])
+        style.configure("TSeparator", background=MORANDI_LINE)
 
-        top = tk.Frame(self.root, bg=MORANDI_TOP)
-        top.pack(fill="x")
-        self._shell_widgets.append(top)
-        inner = tk.Frame(top, bg=MORANDI_TOP)
-        inner.pack(fill="x", padx=16, pady=8)
-        tk.Label(inner, text="文档分发助手", bg=MORANDI_TOP, fg=MORANDI_TEXT,
-                 font=("", 16, "bold")).pack(side="left")
-        navbox = tk.Frame(inner, bg=MORANDI_TOP)
-        navbox.pack(side="left", padx=(26, 0))
+        # ---- 左侧导航 ----
+        outer = tk.Frame(root, bg=MORANDI_BG)
+        outer.pack(fill="both", expand=True)
+        self._shell_widgets.append(outer)
+        sidebar = tk.Frame(outer, bg=MORANDI_TOP, width=216,
+                           highlightbackground=MORANDI_LINE, highlightthickness=1)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        brand = tk.Frame(sidebar, bg=MORANDI_TOP)
+        brand.pack(fill="x", padx=18, pady=(20, 18))
+        tk.Label(brand, text="文档分发助手", bg=MORANDI_TOP, fg=MORANDI_TEXT,
+                 font=(SAAS_FONT, 13, "bold"), anchor="w").pack(fill="x")
+        tk.Label(brand, text="Document Dispatch", bg=MORANDI_TOP, fg=MORANDI_MUTED,
+                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
+
+        tk.Label(sidebar, text="工作台", bg=MORANDI_TOP, fg="#94A3B8",
+                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=20, pady=(4, 4))
         self._nav_buttons = {}
         for key, text in (("home", "事件库"), ("settings", "设置"), ("help", "帮助")):
-            b = ttk.Button(navbox, text=text, style="Nav%s.TButton" % key.capitalize(),
+            b = ttk.Button(sidebar, text=text, style="Nav.TButton",
                            command=lambda k=key: self.show_screen(k))
-            b.pack(side="left", padx=(0, 8))
+            b.pack(fill="x", padx=12, pady=2)
             self._nav_buttons[key] = b
-        right = tk.Frame(inner, bg=MORANDI_TOP)
+        tk.Frame(sidebar, bg=MORANDI_TOP).pack(fill="both", expand=True)
+        tk.Label(sidebar, text="v" + APP_VERSION, bg=MORANDI_TOP, fg=MORANDI_MUTED,
+                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=20, pady=(0, 16))
+
+        # ---- 右侧主区域 ----
+        main = tk.Frame(outer, bg=MORANDI_BG)
+        main.pack(side="left", fill="both", expand=True)
+        topbar = tk.Frame(main, bg=MORANDI_TOP, height=56,
+                          highlightbackground=MORANDI_LINE, highlightthickness=1)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+        top_inner = tk.Frame(topbar, bg=MORANDI_TOP)
+        top_inner.pack(fill="both", expand=True, padx=24)
+        self.crumb = tk.Label(top_inner, text="", bg=MORANDI_TOP, fg=MORANDI_MUTED,
+                              font=(SAAS_FONT, 9), anchor="w")
+        self.crumb.pack(side="left")
+        right = tk.Frame(top_inner, bg=MORANDI_TOP)
         right.pack(side="right")
         ttk.Button(right, text="检查更新",
                    command=lambda: self.check_update(False)).pack(side="right")
-        tk.Label(right, text="v" + APP_VERSION, bg=MORANDI_TOP, fg=MORANDI_MUTED,
-                 font=("", 9)).pack(side="right", padx=10)
-        self.crumb = tk.Label(right, text="", bg=MORANDI_TOP, fg=MORANDI_MUTED,
-                              font=("", 9))
-        self.crumb.pack(side="right", padx=10)
-        # v3.6.0：进入事件后，返回列表/事件信息放在全局右上角（原工作台顶部移除）
+        # 事件操作（进入事件显示）
         self._ev_actions = tk.Frame(right, bg=MORANDI_TOP)
-        self._ev_actions.pack(side="right", padx=(0, 6))
+        self._ev_actions.pack(side="right", padx=(0, 8))
         self._ev_actions_btns = [
             ttk.Button(self._ev_actions, text="返回列表",
                        command=lambda: self.show_screen("home")),
@@ -759,24 +829,27 @@ class App:
             _b.pack(side="left", padx=(0, 6))
         self._ev_actions.pack_forget()
 
-        body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, padx=14, pady=(10, 10))
-        self._shell_widgets.append(body)
-        self.content = ttk.Frame(body)
+        content_host = ttk.Frame(main)
+        content_host.pack(fill="both", expand=True, padx=24, pady=(20, 24))
+        self.content = ttk.Frame(content_host)
         self.content.pack(fill="both", expand=True)
         self.show_screen("home")
 
     def _set_nav_active(self, name):
         active = {"event": "home"}.get(name, name)
         for key, b in getattr(self, "_nav_buttons", {}).items():
-            style = ("Nav%sOn.TButton" if key == active else "Nav%s.TButton") % key.capitalize()
             try:
-                b.configure(style=style)
+                b.configure(style="NavOn.TButton" if key == active else "Nav.TButton")
             except Exception:
                 pass
 
     def show_screen(self, name):
         """切换顶层页面（首次进入时构建）。"""
+        if (getattr(self, "_current_screen", "") == "event"
+                and name != "event"
+                and not self._handle_unsaved_before_leave(name)):
+            return
+        self._current_screen = name
         for f in self._screens.values():
             f.pack_forget()
         if name != "event":
@@ -810,9 +883,9 @@ class App:
 
     def _guide(self, parent, text):
         """页顶部的说明条。"""
-        ttk.Label(parent, text=text, background="#E9E4D8", foreground="#4F4A41",
-                  padding=(10, 7), wraplength=1080, justify="left").pack(
-            fill="x", pady=(0, 4))
+        ttk.Label(parent, text=text, background="#EFF6FF", foreground="#1E40AF",
+                  padding=(12, 9), wraplength=1080, justify="left").pack(
+            fill="x", pady=(0, 12))
 
     # ================= 事件库（主页面） =================
 
@@ -849,23 +922,26 @@ class App:
     def _build_events_tab(self, parent):
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(0, 4))
-        for text, cmd in (("新建事件", self._new_event),
-                          ("复制", self._dup_event),
-                          ("删除", self._del_event),
+        ttk.Button(bar, text="＋ 新建事件", style="Accent.TButton",
+                   command=self._new_event).pack(side="left", padx=(0, 6))
+        for text, cmd in (("打开工作台", self._open_selected_event),
                           ("编辑事件…", self._edit_event_dialog),
-                          ("打开工作台", self._open_selected_event)):
+                          ("复制", self._dup_event),
+                          ("删除", self._del_event)):
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.home_status = ttk.Label(bar, text="", style="Sub.TLabel")
+        self.home_status.pack(side="right")
+        bar2 = ttk.Frame(parent)
+        bar2.pack(fill="x", pady=(0, 8))
         for text, cmd in (("导入收件人…", self._lib_import_recipients),
                           ("导出收件人…", self._lib_export_recipients),
                           ("导出全部收件人…", self._lib_export_all_recipients),
                           ("导出事件…", self._lib_export_event),
                           ("导入事件备份…", self._lib_import_event),
                           ("备份全部…", self._lib_export_backup)):
-            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
-        ttk.Button(bar, text="刷新", command=self._refresh_home).pack(side="left", padx=8)
-        self.home_status = ttk.Label(bar, text="", style="Sub.TLabel")
-        self.home_status.pack(side="right")
+            ttk.Button(bar2, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        ttk.Button(bar2, text="刷新", command=self._refresh_home).pack(
+            side="left", padx=(8, 0))
 
         paned = tk.PanedWindow(parent, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -1089,22 +1165,29 @@ class App:
 
         bar = ttk.Frame(f)
         bar.pack(fill="x", pady=(0, 4))
-        for text, cmd, tip in (
-                ("新增", self._pool_new, "在收件人库里新增一条"),
-                ("编辑", self._pool_edit, "编辑选中的收件人"),
-                ("标签…", self._pool_tags, "给选中收件人批量加/移除标签"),
-                ("删除", self._pool_delete, "从库里删除选中的收件人"),
-                ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
-                ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
-                ("导入 Excel/CSV", self._pool_import, "按收件人清单模板导入（可先下载模板）"),
-                ("导出 Excel", self._pool_export, "把收件人库导出成 Excel"),
-        ):
+        bar2 = ttk.Frame(f)
+        bar2.pack(fill="x", pady=(0, 8))
+        primary = (
+            ("＋ 新增", self._pool_new, "在收件人库里新增一条"),
+            ("编辑", self._pool_edit, "编辑选中的收件人"),
+            ("标签…", self._pool_tags, "给选中收件人批量加/移除标签"),
+            ("删除", self._pool_delete, "从库里删除选中的收件人"),
+            ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
+            ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
+        )
+        secondary = (
+            ("导入 Excel/CSV", self._pool_import, "按收件人清单模板导入"),
+            ("导出 Excel", self._pool_export, "把收件人库导出成 Excel"),
+            ("下载导入模板", self._wb_export_template, "收件人清单模板"),
+        )
+        for text, cmd, tip in primary:
             b = ttk.Button(bar, text=text, command=cmd)
-            b.pack(side="left", padx=2)
+            b.pack(side="left", padx=(0, 4))
             ToolTip(b, tip)
-        b = ttk.Button(bar, text="下载导入模板", command=self._wb_export_template)
-        b.pack(side="left", padx=(10, 2))
-        ToolTip(b, "收件人清单模板（含填写说明页），与事件里用的是同一份")
+        for text, cmd, tip in secondary:
+            b = ttk.Button(bar2, text=text, command=cmd)
+            b.pack(side="left", padx=(0, 4))
+            ToolTip(b, tip)
 
         frame = ttk.Frame(f)
         frame.pack(fill="both", expand=True)
@@ -1749,7 +1832,7 @@ class App:
             "替换通过 Word 查找替换完成，字体、字号、颜色、表格、页眉页脚、分页全部保持原样。\n"
             "在「文档流水线 → 字段映射」里，每个占位符单独选一个来源：\n"
             "    · 收件人名称 / 水印名称 / 打开口令 / 日期 —— 内置\n"
-            "    · 收件人字段 —— 收件人表里的自定义列（可临时加列）\n"
+            "    · 本事件字段 —— 由 Excel/要素模板导入的数据列\n"
             "    · 事件常量 —— 事件选项里定义的固定值\n"
             "    · 外部数据表 —— 从 Excel 按收件人匹配进来的列\n"
             "表格里有一列「预览值」，直接显示以第一位收件人为例填进去会是什么。\n"
@@ -1845,19 +1928,32 @@ class App:
         body.pack(fill="both", expand=True)
 
         # 左侧步骤导航
-        nav = ttk.Frame(body, width=168)
+        nav = ttk.Frame(body, width=156)
         nav.pack(side="left", fill="y")
         nav.pack_propagate(False)
         self._wb_step_buttons = []
         for i, (title, _key) in enumerate(WB_STEPS):
-            b = ttk.Button(nav, style="Step.TButton", text="", width=20,
+            b = ttk.Button(nav, style="Step.TButton", text="", width=18,
                            command=lambda n=i: self._wb_show_step(n))
-            b.pack(fill="x", padx=4, pady=1)
+            b.pack(fill="x", padx=4, pady=2)
             self._wb_step_buttons.append(b)
 
         # 右侧内容区
         self._wb_content = ttk.Frame(body)
         self._wb_content.pack(side="left", fill="both", expand=True)
+
+        # 步骤推进条（右下角：上一步 / 下一步）
+        foot = ttk.Frame(f)
+        # 放在 body 之前 pack，保证底部推进条始终可见
+        foot.pack(side="bottom", fill="x", pady=(6, 0), before=body)
+        self._wb_step_hint = ttk.Label(foot, text="", style="Sub.TLabel")
+        self._wb_step_hint.pack(side="left", padx=4)
+        self._wb_next_btn = ttk.Button(foot, text="下一步 →", style="Accent.TButton",
+                                       command=self._wb_next_step)
+        self._wb_next_btn.pack(side="right")
+        self._wb_prev_btn = ttk.Button(foot, text="← 上一步",
+                                       command=self._wb_prev_step)
+        self._wb_prev_btn.pack(side="right", padx=6)
 
         self._wb_refresh_nav()
         self._wb_show_step(0)
@@ -1879,7 +1975,36 @@ class App:
                                   len(ev.get("recipients", [])),
                                   len(ev.get("pipeline", []))))
 
+    def _wb_prev_step(self):
+        if self._wb_step > 0:
+            self._wb_show_step(self._wb_step - 1)
+
+    def _wb_next_step(self):
+        if self._wb_step < len(WB_STEPS) - 1:
+            self._wb_show_step(self._wb_step + 1)
+
+    def _wb_update_step_buttons(self):
+        i = self._wb_step
+        for b in getattr(self, "_wb_step_buttons", []):
+            pass
+        try:
+            for j, b in enumerate(getattr(self, "_wb_step_buttons", [])):
+                b.configure(style="StepOn.TButton" if j == i else "Step.TButton")
+            self._wb_prev_btn.state(["!disabled"] if i > 0 else ["disabled"])
+            self._wb_next_btn.state(["!disabled"]
+                                    if i < len(WB_STEPS) - 1 else ["disabled"])
+            prev_t = WB_STEPS[i - 1][0] if i > 0 else "（已是第一步）"
+            next_t = WB_STEPS[i + 1][0] if i < len(WB_STEPS) - 1 else "（已到最后一步）"
+            self._wb_step_hint.configure(
+                text="当前：%s　｜　上一步：%s　｜　下一步：%s"
+                     % (WB_STEPS[i][0], prev_t, next_t))
+        except Exception:
+            pass
+
     def _wb_show_step(self, idx):
+        if idx != self._wb_step and not self._handle_unsaved_before_leave(
+                WB_STEPS[idx][0] if idx < len(WB_STEPS) else "下一步"):
+            return
         self._wb_step = idx
         for c in self._wb_content.winfo_children():
             c.destroy()
@@ -1888,6 +2013,59 @@ class App:
         builder(self._wb_content)
         self._set_crumb("事件 · %s · %s" % (self._wb_event.get("name", ""),
                                             WB_STEPS[idx][0]))
+        self._wb_update_step_buttons()
+
+    def _ask_unsaved(self, what):
+        """返回 save / discard / cancel；有未保存修改时的强提醒。"""
+        msg = ("「%s」有未保存的修改。\n\n"
+               "点「是」保存并继续；点「否」不保存继续；点「取消」留在当前页。"
+               % what)
+        fn = getattr(messagebox, "askyesnocancel", None)
+        if fn is not None:
+            r = fn("未保存的修改", msg)
+            return "save" if r is True else ("discard" if r is False else "cancel")
+        r = messagebox.askyesno("未保存的修改", msg)
+        return "save" if r else "discard"
+
+    def _confirm_overview_dirty(self):
+        if not self._ov_dirty:
+            return True
+        action = self._ask_unsaved("这封邮件的修改")
+        if action == "cancel":
+            return False
+        if action == "save":
+            try:
+                self._wb_ov_save(quiet=True)
+            except Exception:
+                pass
+        self._ov_dirty = False
+        return True
+
+    def _handle_unsaved_before_leave(self, target="切换页面"):
+        """离开当前页/生成前调用。返回 False 表示用户取消。"""
+        if self._mail_dirty:
+            action = self._ask_unsaved("邮件模板")
+            if action == "cancel":
+                return False
+            if action == "save":
+                try:
+                    self._wb_save_mail(quiet=True)
+                except Exception:
+                    pass
+            self._mail_dirty = False
+        if self._ov_dirty:
+            if not self._confirm_overview_dirty():
+                return False
+        return True
+
+    def _mark_active_dirty(self, *_a):
+        if getattr(self, "_suppress_dirty", False):
+            return
+        if getattr(self, "_wb_step", -1) == 2:
+            self._mail_dirty = True
+        elif getattr(self, "_wb_step", -1) == 3:
+            self._ov_dirty = True
+            self._ov_dirty_key = getattr(self, "_wb_ov_cur_key", None)
 
     def _default_outdir(self):
         """统一输出目录：设置里的默认输出目录；未设置则程序所在文件夹。"""
@@ -2029,31 +2207,39 @@ class App:
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(0, 4))
-        for text, cmd, tip in [
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(0, 4))
+        bar2 = ttk.Frame(parent)
+        bar2.pack(fill="x", pady=(0, 8))
+        primary = [
             ("导入 Excel/CSV", self._wb_import_recipients,
              "从 xlsx/csv 批量导入收件人清单。\n"
              "流程：选文件 → 逐行数据校验 → 可视化导入结果 → 写入。\n"
-             "按表头名识别列；未识别的列会作为「自定义字段」收进来，供文档映射使用。\n"
-             "同名 LP 覆盖更新、异名新增；口令列留空自动生成随机口令。"),
+             "按表头名识别列；未识别的列会作为自定义字段收进来，供文档映射使用。"),
             ("下载导入模板", self._wb_export_template,
-             "导出一份带表头、示例行和「填写说明」页的 Excel，\n"
-             "发给业务方按说明填写后再导回来。"),
+             "导出一份带表头、示例行和「填写说明」页的 Excel。"),
             ("导出收件人 Excel", self._wb_export_recipients,
-             "把当前事件的收件人清单导出成 Excel（含自定义字段列与口令）。"),
+             "把当前事件的收件人清单导出成 Excel。"),
             ("新增", self._wb_edit_recipient, "手工添加一位收件人。"),
             ("编辑", self._wb_edit_recipient, "编辑选中的收件人（也可直接双击行）。"),
             ("删除", self._wb_delete_recipients, "删除选中的收件人（可多选）。"),
+        ]
+        secondary = [
             ("检查附件", self._wb_check_attachments, "检查收件人专属附件文件是否存在。"),
             ("补齐缺失口令", self._wb_fill_passwords,
              "为打开口令/权限口令为空的收件人批量生成随机口令。"),
             ("从收件人库添加…", self._wb_add_from_pool,
-             "从收件人库（常用收件人）里挑人加进本事件。\n"
-             "按名称合并：本事件已有的口令不会被覆盖。"),
+             "从收件人库（常用收件人）里挑人加进本事件。"),
             ("存入收件人库", self._wb_save_to_pool,
-             "把本事件的收件人整个存进收件人库，方便下个事件复用。"),
-        ]:
+             "把本事件的收件人整个存进收件人库。"),
+        ]
+        for text, cmd, tip in primary:
             b = ttk.Button(bar, text=text, command=cmd)
-            b.pack(side="left", padx=2)
+            b.pack(side="left", padx=(0, 4))
+            ToolTip(b, tip)
+        for text, cmd, tip in secondary:
+            b = ttk.Button(bar2, text=text, command=cmd)
+            b.pack(side="left", padx=(0, 4))
             ToolTip(b, tip)
 
         cols = ["name", "to", "cc", "bcc", "wm", "group", "open_pw", "owner_pw"]
@@ -3158,9 +3344,9 @@ class App:
         pw2 = ttk.PanedWindow(parent, orient="horizontal")
         pw2.pack(fill="both", expand=True, pady=(0, 4))
         # v3.4.5：给两栏显式初始宽度，避免默认窗口下左栏被右栏挤到按钮被裁掉
-        left_col = ttk.Frame(pw2, width=540)
+        left_col = ttk.Frame(pw2, width=470)
         pw2.add(left_col, weight=5)
-        right_col = ttk.Frame(pw2, width=400)
+        right_col = ttk.Frame(pw2, width=360)
         pw2.add(right_col, weight=3)
 
         # ---------- 左栏：条目表 + 参数区 ----------
@@ -3237,9 +3423,8 @@ class App:
         self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
                                           command=self._wb_process)
         self._wb_process_btn.pack(side="left")
-        ttk.Label(proc, foreground="#888", wraplength=520, justify="left",
-                  text="每次点击都按当前参数全量重跑，覆盖上次结果；完成后在下表更新"
-                       "每位收件人的文件路径。这里只生成文件，Outlook 草稿在「总览」页生成。"
+        ttk.Label(proc, foreground=MORANDI_MUTED, wraplength=330, justify="left",
+                  text="每次点击都按当前参数全量重跑；只生成文件，草稿在「总览」页生成。"
                   ).pack(anchor="w", padx=8, pady=(0, 4))
 
         mframe = ttk.Frame(proc)
@@ -3247,7 +3432,7 @@ class App:
         mcols = ["name", "files", "paths", "state"]
         mheads = ["收件人名称", "将收到的文件", "文件路径", "状态"]
         self._wb_map_tree = ttk.Treeview(mframe, columns=mcols, show="headings",
-                                          height=6, selectmode="browse")
+                                          height=4, selectmode="browse")
         for c, h in zip(mcols, mheads):
             self._wb_map_tree.heading(c, text=h)
             self._wb_map_tree.column(
@@ -3265,15 +3450,14 @@ class App:
         save_row.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Button(save_row, text="保存自定义编辑",
                    command=self._wb_map_save_edits).pack(side="left")
-        ttk.Label(save_row, foreground="#888",
-                  text="双击「文件路径」可手动改；保存后写入事件 process_overrides。"
-                  ).pack(side="left", padx=8)
+        ttk.Label(save_row, foreground=MORANDI_MUTED,
+                  text="双击路径可改；保存后写入事件。").pack(side="left", padx=8)
         # v3.6.0：处理进度/日志就在当前页右下角，不再跳到别的页面
         logf = ttk.LabelFrame(proc, text=" 处理进度与日志（实时） ",
                               style="Card.TLabelframe")
         logf.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
         self._wb_pipe_log = tk.Text(logf, height=8, state="disabled",
-                                    font=("Consolas", 9), background="#fafafa",
+                                    font=("Consolas", 9), background=MORANDI_TOP,
                                     wrap="word")
         self._wb_pipe_log.pack(fill="both", expand=True, padx=6, pady=4)
         self._wb_pipe_log.tag_configure("dup", foreground="#c25e00")
@@ -3647,7 +3831,7 @@ class App:
         return "%04d-%02d-%02d" % (dt.year, dt.month, dt.day)
 
     def _wb_import_field_template(self, item):
-        """导入要素模板：Excel 回填「收件人名称 + 占位符列」到收件人字段。
+        """导入要素模板：Excel 回填「收件人名称 + 占位符列」到本事件字段。
 
         v3.4.6：导出要素模板之后必须能导回来。
         规则：按「收件人名称」匹配本事件收件人；每个占位符列的值写进该收件人的
@@ -4174,7 +4358,7 @@ class App:
 
         ttk.Label(win, foreground="#666", justify="left", wraplength=430, text=(
             "· 收件人名称 / 水印名称 / 打开口令 / 日期 —— 内置\n"
-            "· 收件人字段 —— 收件人表里你自己加的列（可临时加列）\n"
+            "· 本事件字段 —— 由 Excel/要素模板导入的数据列\n"
             "· 事件常量 —— 事件选项里定义的固定值\n"
             "· 外部数据表 —— 从 Excel 按收件人匹配进来的列")
         ).pack(anchor="w", padx=12, pady=(6, 0))
@@ -4577,21 +4761,26 @@ class App:
         row2.pack(fill="x", pady=2)
         ttk.Label(row2, text="代发地址：").pack(side="left")
         self.mail_from_var = tk.StringVar(value=mail.get("from_addr", ""))
-        ttk.Entry(row2, textvariable=self.mail_from_var, width=34).pack(side="left", padx=4)
-        ttk.Label(row2, text="默认抄送：").pack(side="left", padx=(10, 0))
+        ttk.Entry(row2, textvariable=self.mail_from_var, width=38).pack(side="left", padx=4)
+        row3 = ttk.Frame(parent)
+        row3.pack(fill="x", pady=2)
+        ttk.Label(row3, text="默认抄送：").pack(side="left")
         self.mail_cc_var = tk.StringVar(value=mail.get("cc_default", ""))
-        ttk.Entry(row2, textvariable=self.mail_cc_var, width=26).pack(side="left", padx=4)
-        ttk.Label(row2, text="默认密送：").pack(side="left", padx=(10, 0))
+        ttk.Entry(row3, textvariable=self.mail_cc_var, width=30).pack(side="left", padx=4)
+        ttk.Label(row3, text="默认密送：").pack(side="left", padx=(12, 0))
         self.mail_bcc_var = tk.StringVar(value=mail.get("bcc_default", ""))
-        ttk.Entry(row2, textvariable=self.mail_bcc_var, width=26).pack(side="left", padx=4)
+        ttk.Entry(row3, textvariable=self.mail_bcc_var, width=30).pack(side="left", padx=4)
+        for _v in (self.mail_subject_var, self.mail_from_var,
+                   self.mail_cc_var, self.mail_bcc_var):
+            _v.trace_add("write", self._mark_active_dirty)
 
         self._build_editor_toolbar(parent)
 
         editpane = ttk.Frame(parent)
         editpane.pack(fill="both", expand=True, pady=4)
-        t = tk.Text(editpane, undo=True, wrap="word", font=("Microsoft YaHei", 12),
-                    spacing1=4, spacing3=4, padx=12, pady=8,
-                    relief="solid", borderwidth=1)
+        t = tk.Text(editpane, undo=True, wrap="word", font=(SAAS_FONT, 11),
+                    spacing1=4, spacing3=4, padx=12, pady=10,
+                    background=MORANDI_TOP, relief="solid", borderwidth=1)
         self.body_text = t
         t.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(editpane, command=t.yview)
@@ -4600,10 +4789,8 @@ class App:
         t.bind("<<Paste>>", self._ed_rich_paste)
         t.bind("<KeyRelease>", self._ed_on_key)
 
-        self._build_editor_toolbar(parent)
-
         bot = ttk.Frame(parent)
-        bot.pack(side="bottom", fill="x", pady=4)
+        bot.pack(side="bottom", fill="x", pady=4, before=editpane)
         ttk.Button(bot, text="保存模板", command=self._wb_save_mail).pack(side="left")
         ttk.Button(bot, text="预生成 →", command=self._wb_mail_preview_next
                    ).pack(side="left", padx=6)
@@ -4613,9 +4800,14 @@ class App:
             "可用字段：收件人名称 / 水印名称 / 打开口令 / 日期"
             " + 收件人自定义字段 + 事件常量（无权限口令字段）")).pack(side="left", padx=8)
 
-        load_html(t, mail.get("body", "") or DEFAULT_BODY)
-        if not mail.get("subject"):
-            self.mail_subject_var.set(DEFAULT_SUBJECT)
+        self._suppress_dirty = True
+        try:
+            load_html(t, mail.get("body", "") or DEFAULT_BODY)
+            if not mail.get("subject"):
+                self.mail_subject_var.set(DEFAULT_SUBJECT)
+        finally:
+            self._suppress_dirty = False
+        self._mail_dirty = False
 
     def _wb_collect_mail(self):
         body = (text_to_html(self.body_text)
@@ -4629,13 +4821,18 @@ class App:
         mail["from_addr"] = self.mail_from_var.get().strip()
         mail["cc_default"] = self.mail_cc_var.get().strip()
         mail["bcc_default"] = self.mail_bcc_var.get().strip()
+        self._mail_dirty = False
         self._wb_save()
         if not quiet:
             messagebox.showinfo("模板", "已保存")
 
     def _wb_mail_preview_next(self):
-        """保存统一邮件模板后进入总览（预生成）。"""
+        """保存统一邮件模板 → 清空总览里的单封修改 → 进入总览。"""
         self._wb_save_mail(quiet=True)
+        ev = self._wb_event
+        if ev is not None:
+            ev["mail_overrides"] = {}     # v3.8.0：预生成覆盖之前的单封人工修改
+            self._wb_save()
         self._wb_show_step(WB_STEP_OVERVIEW)
 
     def _wb_reset_mail(self):
@@ -4693,6 +4890,7 @@ class App:
         self.btn_preflight = ttk.Button(act, text="预检", command=self._wb_preflight)
         self.btn_preflight.pack(side="left")
         self.btn_generate = ttk.Button(act, text="生成全部 Outlook 草稿",
+                                       style="Accent.TButton",
                                        command=self._wb_generate)
         self.btn_generate.pack(side="left", padx=6)
         self.btn_rerun = ttk.Button(act, text="只重跑失败项",
@@ -4727,8 +4925,8 @@ class App:
         pw.pack(fill="both", expand=True, pady=(4, 0))
         leftpane = ttk.Frame(pw)
         pw.add(leftpane, weight=1)
-        rightpane = ttk.Frame(pw, width=470)
-        pw.add(rightpane, weight=1)
+        rightpane = ttk.Frame(pw, width=640)
+        pw.add(rightpane, weight=2)
 
         ttk.Label(leftpane, text="要发送的邮件清单（收件人 / 合并组）：",
                   style="Sub.TLabel").pack(anchor="w")
@@ -4772,10 +4970,11 @@ class App:
         subj.pack(fill="x", pady=(2, 2))
         ttk.Label(subj, text="主题：").pack(side="left")
         self._ov_subject_var = tk.StringVar(value="")
+        self._ov_subject_var.trace_add("write", self._mark_active_dirty)
         ttk.Entry(subj, textvariable=self._ov_subject_var, width=46).pack(
             side="left", fill="x", expand=True, padx=4)
 
-        self._build_editor_toolbar(rightpane)
+        self._build_editor_toolbar(rightpane, compact=True)
 
         _attach_holder = ttk.Frame(rightpane)
         _attach_holder.pack(side="bottom", fill="x", pady=(4, 0))
@@ -4787,9 +4986,9 @@ class App:
         edframe = ttk.Frame(rightpane)
         edframe.pack(fill="both", expand=True, pady=(2, 2))
         self._ov_body_text = tk.Text(
-            edframe, undo=True, wrap="word", font=("Microsoft YaHei", 11),
-            spacing1=3, spacing3=3, padx=10, pady=6,
-            relief="solid", borderwidth=1)
+            edframe, undo=True, wrap="word", font=(SAAS_FONT, 10),
+            spacing1=3, spacing3=3, padx=10, pady=8,
+            background=MORANDI_TOP, relief="solid", borderwidth=1)
         self.body_text = self._ov_body_text
         self._ov_body_text.pack(side="left", fill="both", expand=True)
         _sb = ttk.Scrollbar(edframe, command=self._ov_body_text.yview)
@@ -4812,7 +5011,7 @@ class App:
         logf = ttk.LabelFrame(parent, text=" 生成日志 ", style="Card.TLabelframe")
         logf.pack(fill="x", pady=(6, 0))
         self._wb_ov_log = tk.Text(logf, height=6, state="disabled",
-                                  font=("Consolas", 9), background="#fafafa")
+                                  font=("Consolas", 9), background=MORANDI_TOP)
         self._wb_ov_log.pack(fill="both", expand=True, padx=6, pady=4)
         self._wb_ov_log.tag_configure("dup", foreground="#c25e00")
         self._wb_ov_log.tag_configure("err", foreground="#b00000")
@@ -4825,6 +5024,8 @@ class App:
             self._wb_ov_log.configure(state="disabled")
 
     def _wb_overview_show(self, tree):
+        if getattr(self, "_ov_ignore_select", False):
+            return
         sel = tree.selection()
         if not sel:
             return
@@ -4833,6 +5034,20 @@ class App:
         if idx is None or idx >= len(rows):
             return
         key, unit, names = rows[idx]
+        prev_key = getattr(self, "_wb_ov_cur_key", None)
+        if self._ov_dirty and prev_key and key != prev_key:
+            if not self._confirm_overview_dirty():
+                # 回到上一行，且不再次触发确认
+                prev_iid = next((iid for iid, i in getattr(self, "_wb_ov_iids", {}).items()
+                                 if i < len(rows) and rows[i][0] == prev_key), None)
+                self._ov_ignore_select = True
+                try:
+                    if prev_iid:
+                        tree.selection_set(prev_iid)
+                finally:
+                    self.root.after(50, lambda: setattr(self, "_ov_ignore_select", False))
+                return
+        self._suppress_dirty = True
         self._wb_ov_cur_key = key
         ev = self._wb_event
         mail = ev.get("mail") or {}
@@ -4853,8 +5068,11 @@ class App:
         state = "已单独修改" if ov else "跟随统一模板"
         self._ov_status.configure(text="【%s】%s" % (who, state))
         self._wb_ov_show_files(unit, names)
+        self._suppress_dirty = False
+        self._ov_dirty = False
+        self._ov_dirty_key = key
 
-    def _wb_ov_save(self):
+    def _wb_ov_save(self, quiet=False):
         key = getattr(self, "_wb_ov_cur_key", None)
         if not key:
             return
@@ -4864,8 +5082,11 @@ class App:
         ev.setdefault("mail_overrides", {})[key] = {
             "subject": subject, "body": body}
         self._wb_save()
-        self._ov_status.configure(text="已保存：%s" % self._ov_status.cget("text"))
-        self._wb_log("已保存单封邮件修改：%s" % key)
+        self._ov_dirty = False
+        self._ov_dirty_key = None
+        if not quiet:
+            self._ov_status.configure(text="已保存：%s" % self._ov_status.cget("text"))
+            self._wb_log("已保存单封邮件修改：%s" % key)
 
     def _wb_ov_reset(self):
         key = getattr(self, "_wb_ov_cur_key", None)
@@ -4989,6 +5210,8 @@ class App:
 
     def _wb_run(self, only_recips):
         """后台线程执行事件；结果回主线程刷新。"""
+        if not self._handle_unsaved_before_leave("生成草稿"):
+            return
         if self.running:
             messagebox.showinfo("正在执行", "上一次执行还没结束，请等它完成。")
             return
@@ -5075,47 +5298,69 @@ class App:
     EDITOR_FONTS = ("微软雅黑", "宋体", "黑体", "楷体", "仿宋",
                     "Arial", "Times New Roman", "Courier New")
 
-    def _build_editor_toolbar(self, parent):
+    EDITOR_FONTS = ("微软雅黑", "宋体", "黑体", "楷体", "仿宋",
+                    "Arial", "Times New Roman", "Courier New")
+
+    def _build_editor_toolbar(self, parent, compact=False):
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(4, 2))
         for label, opt in [("B", "b"), ("I", "i"), ("U", "u")]:
             tk.Button(bar, text=label, width=3,
                       font=("", 10, "bold" if opt == "b" else "normal"),
-                      relief="groove",
+                      relief="groove", background=MORANDI_TOP,
                       command=lambda o=opt: self._ed_toggle(o)).pack(side="left", padx=1)
 
-        ttk.Label(bar, text=" 字体").pack(side="left")
-        self._ed_font = ttk.Combobox(bar, width=11, state="readonly",
+        if not compact:
+            ttk.Label(bar, text=" 字体").pack(side="left")
+        self._ed_font = ttk.Combobox(bar, width=12 if not compact else 10,
+                                     state="readonly",
                                      values=list(self.EDITOR_FONTS))
         self._ed_font.set("微软雅黑")
-        self._ed_font.pack(side="left", padx=2)
+        self._ed_font.pack(side="left", padx=4)
         self._ed_font.bind("<<ComboboxSelected>>",
                            lambda _e: self._ed_restyle(f=self._ed_font.get()))
-
-        ttk.Label(bar, text=" 字号").pack(side="left")
+        if not compact:
+            ttk.Label(bar, text=" 字号").pack(side="left")
         self._ed_size = ttk.Combobox(bar, width=3, state="readonly",
                                      values=[str(x) for x in (10, 12, 14, 16, 18, 20, 24, 28)])
         self._ed_size.set("14")
-        self._ed_size.pack(side="left", padx=2)
+        self._ed_size.pack(side="left", padx=4)
         self._ed_size.bind("<<ComboboxSelected>>",
                            lambda _e: self._ed_restyle(s=int(self._ed_size.get())))
         self._ed_size.bind("<Return>",
                            lambda _e: self._ed_restyle(s=int(self._ed_size.get())))
+        if not compact:
+            ttk.Button(bar, text="文字色", width=7,
+                       command=self._ed_pick_fg).pack(side="left", padx=(12, 2))
+            ttk.Button(bar, text="背景色", width=7,
+                       command=self._ed_pick_bg).pack(side="left", padx=2)
 
-        ttk.Button(bar, text="文字色", width=6, command=self._ed_pick_fg).pack(side="left", padx=2)
-        ttk.Button(bar, text="背景色", width=6, command=self._ed_pick_bg).pack(side="left", padx=1)
-        ttk.Button(bar, text="左对齐", width=6,
-                   command=lambda: self._ed_align(None)).pack(side="left", padx=(6, 1))
-        ttk.Button(bar, text="居中", width=4,
-                   command=lambda: self._ed_align("center")).pack(side="left", padx=1)
-        ttk.Button(bar, text="右对齐", width=6,
-                   command=lambda: self._ed_align("right")).pack(side="left", padx=1)
-        ttk.Button(bar, text="插入图片…", width=10,
-                   command=self._ed_insert_image).pack(side="left", padx=4)
-        ttk.Button(bar, text="清除格式", width=8,
+        bar2 = ttk.Frame(parent)
+        bar2.pack(fill="x", pady=(0, 2))
+        if compact:
+            ttk.Button(bar2, text="文字色", width=7,
+                       command=self._ed_pick_fg).pack(side="left", padx=(0, 2))
+            ttk.Button(bar2, text="背景色", width=7,
+                       command=self._ed_pick_bg).pack(side="left", padx=2)
+            ttk.Button(bar2, text="左对齐", width=7,
+                       command=lambda: self._ed_align(None)).pack(side="left", padx=(10, 2))
+        else:
+            ttk.Button(bar2, text="左对齐", width=7,
+                       command=lambda: self._ed_align(None)).pack(side="left", padx=(0, 2))
+        ttk.Button(bar2, text="居中", width=5,
+                   command=lambda: self._ed_align("center")).pack(side="left", padx=2)
+        ttk.Button(bar2, text="右对齐", width=7,
+                   command=lambda: self._ed_align("right")).pack(side="left", padx=2)
+
+        bar3 = ttk.Frame(parent)
+        if compact or True:
+            bar3.pack(fill="x", pady=(0, 3))
+        ttk.Button(bar3, text="插入图片…", width=11,
+                   command=self._ed_insert_image).pack(side="left", padx=(0, 2))
+        ttk.Button(bar3, text="清除格式", width=9,
                    command=lambda: self._ed_restyle(b=None, i=None, u=None, c=None,
-                                                    s=None, bg=None, f=None)).pack(side="left", padx=4)
-        flds = ttk.Menubutton(bar, text="插入字段 ▾")
+                                                    s=None, bg=None, f=None)).pack(side="left", padx=2)
+        flds = ttk.Menubutton(bar3, text="插入字段 ▾")
         m = tk.Menu(flds, tearoff=0)
         for fld in FIELDS:
             m.add_command(label=fld, command=lambda x=fld: self._insert_editor_text(x))
@@ -5128,7 +5373,7 @@ class App:
             m.add_command(label=ph + "（常量）",
                           command=lambda x=ph: self._insert_editor_text(x))
         flds["menu"] = m
-        flds.pack(side="left", padx=2)
+        flds.pack(side="left", padx=(8, 2))
 
     def _insert_editor_text(self, text):
         tw = getattr(self, "body_text", None)
@@ -5143,6 +5388,7 @@ class App:
                        ("所有文件", "*.*")])
         if path:
             _editor_insert_image(self.body_text, path)
+            self._mark_active_dirty()
 
     def _ed_need_sel(self):
         try:
@@ -5151,6 +5397,7 @@ class App:
             return None
 
     def _ed_restyle(self, **changes):
+        self._mark_active_dirty()
         t = self.body_text
         sel = self._ed_need_sel()
         if not sel:
@@ -5174,6 +5421,7 @@ class App:
 
     def _ed_align(self, mode):
         """对齐作用于整行（tk 的 justify 需要覆盖整行才生效）。"""
+        self._mark_active_dirty()
         t = self.body_text
         sel = self._ed_need_sel()
         if not sel:
@@ -5215,7 +5463,7 @@ class App:
         return "break"
 
     def _ed_on_key(self, _e=None):
-        pass
+        self._mark_active_dirty()
 
     # ================= 水印设置 =================
 
@@ -5708,6 +5956,8 @@ class App:
             self._wb_render_mapping_table()
 
     def on_close(self):
+        if not self._handle_unsaved_before_leave("退出程序"):
+            return
         if self.running and not messagebox.askyesno(
                 "批量进行中",
                 "后台仍在生成文件/草稿。\n\n确定退出？（强退可能留下不完整文件，"

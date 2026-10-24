@@ -244,7 +244,7 @@ def test_pipeline_item_mapping_uses_field_level_source(app):
     item = app._wb_event["pipeline"][0]
     item["mapping"] = {"{{Call_Amount}}": "fields.Call_Amount"}
     opts = app._wb_field_source_options(item, app._wb_event["recipients"][0])
-    assert ("fields.Call_Amount", "收件人字段", "Call_Amount") in opts
+    assert ("fields.Call_Amount", "本事件字段", "Call_Amount") in opts
 
 
 def test_pipeline_item_sheet_config_is_item_level(app):

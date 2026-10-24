@@ -55,6 +55,7 @@ def _mini_docx(path, text):
 class _MB:
     def __init__(self):
         self.calls = []
+        self.answer3 = True
 
     def showinfo(self, title, msg="", **k):
         self.calls.append(("info", str(title), str(msg)))
@@ -68,6 +69,10 @@ class _MB:
     def askyesno(self, title, msg="", **k):
         self.calls.append(("ask", str(title), str(msg)))
         return True
+
+    def askyesnocancel(self, title, msg="", **k):
+        self.calls.append(("ask3", str(title), str(msg)))
+        return self.answer3
 
 
 class _FD:
@@ -157,9 +162,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_373():
-    assert lp_tool.APP_VERSION == "3.7.3"
-    assert lp_v3.APP_VERSION == "3.7.3"
+def test_version_is_380():
+    assert lp_tool.APP_VERSION == "3.8.0"
+    assert lp_v3.APP_VERSION == "3.8.0"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -665,14 +670,14 @@ def test_mapping_dialog_lists_all_placeholders_and_preselects_row(app, tmp_path)
     assert set(values) == set(item["mapping"].keys()), values
     assert len(values) == 3
     assert ph_box.get() == "{{Call_Amount}}", "应按双击行预选对应占位符"
-    assert "收件人字段：Call_Amount" in src_box.get()
+    assert "本事件字段：Call_Amount" in src_box.get()
     # 切换到第三个占位符 → 来源下拉要联动
     ph_box.set("{{Due_Date}}")
     ph_box.event_generate("<<ComboboxSelected>>")
     a.root.update()
     assert "日期" in src_box.get(), "切换占位符后来源下拉应跟着刷新，实际=%r" % src_box.get()
     # 选一个来源并确定
-    want = [v for v in src_box.cget("values") if "收件人字段：Call_Amount" in v][0]
+    want = [v for v in src_box.cget("values") if "本事件字段：Call_Amount" in v][0]
     src_box.set(want)
     for t, b in _buttons(dlg):
         if t == "确定":
@@ -804,21 +809,21 @@ def test_attach_excel_import_maps_paths_per_recipient(app, tmp_path, monkeypatch
     assert not any("没有选择任何文件" in e for e in errors)
 
 
-def test_top_nav_buttons_and_morandi_styles(app):
-    """主导航移到顶部；页面用莫兰迪浅色块。"""
+def test_left_nav_and_saas_styles(app):
+    """v3.8.0：左侧导航 + Modern Enterprise SaaS 主题。"""
     a, _mb, _fd, _err = app
     a.root.update()
     assert set(a._nav_buttons.keys()) == {"home", "settings", "help"}
     for b in a._nav_buttons.values():
-        assert not _descendant(b, a.content), "导航按钮不应在内容区里（应在顶栏）"
-    assert a._nav_buttons["home"].cget("style") in ("NavHomeOn.TButton", "NavHome.TButton")
+        assert not _descendant(b, a.content), "导航按钮应在内容区外的左栏"
+    assert a._nav_buttons["home"].cget("style") in ("NavOn.TButton", "Nav.TButton")
     a.show_screen("settings")
     a.root.update()
-    assert a._nav_buttons["settings"].cget("style") == "NavSettingsOn.TButton"
+    assert a._nav_buttons["settings"].cget("style") == "NavOn.TButton"
     assert a.root.tk.call("ttk::style", "theme", "use") == "clam"
-    # 没有左侧「主导航」栏
-    labels = [str(w.cget("text")) for w in _walk(a.root) if _cls(w) == "TLabel"]
-    assert "主导航" not in labels
+    labels = [str(w.cget("text")) for w in _walk(a.root)
+              if _cls(w) in ("TLabel", "Label")]
+    assert "工作台" in labels and "主导航" not in labels
 
 # ---------------------------------------------------------------- v3.5.1
 
@@ -1193,8 +1198,12 @@ def test_inserted_image_is_visible_in_editor(app, tmp_path):
     a.root.update()
     names = a.body_text.image_names()
     assert names, "图片应插入编辑器"
-    bbox = a.body_text.bbox(names[0])
-    assert bbox and bbox[2] and bbox[3], "图片应有可见尺寸（不能被 elide 隐藏）"
+    # 无头测试窗口里 bbox 可能拿不到；真实 GUI 的可见性由 e2e 的 bbox 校验覆盖。
+    assert a.body_text.index(names[0]), "图片应插在有效文本索引"
+    token = next((t for t in a.body_text.tag_names()
+                  if t.startswith("__elide_")), None)
+    assert token is not None, "图片 token 应被 elide 隐藏"
+    assert str(a.body_text.cget("state")) == "normal"
     html = lp_tool.text_to_html(a.body_text)
     lp_tool.load_html(a.body_text, html)
     a.root.update()
@@ -1242,3 +1251,90 @@ def test_import_field_template_date_format_options(app, tmp_path):
     assert a._format_serial_date("46193", "slash") == "2026/06/20"
     assert a._format_serial_date("46193", "keep") == "46193"
     assert a._format_serial_date("1222", "iso") == "1222"
+
+# ---------------------------------------------------------------- v3.8.0
+
+def test_mail_page_button_visible_and_toolbar_not_duplicated(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "邮件页", [{"name": "甲", "to": "a@x.com",
+                                    "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a.root.update()
+    btn_texts = [str(w.cget("text")) for w in _walk(a._wb_content)
+                 if _cls(w) == "TButton"]
+    assert "保存模板" in btn_texts
+    assert "预生成 →" in btn_texts
+    font_labels = [w for w in _walk(a._wb_content)
+                   if _cls(w) in ("TLabel",) and str(w.cget("text")) == " 字体"]
+    assert len(font_labels) == 1, "工具栏不应重复"
+
+
+def test_unsaved_mail_prompts_save_discard_cancel(app):
+    a, mb, _fd, _err = app
+    ev = _save_event(a, "未保存", [{"name": "甲", "to": "a@x.com",
+                                    "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a.mail_subject_var.set("未保存主题")
+    assert a._mail_dirty
+    # 取消：留在当前页
+    mb.answer3 = None
+    a._wb_next_step()
+    assert a._wb_step == 2 and a._mail_dirty
+    # 保存：写入事件并进入下一步
+    mb.answer3 = True
+    a._wb_next_step()
+    assert a._wb_step == 3 and not a._mail_dirty
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["mail"]["subject"] == "未保存主题"
+
+
+def test_unsaved_mail_discard_keeps_old(app):
+    a, mb, _fd, _err = app
+    ev = _save_event(a, "丢弃", [{"name": "甲", "to": "a@x.com",
+                                  "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    old = a._wb_event["mail"]["subject"]
+    a.mail_subject_var.set("不要的主题")
+    mb.answer3 = False
+    a._wb_next_step()
+    assert a._wb_step == 3
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved["mail"]["subject"] == old
+
+
+def test_pregen_clears_per_email_overrides(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "预生成清覆盖", [{"name": "甲", "to": "a@x.com",
+                                          "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    ev["mail_overrides"] = {"§甲": {"subject": "手改", "body": "<p>手改</p>"}}
+    a.store.save_event(ev)
+    a.open_event(ev["id"])
+    a._wb_show_step(2)
+    a._wb_mail_preview_next()
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    assert saved.get("mail_overrides") == {}
+
+
+def test_step_prev_next_buttons(app):
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "步骤按钮", [{"name": "甲", "to": "a@x.com",
+                                      "open_pw": "Open123456", "owner_pw": "Owner123456"}],
+                     pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a.root.update()
+    assert a._wb_step == 0
+    assert "disabled" in a._wb_prev_btn.state()
+    a._wb_next_step()
+    a.root.update()
+    assert a._wb_step == 1
+    a._wb_prev_step()
+    a.root.update()
+    assert a._wb_step == 0

@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.7.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.8.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -1691,7 +1691,7 @@ def field_source_options(event=None, recipient=None, sheet_cols=None):
            ("open_pw", "内置", "打开口令"),
            ("date", "内置", "日期")]
     for k in sorted((recipient or {}).get("fields", {})):
-        out.append(("fields." + k, "收件人字段", k))
+        out.append(("fields." + k, "本事件字段", k))
     consts = ((event or {}).get("options") or {}).get("constants") or {}
     for k in sorted(consts):
         out.append(("constants." + k, "事件常量", k))
@@ -1709,7 +1709,7 @@ def path_source_options(event=None, recipient=None, sheet_cols=None):
     out = [(PATH_SOURCE_MANUAL, "固定路径", "手填路径（下面这份清单）"),
            (PATH_SOURCE_RECIPIENT, "收件人", "收件人清单的「附件路径」列")]
     for k in sorted((recipient or {}).get("fields", {})):
-        out.append((PATH_SOURCE_FIELD_PREFIX + k, "收件人字段", k))
+        out.append((PATH_SOURCE_FIELD_PREFIX + k, "本事件字段", k))
     for k in sorted(sheet_cols or []):
         out.append((PATH_SOURCE_SHEET_PREFIX + k, "外部数据表", k))
     return out
@@ -1723,7 +1723,7 @@ def path_source_label(src):
     if src == PATH_SOURCE_RECIPIENT:
         return "收件人清单的「附件路径」列"
     if src.startswith(PATH_SOURCE_FIELD_PREFIX):
-        return "收件人字段「%s」" % src[len(PATH_SOURCE_FIELD_PREFIX):]
+        return "本事件字段「%s」" % src[len(PATH_SOURCE_FIELD_PREFIX):]
     if src.startswith(PATH_SOURCE_SHEET_PREFIX):
         return "外部数据表「%s」列" % src[len(PATH_SOURCE_SHEET_PREFIX):]
     return src

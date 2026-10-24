@@ -146,7 +146,7 @@ def test_field_source_options_lists_sheet_cols_only_when_given():
     rec = ev["recipients"][0]
     plain = field_source_options(ev, rec, None)
     assert not any(k.startswith("sheet.") for k, _c, _l in plain)
-    assert ("fields.Call", "收件人字段", "Call") in plain
+    assert ("fields.Call", "本事件字段", "Call") in plain
     with_sheet = field_source_options(ev, rec, ["Due_Date"])
     assert ("sheet.Due_Date", "外部数据表", "Due_Date") in with_sheet
 
