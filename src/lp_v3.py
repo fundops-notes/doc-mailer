@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.3.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.4.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -401,12 +401,12 @@ DEFAULT_SETTINGS = {
 ITEM_KINDS = ("generate", "attach")
 
 ITEM_KIND_LABELS = {
-    "generate": "生成文档",
+    "generate": "Word-MailMerge",
     "attach": "附加文件",
 }
 
 ITEM_KIND_DESC = {
-    "generate": "用 Word 模板给每位收件人生成一份内容不同的文档",
+    "generate": "Word 邮件合并：按占位符把收件人字段替换进模板，可转 PDF / 加水印 / 加密",
     "attach": "把磁盘上已有的文件放进附件包",
 }
 
@@ -671,9 +671,13 @@ def normalize_event(ev):
         "scenario_id": "", "scenario_name": "",
         "recipients": [], "pipeline": [], "attachments": [],
         "mail": dict(DEFAULT_MAIL), "options": dict(DEFAULT_OPTIONS),
+        "process_results": {},
     }
     if not isinstance(ev, dict):
         return out
+    pr = ev.get("process_results")
+    if isinstance(pr, dict):
+        out["process_results"] = pr
     for k in ("id", "name", "biz_type", "due_date", "notes",
               "created_at", "updated_at", "status", "scenario_id", "scenario_name"):
         v = ev.get(k)
@@ -1400,7 +1404,7 @@ def _demo_items():
 
 # 内置字段的别名（用户在模板里可能写成其中任何一种）
 BUILTIN_ALIASES = {
-    "name": ("name", "名称", "收件人名称", "lp名称", "lp_name", "lpname"),
+    "name": ("name", "client_name", "名称", "收件人名称", "lp名称", "lp_name", "lpname"),
     "wm": ("wm", "水印", "水印名称", "wm_name"),
     "open_pw": ("open_pw", "打开口令", "打开密码", "openpw"),
     "date": ("date", "日期"),
@@ -1568,7 +1572,8 @@ def field_source_options(event=None, recipient=None, sheet_cols=None):
     v3.1：来源是**字段级**的，每个占位符自己选一个具体来源；
     外部数据表的列只有在真的要选它时才出现在列表里。
     """
-    out = [("name", "内置", "收件人名称"),
+    out = [("Client_Name", "预设", "收件人名称（客户名）"),
+           ("name", "内置", "收件人名称"),
            ("wm", "内置", "水印名称"),
            ("open_pw", "内置", "打开口令"),
            ("date", "内置", "日期")]

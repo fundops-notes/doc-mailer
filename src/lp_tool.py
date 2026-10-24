@@ -56,9 +56,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.3.2"
+APP_VERSION = "3.4.0"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.3.2"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.0"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -473,11 +473,14 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("1200x780")
-        try:
-            root.state("zoomed")
-        except Exception:
-            pass
+        root.geometry("1280x800")   # 默认正常窗口（首次不最大化）
+        root.minsize(960, 620)
+        _icon = Path(__file__).parent / "icon.ico"
+        if _icon.exists():
+            try:
+                root.iconbitmap(str(_icon))
+            except Exception:
+                pass
 
         self._boot_error = None
         self.store = Store()
@@ -694,9 +697,11 @@ class App:
             self.ev_tree.heading(c, text=h)
             self.ev_tree.column(c, width=190 if c == "name" else 86)
         vsb = ttk.Scrollbar(left, orient="vertical", command=self.ev_tree.yview)
-        self.ev_tree.configure(yscrollcommand=vsb.set)
+        hsb = ttk.Scrollbar(left, orient="horizontal", command=self.ev_tree.xview)
+        self.ev_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.ev_tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
         self.ev_tree.bind("<Double-1>", lambda _e: self._open_selected_event())
         self.ev_tree.bind("<<TreeviewSelect>>", lambda _e: self._draw_selected_flow())
 
@@ -964,9 +969,9 @@ class App:
             for k in (r.get("fields") or {}):
                 if k not in fcols:
                     fcols.append(k)
-        cols = ["name", "to", "cc", "bcc", "wm", "group", "atts"] + \
+        cols = ["name", "to", "cc", "bcc", "wm", "group"] + \
             ["f%d" % i for i in range(len(fcols))] + ["open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "附件路径"] + fcols + \
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组"] + fcols + \
             ["打开口令", "权限口令(勿发)"]
         tree.delete(*tree.get_children())
         self._pool_iids = {}
@@ -977,8 +982,7 @@ class App:
         for c, h in zip(cols, heads):
             try:
                 tree.heading(c, text=h)
-                tree.column(c, width=150 if c in ("to", "cc", "bcc")
-                            else (200 if c == "atts" else 110))
+                tree.column(c, width=150 if c in ("to", "cc", "bcc") else 110)
             except Exception:
                 pass
         for i, r in enumerate(pool):
@@ -1860,9 +1864,9 @@ class App:
             b.pack(side="left", padx=2)
             ToolTip(b, tip)
 
-        cols = ["name", "to", "cc", "bcc", "wm", "group", "atts"] + fcols + \
+        cols = ["name", "to", "cc", "bcc", "wm", "group"] + fcols + \
             ["open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "附件路径"] + fcols + \
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组"] + fcols + \
                 ["打开口令", "权限口令(勿发)"]
         # 注意：Treeview 必须建在 frame 里。之前建在 parent 里、却 pack 进 frame，
         # 结果它被排到了 frame 下面，表格被挤成右下角一小块。
@@ -1871,8 +1875,7 @@ class App:
         tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
-            tree.column(c, width=150 if c in ("to", "cc", "bcc")
-                        else (200 if c == "atts" else 100))
+            tree.column(c, width=150 if c in ("to", "cc", "bcc") else 100)
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -2386,7 +2389,6 @@ class App:
                 ("收件人To（多人用;分隔）", "to"), ("抄送CC（可空）", "cc"),
                 ("密送BCC（可空）", "bcc"),
                 ("合并发送组（同名=一封邮件，可空）", "group"),
-                ("附件路径（每人专属，多个用;分隔，可空）", "attachments"),
                 ("邮件标题（空=用模板）", "subject"),
                 ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw")]
         entries = {}
@@ -2720,18 +2722,132 @@ class App:
 
     # ---------- 流水线页 ----------
 
+    def _wb_process(self):
+        """④⑤「处理」按钮：按上方条目参数全量重跑流水线（不用历史数据），
+        完成后把每位收件人的产出文件路径回填到下方对应表。只生成文件，
+        不建 Outlook 草稿（草稿在「预览与生成」步骤）。"""
+        if self.running:
+            messagebox.showinfo("正在执行", "上一次处理还没结束，请等它完成。")
+            return
+        ev = self._wb_event
+        errs, _warns, _info = lp_v3.preflight(ev, self.store)
+        if errs:
+            messagebox.showerror("预检未通过（未开始处理）",
+                                 "以下问题必须先修正：\n\n"
+                                 + "\n".join("· " + e for e in errs[:15]))
+            return
+        outdir = Path((ev.get("options") or {}).get("outdir")
+                      or self.settings.get("outdir")
+                      or (Path.home() / "Documents" / "文档分发输出"))
+        outdir.mkdir(parents=True, exist_ok=True)
+        ev.setdefault("options", {})["outdir"] = str(outdir)
+        ev["process_results"] = {}   # 全量更新：清空上次记录，避免历史污染
+        self._wb_save()
+
+        self.running = True
+        self._cancel = threading.Event()
+        self.log("===== 处理开始：按当前参数全量生成 =====")
+
+        def job(get_word):
+            run = lp_v3.run_event(self.store, ev, create_drafts=False,
+                                  outdir=str(outdir),
+                                  log=lambda m: self._q.put(("log", m)),
+                                  progress=lambda p_: self._q.put(("prog", p_)),
+                                  word=get_word())
+            self._q.put(("run_done", (run, ev)))
+
+        self._submit_job(job)
+
+    def _apply_process_results(self, run, ev=None):
+        """把 Run 里每位收件人的产物文件回填到对应表（每次处理全量刷新）。
+
+        Run items 的字段：name(收件人或组名)/members/files(最终产物路径)。
+        按组合并的 Run item 拆回每位成员（各自名下记录组共享的文件）。
+        """
+        ev = ev or self._wb_event
+        if ev is None:
+            return
+        results = {}
+        for it in run.get("items") or []:
+            files = [str(f) for f in it.get("files") or []]
+            members = it.get("members") or []
+            if it.get("kind") == "group" and len(members) > 1:
+                for m in members:      # 组共享：每个成员名下都记一份
+                    results.setdefault(m, []).extend(files)
+            else:
+                for m in members or ([it.get("name")] if it.get("name") else []):
+                    results.setdefault(m, []).extend(files)
+        # 按收件人清单顺序去重
+        for r in ev.get("recipients") or []:
+            seen, ded = set(), []
+            for f in results.get(r.get("name", "")) or []:
+                if f.lower() not in seen:
+                    seen.add(f.lower()); ded.append(f)
+            if r.get("name", "") in results or ded:
+                results[r.get("name", "")] = ded
+        ev["process_results"] = results
+        self._wb_save()
+        self.log("===== 处理完成：%d 位收件人的文件路径已更新到对应表 ====="
+                 % len(results))
+        self._wb_render_mapping_table()
+
+    def _wb_render_mapping_table(self):
+        """刷新收件人 ↔ 文件路径对应表。"""
+        tree = getattr(self, "_wb_map_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        ev = self._wb_event
+        results = ev.get("process_results") or {}
+        done = bool(ev.get("process_results"))
+        for r in ev.get("recipients") or []:
+            name = r.get("name", "")
+            files = results.get(name) or []
+            state = "已处理" if files else ("失败/未处理" if done else "未处理")
+            tree.insert("", "end", values=[
+                name,
+                "\n".join(Path(p).name for p in files) if files else "—",
+                " / ".join(str(p) for p in files) if files else "—",
+                state])
+
+    def _wb_uni_add_file(self):
+        files = filedialog.askopenfilenames(title="选择统一附件（所有人同一份）")
+        if not files:
+            return
+        box = getattr(self, "_wb_uni_text", None)
+        if box is None:
+            return
+        for f in files:
+            box.insert("end", str(f) + "\n")
+        self._wb_uni_save()
+
+    def _wb_uni_save(self):
+        box = getattr(self, "_wb_uni_text", None)
+        if box is None:
+            return
+        atts = []
+        for line in box.get("1.0", "end").splitlines():
+            pth = line.strip()
+            if pth and Path(pth).exists():
+                atts.append(lp_v3.normalize_attachment(
+                    {"name": Path(pth).name, "path": pth, "scope": "all"}))
+            elif pth:
+                messagebox.showwarning("附件不存在", "跳过不存在的文件：\n" + pth)
+        self._wb_event["attachments"] = atts
+        self._wb_save()
+
     def _wb_step_pipeline(self, parent):
         ttk.Label(parent, text="文档流水线", style="Head.TLabel").pack(anchor="w")
         ttk.Label(parent, text=(
             "每一行 = 一个要附上的东西，只有两种：\n"
-            "    ① 生成文档 —— 用 Word 模板给每位收件人生成一份内容不同的文档\n"
+            "    ① Word-MailMerge —— 用 Word 模板给每位收件人生成内容各异的文档\n"
             "    ② 附加文件 —— 把磁盘上已有的文件放进附件包\n"
             "单击行 → 下方参数区；按住行上下拖动 → 改顺序；Ctrl/Shift 多选 → 批量删除。"),
             style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(0, 4))
-        ttk.Button(bar, text="＋ 生成文档",
+        ttk.Button(bar, text="＋ Word-MailMerge",
                    command=lambda: self._wb_add_item("generate")).pack(side="left")
         ttk.Button(bar, text="＋ 附加文件",
                    command=lambda: self._wb_add_item("attach")).pack(side="left", padx=4)
@@ -2743,10 +2859,72 @@ class App:
         self._wb_pipe_count = ttk.Label(bar, foreground="#888", text="")
         self._wb_pipe_count.pack(side="left", padx=10)
 
+        # ④ 统一附件（所有人发一样的文件也在这里设置——替代「附件」页）
+        uni = ttk.LabelFrame(parent, text=" 统一附件（所有收件人都收到的同一份文件） ",
+                             style="Card.TLabelframe")
+        uni.pack(fill="x", pady=(0, 4))
+        uni_row = ttk.Frame(uni)
+        uni_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(
+            side="left", anchor="n")
+        self._wb_uni_text = tk.Text(uni_row, height=3, width=70, wrap="none")
+        self._wb_uni_text.pack(side="left", padx=4)
+        for _a in ((self._wb_event or {}).get("attachments") or []):
+            self._wb_uni_text.insert("end", str(_a.get("path") or "") + "\n")
+        uni_btns = ttk.Frame(uni_row)
+        uni_btns.pack(side="left", anchor="n", padx=4)
+        ttk.Button(uni_btns, text="添加文件…", width=12,
+                   command=self._wb_uni_add_file).pack(side="left")
+        ttk.Button(uni_btns, text="保存", width=6,
+                   command=self._wb_uni_save).pack(side="left", pady=4)
+        ttk.Label(uni, foreground="#888", wraplength=860, justify="left",
+                  text="每人专属的内容（如带各自水印/口令的 PDF）用上方流水线条目处理；"
+                       "这里只放所有人同一份的文件，会进入每位收件人的附件包。"
+                       ).pack(anchor="w", padx=8, pady=(0, 4))
+
+        # ④⑤ 处理按钮 + 收件人↔文件对应表
+        proc = ttk.LabelFrame(parent, text=" 处理与文件对应（收件人 → 将收到的文件） ",
+                              style="Card.TLabelframe")
+        proc.pack(fill="both", expand=True, pady=(0, 6))
+        prow = ttk.Frame(proc)
+        prow.pack(fill="x", padx=8, pady=4)
+        self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
+                                          command=self._wb_process)
+        self._wb_process_btn.pack(side="left")
+        ttk.Label(prow, foreground="#888", wraplength=620, justify="left",
+                  text="每次点击都按当前参数全量重跑，覆盖上次结果；"
+                       "完成后在下表更新每位收件人的文件路径。"
+                       "只生成文件，Outlook 草稿在「预览与生成」步骤。"
+                       ).pack(side="left", padx=8)
+        self._wb_progress2 = ttk.Progressbar(prow, length=140, mode="determinate")
+        self._wb_progress2.pack(side="right")
+
+        mframe = ttk.Frame(proc)
+        mframe.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        mcols = ["name", "files", "paths", "state"]
+        mheads = ["收件人名称", "将收到的文件", "文件路径", "状态"]
+        self._wb_map_tree = ttk.Treeview(mframe, columns=mcols, show="headings",
+                                          height=6)
+        for c, h in zip(mcols, mheads):
+            self._wb_map_tree.heading(c, text=h)
+            self._wb_map_tree.column(c,
+                                     width=170 if c == "name"
+                                     else (220 if c == "files" else 100))
+        mvsb = ttk.Scrollbar(mframe, orient="vertical",
+                              command=self._wb_map_tree.yview)
+        mhsb = ttk.Scrollbar(mframe, orient="horizontal",
+                              command=self._wb_map_tree.xview)
+        self._wb_map_tree.configure(yscrollcommand=mvsb.set,
+                                     xscrollcommand=mhsb.set)
+        self._wb_map_tree.pack(side="left", fill="both", expand=True)
+        mvsb.pack(side="right", fill="y")
+        mhsb.pack(side="bottom", fill="x")
+        self._wb_render_mapping_table()
+
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True, pady=(0, 6))
         cols = ["no", "name", "kind", "source", "proc", "gran", "on"]
-        heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "产出粒度", "启用"]
+        heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "产出颗粒度", "启用"]
         tree = ttk.Treeview(frame, columns=cols, show="headings",
                             selectmode="extended", height=8)
         for c, h in zip(cols, heads):
@@ -2777,7 +2955,7 @@ class App:
         self._wb_fill_pipe_table()
         if not self._wb_pipeline_items():
             ttk.Label(self._wb_params_frame,
-                      text="还没有条目。点上面的「＋ 生成文档」或「＋ 附加文件」开始。",
+                      text="还没有条目。点上面的「＋ Word-MailMerge」或「＋ 附加文件」开始。",
                       style="Sub.TLabel").pack(anchor="w", padx=4, pady=6)
             return
         iid = self._wb_selected_item_id()
@@ -3030,6 +3208,20 @@ class App:
 
     # ---------- 条目参数区 ----------
 
+    def _show_mailmerge_help(self):
+        messagebox.showinfo(
+            "Word-MailMerge 说明",
+            "用 Word 做邮件合并：\n\n"
+            "1. 在 Word 模板里需要替换的位置写占位符：{{字段}} 或 ?字段?\n"
+            "   （例：{{Client_Name}}、{{金额}}、?Due_Date?）\n"
+            "2. 收件人表里的列（含自定义字段）都可以作为字段\n"
+            "3. 点「检测占位符」自动从模板提取 → 在映射表里给每个占位符选数据来源\n"
+            "4. 处理顺序固定：转 PDF → 加水印 → 加密\n\n"
+            "· 加水印：水印文字 = 每位收件人的「水印」列（在收件人处维护）\n"
+            "· 加密：打开口令 = 每位收件人的「打开口令」列（在收件人处维护）；\n"
+            "  可勾选「发送人统一密码」方便自己打开核对\n"
+            "· Word 文档的格式（字体/表格/页眉页脚）保持不变")
+
     def _wb_item_params(self, parent, item):
         kind = item.get("kind") or "generate"
         params = item.setdefault("params", {})
@@ -3059,8 +3251,12 @@ class App:
                        command=lambda: self._wb_pick_template(item, tpl_var)).pack(side="left")
             ttk.Button(r1, text="检测占位符", width=10,
                        command=lambda: self._wb_detect_placeholders(item)).pack(side="left", padx=4)
-            ttk.Label(box, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
-                      foreground="#888").pack(anchor="w", padx=8, pady=(0, 4))
+            hrow = ttk.Frame(box)
+            hrow.pack(fill="x", padx=8, pady=(0, 4))
+            ttk.Label(hrow, text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。",
+                      foreground="#888").pack(side="left")
+            ttk.Button(hrow, text="Word-MailMerge 说明", width=18,
+                       command=self._show_mailmerge_help).pack(side="left", padx=8)
         else:
             # --- 路径来源：手填路径 / 按收件人取（每人一份不同的文件）---
             recips = (self._wb_event or {}).get("recipients") or []
@@ -3142,8 +3338,34 @@ class App:
         ttk.Checkbutton(r2, text="加密（AES-256）", variable=enc_var,
                         command=lambda: self._wb_item_flag(item, "encrypt", enc_var)
                         ).pack(side="left")
+        ttk.Label(r2, foreground="#888",
+                  text="水印文字与各人打开口令在「收件人」处维护").pack(side="left", padx=(8, 0))
         ToolTip(r2, "处理顺序固定，你不用排：转 PDF → 加水印 → 加密。\n"
                    "加密只对 PDF 生效；打开口令取该收件人的打开口令。")
+
+        # --- 加密选项：发送人统一密码（即 GP 统一权限口令机制，方便发送人核对）---
+        if params.get("encrypt"):
+            r_gp = ttk.Frame(box)
+            r_gp.pack(fill="x", padx=8, pady=(0, 4))
+            gp_mode_var = self._wb_keep_var(
+                tk.BooleanVar(value=bool(self.settings.get("gp_owner_mode"))))
+            gp_pw_var = self._wb_keep_var(
+                tk.StringVar(value=self.settings.get("gp_owner_pw", "")))
+
+            def _gp_changed(mode_v=gp_mode_var, pw_v=gp_pw_var):
+                self.settings["gp_owner_mode"] = bool(mode_v.get())
+                self.settings["gp_owner_pw"] = pw_v.get().strip()
+                self.save_data()
+
+            ttk.Checkbutton(r_gp, text="发送人统一密码（所有文件用同一口令打开，"
+                                      "方便发送人核对；收件人仍用各自口令）",
+                            variable=gp_mode_var,
+                            command=_gp_changed).pack(side="left")
+            e_gp = ttk.Entry(r_gp, textvariable=gp_pw_var, width=20, show="*")
+            e_gp.pack(side="left", padx=6)
+            e_gp.bind("<KeyRelease>", lambda _e: _gp_changed())
+            ToolTip(e_gp, "统一打开口令（收件人口令之外，发送人自己核对用）。"
+                          "不能与任何收件人的打开口令相同。留空则生成时自动创建。")
 
         # --- 权限位（仅加密时出现）---
         if params.get("encrypt"):
@@ -3165,7 +3387,7 @@ class App:
         # --- 产出粒度（条目级：这一条产出几份文件）---
         r4 = ttk.Frame(box)
         r4.pack(fill="x", padx=8, pady=4)
-        ttk.Label(r4, text="产出粒度（这一条产出几份文件）：").pack(side="left")
+        ttk.Label(r4, text="产出颗粒度（这一条产出几份文件）：").pack(side="left")
         cur_gran = item.get("granularity") or "per_lp"
         gran_var = self._wb_keep_var(tk.StringVar(value=GRANULARITY_LABELS.get(cur_gran, cur_gran)))
         cb = ttk.Combobox(r4, textvariable=gran_var, state="readonly", width=16,
@@ -4202,7 +4424,7 @@ class App:
                                   log=lambda m: self._q.put(("log", m)),
                                   progress=lambda p: self._q.put(("prog", p)),
                                   word=get_word())
-            self._q.put(("run_done", run))
+            self._q.put(("run_done", (run, ev)))
 
         self._submit_job(job)
 
@@ -4660,10 +4882,25 @@ class App:
                         self.wb_progress.configure(value=payload)
                     except Exception:
                         pass
+                    bar2 = getattr(self, "_wb_progress2", None)
+                    if bar2 is not None:
+                        try:
+                            bar2.configure(value=payload)
+                        except Exception:
+                            pass
                 elif kind == "run_done":
-                    self._wb_last_run = payload
-                    if payload is not None:
-                        st = payload.get("stats") or {}
+                    if isinstance(payload, tuple):
+                        run_obj, run_ev = payload
+                    else:
+                        run_obj, run_ev = payload, self._wb_event
+                    self._wb_last_run = run_obj
+                    if run_obj is not None:
+                        try:
+                            self._apply_process_results(run_obj, run_ev)
+                        except Exception:
+                            pass
+                    if run_obj is not None:
+                        st = run_obj.get("stats") or {}
                         self.wb_status.configure(
                             text="成功 %d · 失败 %d · 跳过 %d"
                                  % (st.get("ok", 0), st.get("fail", 0), st.get("skip", 0)))
@@ -4726,11 +4963,17 @@ class App:
 
     def _wb_set_running(self, running):
         self.running = running
-        for b in (self.btn_preflight, self.btn_generate, self.btn_rerun):
+        btns = [self.btn_preflight, self.btn_generate, self.btn_rerun]
+        pb = getattr(self, "_wb_process_btn", None)
+        if pb is not None:
+            btns.append(pb)
+        for b in btns:
             try:
                 b.state(["disabled"] if running else ["!disabled"])
             except tk.TclError:
                 pass
+        if not running:
+            self._wb_render_mapping_table()
 
     def on_close(self):
         if self.running and not messagebox.askyesno(
