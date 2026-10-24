@@ -1233,5 +1233,10 @@ HEAD/GET 均 200（跟随 302 到 `/releases/tag/vX.Y.Z`，约 0.3~1s）——
 
 ### 27.5 发布结果
 
-- commit：`待回填`；tag：`v3.4.7`；CI run：`待回填`。
-- Release：`待回填`。
+- commit：`9daa0d6`；tag：`v3.4.7`（已 push）；CI run **40095336535** conclusion=**success**。
+- Release：**id=422728475**（https://github.com/fundops-notes/doc-mailer/releases/tag/v3.4.7）；
+  两资产从 Release 下载回来做 SHA256 复核，与本地构建产物**字节级一致**：
+  `doc-mailer_v3.4.7_portable.zip` 46,416,060 B sha256 `C180F99B…FCEB5`；
+  `doc-mailer_win64.zip` 46,826,910 B sha256 `22B15250…4C3F9`（内含签名 Valid 的 exe）。
+- 遗留观测：修复上线时 GitHub API 仍返回 403（共享出口 IP），但网页跳转路径可用 →
+  「检查更新」功能正常；这正好验证了修复目标。
