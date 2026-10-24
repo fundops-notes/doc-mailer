@@ -21,7 +21,13 @@ def _event(name="E", recips=None, pipeline=None, **opts):
     ev = new_event(name)
     ev["recipients"] = [normalize_recipient(r) for r in (recips or [])]
     if pipeline is not None:
-        ev["pipeline"] = [normalize_item(s) for s in pipeline]
+        ev["pipeline"] = []
+        for s in pipeline:
+            it = normalize_item(s)
+            if "granularity" not in s:
+                # v3.5.0：UI/新建条目默认按分组；这些引擎用例仍按旧「每人一份」断言
+                it["granularity"] = "per_lp"
+            ev["pipeline"].append(it)
     ev["options"].update(opts)
     return ev
 
@@ -93,7 +99,7 @@ def test_normalize_item_defaults():
     it = normalize_item({})
     assert it["kind"] == "generate"
     assert it["enabled"] is True
-    assert it["granularity"] == "per_lp"
+    assert it["granularity"] == "per_group"
     assert it["params"]["to_pdf"] is False
     assert it["params"]["watermark"] is False
     assert it["params"]["encrypt"] is False

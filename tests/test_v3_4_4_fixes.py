@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_349():
-    assert lp_tool.APP_VERSION == "3.4.9"
-    assert lp_v3.APP_VERSION == "3.4.9"
+def test_version_is_350():
+    assert lp_tool.APP_VERSION == "3.5.0"
+    assert lp_v3.APP_VERSION == "3.5.0"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -381,7 +381,9 @@ def test_help_page_text_updated(app):
         if _cls(w) == "TLabel":
             texts.append(str(w.cget("text")))
     joined = "\n".join(texts)
-    assert "产出颗粒度" in joined
+    # v3.5.0：颗粒度设置已移除，帮助页改为说明「按分组」
+    assert "按分组" in joined
+    assert "产出颗粒度" not in joined
     for stale in ("产出粒度", "附件路径", "路径来源", "生成文档"):
         assert stale not in joined, "帮助页仍有旧文案：%s" % stale
 
@@ -727,3 +729,89 @@ def test_self_update_progress_hook_and_staging(app, tmp_path, monkeypatch):
     bat = (appdir / "run_update.bat").read_text(encoding="ascii", errors="ignore")
     assert "robocopy" in bat and "lp_data" in bat and "start" in bat
     assert not (appdir / ".update_pkg.zip").exists(), "下载包应在解压后删除"
+
+# ---------------------------------------------------------------- v3.5.0
+
+def test_read_spreadsheet_uses_excel_display_values(tmp_path):
+    """Excel 日期/金额/百分比按显示值读取，而不是变成序列号或 datetime 字符串。"""
+    import datetime
+    import openpyxl
+    path = tmp_path / "显示格式.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "日期"
+    ws["A2"] = datetime.datetime(2026, 11, 15)
+    ws["A2"].number_format = 'yyyy"年"m"月"d"日"'
+    ws["B1"] = "金额"
+    ws["B2"] = 200000
+    ws["B2"].number_format = "#,##0"
+    ws["C1"] = "百分比"
+    ws["C2"] = 0.256
+    ws["C2"].number_format = "0.00%"
+    wb.save(str(path))
+    rows = lp_v3.read_spreadsheet(str(path))
+    assert rows[1][0] == "2026年11月15日"
+    assert rows[1][1] == "200,000"
+    assert rows[1][2] == "25.6%"
+
+
+def test_attach_excel_import_maps_paths_per_recipient(app, tmp_path, monkeypatch):
+    """「从 Excel 导入路径」必须按收件人对应，不能把全部路径发给所有人。"""
+    import openpyxl
+    a, _mb, _fd, _err = app
+    ev = _save_event(a, "路径导入", [
+        {"name": "甲", "to": "a@x.com", "open_pw": "Open123456", "owner_pw": "Owner123456"},
+        {"name": "乙", "to": "b@x.com", "open_pw": "Open223456", "owner_pw": "Owner223456"},
+    ], pipeline=[{"kind": "attach", "params": {"files": []}}])
+    a.open_event(ev["id"])
+    a._wb_show_step(1)
+    a.root.update()
+    xlsx = tmp_path / "路径模板.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["收件人名称", "附件路径"])
+    ws.append(["甲", str(tmp_path / "甲.pdf")])
+    ws.append(["乙", str(tmp_path / "乙.pdf")])
+    wb.save(str(xlsx))
+    _fd.open_path = str(xlsx)
+    a._wb_import_attach_paths(a._wb_event["pipeline"][0], None)
+    a.root.update()
+    dlg = _find_toplevel(a.root, "从 Excel 导入路径")
+    assert dlg is not None
+    for t, b in _buttons(dlg):
+        if t == "导入":
+            b.invoke()
+            break
+    a.root.update()
+    saved, _e = a.store.load_event(ev["id"])
+    recs = {r["name"]: r for r in saved["recipients"]}
+    assert recs["甲"]["attachments"] == [str(tmp_path / "甲.pdf")]
+    assert recs["乙"]["attachments"] == [str(tmp_path / "乙.pdf")]
+    it = saved["pipeline"][0]
+    assert it["params"]["path_source"] == lp_v3.PATH_SOURCE_RECIPIENT
+    assert it["params"]["files"] == []
+    # 引擎按人取路径
+    unit = {"rep": recs["甲"], "recipients": [recs["甲"]], "lp_name": "甲",
+            "group_key": "甲", "group": ""}
+    paths, _label = lp_v3.resolve_item_paths(it, unit, saved)
+    assert paths == [str(tmp_path / "甲.pdf")]
+    # 预检不再误报「没有选择任何文件」
+    errors, _w, _i = lp_v3.preflight(saved)
+    assert not any("没有选择任何文件" in e for e in errors)
+
+
+def test_top_nav_buttons_and_morandi_styles(app):
+    """主导航移到顶部；页面用莫兰迪浅色块。"""
+    a, _mb, _fd, _err = app
+    a.root.update()
+    assert set(a._nav_buttons.keys()) == {"home", "settings", "help"}
+    for b in a._nav_buttons.values():
+        assert not _descendant(b, a.content), "导航按钮不应在内容区里（应在顶栏）"
+    assert a._nav_buttons["home"].cget("style") in ("NavHomeOn.TButton", "NavHome.TButton")
+    a.show_screen("settings")
+    a.root.update()
+    assert a._nav_buttons["settings"].cget("style") == "NavSettingsOn.TButton"
+    assert a.root.tk.call("ttk::style", "theme", "use") == "clam"
+    # 没有左侧「主导航」栏
+    labels = [str(w.cget("text")) for w in _walk(a.root) if _cls(w) == "TLabel"]
+    assert "主导航" not in labels

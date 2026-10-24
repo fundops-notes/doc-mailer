@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.4.9"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.5.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -112,15 +112,79 @@ def read_spreadsheet(path):
             rows = [[c.strip() for c in r[0].split(";")] for r in rows if r]
         return rows
     import openpyxl
+    from openpyxl.utils.datetime import from_excel
     wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
     ws = wb.active
     rows = []
-    for row in ws.iter_rows(values_only=True):
-        rows.append(list(row))
+    for row in ws.iter_rows():
+        out = []
+        for cell in row:
+            out.append(_excel_display_text(cell, from_excel))
+        rows.append(out)
         if len(rows) > 5000:
             break
     wb.close()
     return rows
+
+
+def _excel_fmt_has_date(fmt):
+    f = str(fmt or "").lower()
+    if not f:
+        return False
+    if "年" in f or "月" in f or "日" in f:
+        return True
+    # 去掉引号/转义里的普通字符后看是否还有 y/m/d 日期占位
+    f2 = re.sub(r'"[^"]*"', "", f)
+    f2 = re.sub(r"\\[^a-z]", "", f2)
+    return bool(re.search(r"[ymd]", f2)) and not re.search(r"[#0]", f2)
+
+
+def _excel_display_text(cell, from_excel):
+    """单元格 → 文本，尽量按 Excel 里看到的格式（日期不变成数字/带 00:00:00）。"""
+    v = getattr(cell, "value", None)
+    if v is None:
+        return ""
+    fmt = str(getattr(cell, "number_format", "") or "")
+    # 1) 日期/时间（openpyxl 一般已转成 datetime；个别自定义格式会留数字）
+    dt = None
+    if hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day"):
+        dt = v
+    elif isinstance(v, (int, float)) and not isinstance(v, bool) and _excel_fmt_has_date(fmt):
+        try:
+            dt = from_excel(v)
+        except Exception:
+            dt = None
+    if dt is not None:
+        has_time = bool(re.search(r"[hHsS]", fmt)) or (
+            getattr(dt, "hour", 0) or getattr(dt, "minute", 0) or getattr(dt, "second", 0))
+        if "年" in fmt or "月" in fmt or "日" in fmt:
+            out = "%d年%d月%d日" % (dt.year, dt.month, dt.day)
+        else:
+            sep = "-" if "-" in fmt else ("/" if "/" in fmt else "-")
+            out = "%04d%s%02d%s%02d" % (dt.year, sep, dt.month, sep, dt.day)
+        if has_time and (getattr(dt, "hour", 0) or getattr(dt, "minute", 0)):
+            out += " %02d:%02d" % (dt.hour, dt.minute)
+            if re.search(r"[sS]", fmt):
+                out += ":%02d" % dt.second
+        return out
+    # 2) 数字：百分比/小数位/千分位
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if "%" in fmt:
+            return ("%g" % (v * 100)) + "%"
+        dec = 0
+        m = re.search(r"0\.([0#]+)", fmt)
+        if m:
+            dec = len(m.group(1))
+        use_comma = "," in fmt
+        if dec:
+            return format(v, ",.%df" % dec if use_comma else ".%df" % dec)
+        if float(v).is_integer():
+            iv = int(v)
+            return format(iv, ",") if use_comma else str(iv)
+        return str(v)
+    if isinstance(v, bool):
+        return str(v)
+    return str(v).strip()
 
 
 def _cell_text(v):
@@ -129,6 +193,10 @@ def _cell_text(v):
         return ""
     if isinstance(v, bool):
         return str(v)
+    if hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day"):
+        if getattr(v, "hour", 0) or getattr(v, "minute", 0):
+            return v.strftime("%Y-%m-%d %H:%M")
+        return v.strftime("%Y-%m-%d")
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
     return str(v).strip()
@@ -461,7 +529,7 @@ PATH_SOURCE_SHEET_PREFIX = "sheet."
 
 DEFAULT_ITEM = {
     "id": "", "kind": "generate", "name": "", "enabled": True,
-    "params": {}, "granularity": "per_lp", "mapping": {}, "sheet": {},
+    "params": {}, "granularity": "per_group", "mapping": {}, "sheet": {},
 }
 
 # 占位符来源种类（**字段级**，不再是步骤级）
@@ -536,7 +604,7 @@ def normalize_item(it):
     """把任意来源的条目配置规范成 v3.1 结构（容错：坏数据不抛异常）。"""
     out = {
         "id": "", "kind": "generate", "name": "", "enabled": True,
-        "params": {}, "granularity": "per_lp", "mapping": {}, "sheet": {},
+        "params": {}, "granularity": "per_group", "mapping": {}, "sheet": {},
     }
     if not isinstance(it, dict):
         it = {}
@@ -551,7 +619,8 @@ def normalize_item(it):
     en = it.get("enabled")
     out["enabled"] = bool(en) if en is not None else True
     g = it.get("granularity")
-    out["granularity"] = g if g in GRANULARITIES else "per_lp"
+    # v3.5.0：默认按分组产出（同组一份、未分组各自一份）
+    out["granularity"] = g if g in GRANULARITIES else "per_group"
 
     params = it.get("params")
     params = params if isinstance(params, dict) else {}
@@ -1394,12 +1463,12 @@ def _demo_items():
             "kind": "generate", "name": "示例：季度对账单", "enabled": False,
             "params": {"template_path": "", "to_pdf": True, "watermark": True,
                        "encrypt": True, "permissions": list(DEFAULT_PERMISSIONS)},
-            "granularity": "per_lp",
+            "granularity": "per_group",
         }),
         normalize_item({
             "kind": "attach", "name": "示例：附加说明文件", "enabled": False,
             "params": {"files": [], "path_source": PATH_SOURCE_MANUAL},
-            "granularity": "per_lp",
+            "granularity": "per_group",
         }),
     ]
 
@@ -2361,12 +2430,37 @@ def preflight(event, store=None):
                         elif not Path(sp).exists():
                             errors.append("%s：外部数据表不存在：%s" % (label, sp))
         else:
-            files = params.get("files") or []
-            if not files:
-                errors.append("%s：没有选择任何文件" % label)
-            for sp in files:
-                if not Path(str(sp)).exists():
-                    errors.append("%s：文件不存在：%s" % (label, sp))
+            psrc = str(params.get("path_source") or PATH_SOURCE_MANUAL)
+            if psrc != PATH_SOURCE_MANUAL:
+                # v3.5.0：「从 Excel 导入路径」后按收件人取路径，手填清单允许为空
+                anyone = False
+                for _r in recips:
+                    _unit = {"rep": _r, "recipients": [_r],
+                             "lp_name": _r.get("name", ""),
+                             "group_key": group_key_of(_r),
+                             "group": (_r.get("group") or "").strip()}
+                    try:
+                        _paths, _lab = resolve_item_paths(item, _unit, event)
+                    except Exception as _e:
+                        warnings.append("%s：%s 取路径失败：%s"
+                                        % (label, _r.get("name", ""), _e))
+                        continue
+                    if _paths:
+                        anyone = True
+                    for sp in _paths:
+                        if not Path(str(sp)).exists():
+                            warnings.append("%s：%s 的附件不存在（将跳过）：%s"
+                                            % (label, _r.get("name", ""), sp))
+                if not anyone:
+                    warnings.append("%s：按「%s」没有取到任何路径，处理时会被跳过"
+                                    % (label, path_source_label(psrc)))
+            else:
+                files = params.get("files") or []
+                if not files:
+                    errors.append("%s：没有选择任何文件" % label)
+                for sp in files:
+                    if not Path(str(sp)).exists():
+                        errors.append("%s：文件不存在：%s" % (label, sp))
         if params.get("encrypt"):
             if not params.get("watermark") and kind == "generate" \
                     and not params.get("to_pdf"):

@@ -39,7 +39,7 @@ def test_normalize_item_rejects_unknown_kind():
     """v3.1：旧的六种步骤类型不再出现在模型里。"""
     s = normalize_item({"kind": "不存在的类型"})
     assert s["kind"] == "generate"
-    assert s["granularity"] == "per_lp"
+    assert s["granularity"] == "per_group"
     assert s["id"]
 
 

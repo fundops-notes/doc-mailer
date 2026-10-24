@@ -18,7 +18,13 @@ def _event(recips=None, pipeline=None, **opts):
     ev = new_event("E")
     ev["recipients"] = [normalize_recipient(r) for r in (recips or [])]
     if pipeline is not None:
-        ev["pipeline"] = [normalize_item(s) for s in pipeline]
+        ev["pipeline"] = []
+        for s in pipeline:
+            it = normalize_item(s)
+            if "granularity" not in s:
+                # v3.5.0：UI/新建条目默认按分组；这些引擎用例仍按旧「每人一份」断言
+                it["granularity"] = "per_lp"
+            ev["pipeline"].append(it)
     ev["options"].update(opts)
     return ev
 

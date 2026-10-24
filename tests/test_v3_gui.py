@@ -227,14 +227,18 @@ def test_pipeline_item_editor_shows_table_and_deletes_selected(app):
     assert len(app._wb_event["pipeline"]) == 0
 
 
-def test_pipeline_item_granularity_roundtrip(app):
-    """产出粒度挂在条目上（不再是步骤的 mapping.mode）。"""
+def test_pipeline_granularity_ui_removed_defaults_to_per_group(app):
+    """v3.5.0：「产出颗粒度」设置已移除，默认按分组产出。"""
     ev = _event_with(app, pipeline=[{"kind": "attach",
                                      "params": {"files": ["C:/x.pdf"]}}])
     app._wb_show_step(1)
-    app._wb_set_item_gran(app._wb_event["pipeline"][0],
-                          lp_v3.GRANULARITY_LABELS["per_group"])
-    assert app._wb_event["pipeline"][0]["granularity"] == "per_group"
+    item = app._wb_event["pipeline"][0]
+    assert item["granularity"] == "per_group"
+    tree = app._wb_pipe_tree
+    assert "gran" not in list(tree["columns"])
+    assert not any("产出颗粒度" in str(tree.heading(c)["text"])
+                   for c in tree["columns"])
+    assert not hasattr(app, "_wb_set_item_gran")
 
 
 def test_pipeline_item_mapping_uses_field_level_source(app):

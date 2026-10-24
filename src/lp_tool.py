@@ -15,7 +15,7 @@ v3.1 相对 v3.0 的结构变化：
       ① Word-MailMerge（Word 模板 → 可选转 PDF / 加水印 / 加密）
       ② 附加文件（磁盘上已有的文件 → 可选加水印 / 加密）
     处理顺序固定（转 PDF → 加水印 → 加密），用户不用排；每条产出几份文件由条目自己的
-    「产出颗粒度」决定。
+    产出方式固定按分组（同组一份、未分组各一份）。
   · 「数据来源」概念消解：来源下沉到字段级 —— 每个占位符单独选来源，并给预览值。
   · 工作台新增第 5 步「总览」：生成前逐人核对最终附件包与邮件样子。
 
@@ -63,12 +63,28 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.9"
+APP_VERSION = "3.5.0"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.9"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.5.0"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
+
+# v3.5.0：莫兰迪浅色系（顶部导航 + 功能色块）
+MORANDI_BG = "#F4F1EC"
+MORANDI_TOP = "#E8E2D7"
+MORANDI_CARD = "#FBF8F3"
+MORANDI_LINE = "#D8D0C4"
+MORANDI_TEXT = "#3F3C37"
+MORANDI_MUTED = "#77726A"
+MORANDI_HOME = "#CBD8C4"
+MORANDI_HOME_ON = "#B7C9AD"
+MORANDI_SET = "#DFD1C2"
+MORANDI_SET_ON = "#CDBBA8"
+MORANDI_HELP = "#C7D3DC"
+MORANDI_HELP_ON = "#B3C4D0"
+MORANDI_STEP = "#E9E3D9"
+MORANDI_STEP_ON = "#DDD4C6"
 
 # 邮件模板里永远可用的内置字段（**没有权限口令**，这是架构保证不是靠自觉）
 FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
@@ -480,6 +496,10 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
+        try:
+            root.configure(bg=MORANDI_BG)
+        except Exception:
+            pass
         root.geometry("1280x800")   # 默认正常窗口（首次不最大化）
         root.minsize(960, 620)
         _icon = Path(__file__).parent / "icon.ico"
@@ -558,50 +578,89 @@ class App:
     # ================= 外壳 =================
 
     def _build_shell(self):
+        """v3.5.0：主导航移到顶部（按钮形式），整体莫兰迪浅色块。"""
         style = ttk.Style()
         try:
-            style.theme_use("vista")
+            style.theme_use("clam")
         except Exception:
             pass
-        style.configure("Nav.TButton", padding=(10, 7), anchor="w")
-        style.configure("Step.TButton", padding=(8, 6), anchor="w")
-        style.configure("Head.TLabel", font=("", 15, "bold"))
-        style.configure("Sub.TLabel", foreground="#666")
-        style.configure("Card.TLabelframe", padding=8)
+        style.configure("TFrame", background=MORANDI_BG)
+        style.configure("TLabel", background=MORANDI_BG, foreground=MORANDI_TEXT)
+        style.configure("TButton", padding=(8, 5))
+        style.configure("TNotebook", background=MORANDI_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background="#E4DFD4", foreground=MORANDI_TEXT,
+                        padding=(14, 6))
+        style.map("TNotebook.Tab", background=[("selected", MORANDI_CARD)])
+        style.configure("Head.TLabel", background=MORANDI_BG, foreground=MORANDI_TEXT,
+                        font=("", 15, "bold"))
+        style.configure("Sub.TLabel", background=MORANDI_BG, foreground=MORANDI_MUTED)
+        style.configure("Card.TLabelframe", background=MORANDI_CARD,
+                        bordercolor=MORANDI_LINE)
+        style.configure("Card.TLabelframe.Label", background=MORANDI_CARD,
+                        foreground="#5A564E", font=("", 10, "bold"))
+        style.configure("Treeview", background="#FFFDFA", fieldbackground="#FFFDFA",
+                        foreground=MORANDI_TEXT, rowheight=24)
+        style.configure("Treeview.Heading", background="#E7E1D6",
+                        foreground=MORANDI_TEXT)
+        style.map("Treeview.Heading", background=[("active", "#DDD5C7")])
+        style.configure("Step.TButton", background=MORANDI_STEP,
+                        foreground=MORANDI_TEXT, padding=(10, 7), anchor="w",
+                        borderwidth=0, relief="flat")
+        style.map("Step.TButton", background=[("active", MORANDI_STEP_ON)])
+        for key, col, on in (("Home", MORANDI_HOME, MORANDI_HOME_ON),
+                             ("Settings", MORANDI_SET, MORANDI_SET_ON),
+                             ("Help", MORANDI_HELP, MORANDI_HELP_ON)):
+            style.configure("Nav%s.TButton" % key, background=col,
+                            foreground="#33402F", padding=(20, 8), borderwidth=0,
+                            relief="flat", font=("", 10, "bold"))
+            style.map("Nav%s.TButton" % key,
+                      background=[("active", on), ("pressed", on)])
+            style.configure("Nav%sOn.TButton" % key, background=on,
+                            foreground="#22301F", padding=(20, 8), borderwidth=0,
+                            relief="flat", font=("", 10, "bold"))
+            style.map("Nav%sOn.TButton" % key,
+                      background=[("active", on), ("pressed", on)])
 
-        # --- 顶栏 ---
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=10, pady=(8, 4))
+        top = tk.Frame(self.root, bg=MORANDI_TOP)
+        top.pack(fill="x")
         self._shell_widgets.append(top)
-        ttk.Label(top, text="文档分发助手", style="Head.TLabel").pack(side="left")
-        self.crumb = ttk.Label(top, text="", style="Sub.TLabel")
-        self.crumb.pack(side="left", padx=14)
-        ttk.Button(top, text="检查更新", command=lambda: self.check_update(False)
-                   ).pack(side="right")
-        ttk.Label(top, text="v" + APP_VERSION, foreground="#888").pack(side="right", padx=10)
+        inner = tk.Frame(top, bg=MORANDI_TOP)
+        inner.pack(fill="x", padx=16, pady=8)
+        tk.Label(inner, text="文档分发助手", bg=MORANDI_TOP, fg=MORANDI_TEXT,
+                 font=("", 16, "bold")).pack(side="left")
+        navbox = tk.Frame(inner, bg=MORANDI_TOP)
+        navbox.pack(side="left", padx=(26, 0))
+        self._nav_buttons = {}
+        for key, text in (("home", "事件库"), ("settings", "设置"), ("help", "帮助")):
+            b = ttk.Button(navbox, text=text, style="Nav%s.TButton" % key.capitalize(),
+                           command=lambda k=key: self.show_screen(k))
+            b.pack(side="left", padx=(0, 8))
+            self._nav_buttons[key] = b
+        right = tk.Frame(inner, bg=MORANDI_TOP)
+        right.pack(side="right")
+        ttk.Button(right, text="检查更新",
+                   command=lambda: self.check_update(False)).pack(side="right")
+        tk.Label(right, text="v" + APP_VERSION, bg=MORANDI_TOP, fg=MORANDI_MUTED,
+                 font=("", 9)).pack(side="right", padx=10)
+        self.crumb = tk.Label(right, text="", bg=MORANDI_TOP, fg=MORANDI_MUTED,
+                              font=("", 9))
+        self.crumb.pack(side="right", padx=10)
 
-        # --- 主体：左导航 + 右内容 ---
         body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        body.pack(fill="both", expand=True, padx=14, pady=(10, 10))
         self._shell_widgets.append(body)
-        nav = ttk.Frame(body, width=152)
-        nav.pack(side="left", fill="y")
-        nav.pack_propagate(False)
-        ttk.Label(nav, text="主导航", foreground="#888").pack(anchor="w", padx=8, pady=(4, 2))
-        for key, text in (("home", "事件库"),):
-            b = ttk.Button(nav, text=text, style="Nav.TButton",
-                           command=lambda k=key: self.show_screen(k))
-            b.pack(fill="x", padx=4, pady=1)
-        ttk.Label(nav, text="全局", foreground="#888").pack(anchor="w", padx=8, pady=(12, 2))
-        for key, text in (("settings", "设置"), ("help", "帮助")):
-            b = ttk.Button(nav, text=text, style="Nav.TButton",
-                           command=lambda k=key: self.show_screen(k))
-            b.pack(fill="x", padx=4, pady=1)
-
         self.content = ttk.Frame(body)
-        self.content.pack(side="left", fill="both", expand=True)
-        # 启动后直接落在「场景与事件」页
+        self.content.pack(fill="both", expand=True)
         self.show_screen("home")
+
+    def _set_nav_active(self, name):
+        active = {"event": "home"}.get(name, name)
+        for key, b in getattr(self, "_nav_buttons", {}).items():
+            style = ("Nav%sOn.TButton" if key == active else "Nav%s.TButton") % key.capitalize()
+            try:
+                b.configure(style=style)
+            except Exception:
+                pass
 
     def show_screen(self, name):
         """切换顶层页面（首次进入时构建）。"""
@@ -622,6 +681,7 @@ class App:
         self._set_crumb({
             "home": "事件库", "settings": "设置", "help": "帮助",
         }.get(name, name))
+        self._set_nav_active(name)
         if name == "home":
             self._refresh_home()
         elif name == "settings":
@@ -632,7 +692,7 @@ class App:
 
     def _guide(self, parent, text):
         """页顶部的说明条。"""
-        ttk.Label(parent, text=text, background="#eef3fa", foreground="#2b4a75",
+        ttk.Label(parent, text=text, background="#E9E4D8", foreground="#4F4A41",
                   padding=(10, 7), wraplength=1080, justify="left").pack(
             fill="x", pady=(0, 4))
 
@@ -1626,7 +1686,7 @@ class App:
             "    ② 文档流水线 —— 一张表，每一行 = 一个要附上的东西\n"
             "         · Word-MailMerge：用 Word 模板给每位收件人生成内容不同的文档\n"
             "         · 附加文件：把磁盘上已有的文件放进附件包\n"
-            "         每行可勾选「转 PDF / 加水印 / 加密」，并单独设「产出颗粒度」\n"
+            "         每行可勾选「转 PDF / 加水印 / 加密」\n"
             "    ③ 邮件模板 —— 主题与正文，{{字段}} 按每位收件人替换\n\n"
             "流水线页是左右分栏：\n"
             "    左栏 = 条目表 + 选中条目的参数区\n"
@@ -1636,9 +1696,9 @@ class App:
             "    · 流水线的 Word-MailMerge 条目 —— 每人一份、内容各异的文档\n"
             "    · 流水线的「附加文件」条目 —— 手填路径清单，或从 Excel 导入路径（与收件人一一对应）\n"
             "    · 统一附件 / 「附件」页 —— 所有人或指定的人收到的同一份静态文件\n\n"
-            "两个「模式」别搞混：\n"
-            "    发送模式（事件级）→ 决定几封邮件：每人一份 / 按组合并 / 全部合并\n"
-            "    产出颗粒度（条目级）→ 决定这一条产出几份文件：每人一份 / 每组合并一份 / 全员共用一份\n\n"
+            "发送模式（事件级）→ 决定几封邮件：每人一份 / 按组合并 / 全部合并\n"
+            "产出方式固定按分组：同一合并组共用一份文件，未分组的收件人各自一份\n"
+            "（这一项不再单独设置）\n\n"
             "操作顺序：\n"
             "1. 事件库 → 新建事件（或从「场景模板」复制一份配置）\n"
             "2. 收件人：先「下载导入模板」发给业务方填，填好导回来；\n"
@@ -2711,7 +2771,6 @@ class App:
                 ITEM_KIND_LABELS.get(it.get("kind"), ""),
                 self._wb_item_source_text(it),
                 self._wb_item_proc_text(it),
-                GRANULARITY_LABELS.get(it.get("granularity") or "per_lp", ""),
                 "✓" if it.get("enabled", True) else "—",
             ))
         if sel and tree.exists(sel):
@@ -2954,8 +3013,9 @@ class App:
         # ---------- 左栏：条目表 + 参数区 ----------
         frame = ttk.Frame(left_col)
         frame.pack(fill="both", expand=True, pady=(0, 4))
-        cols = ["no", "name", "kind", "source", "proc", "gran", "on"]
-        heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "产出颗粒度", "启用"]
+        # v3.5.0：去掉「产出颗粒度」，产出固定按分组（同组一份/未分组各一份）
+        cols = ["no", "name", "kind", "source", "proc", "on"]
+        heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "启用"]
         tree = ttk.Treeview(frame, columns=cols, show="headings",
                             selectmode="extended", height=6)
         for c, h in zip(cols, heads):
@@ -2965,7 +3025,6 @@ class App:
         tree.column("kind", width=78, stretch=False)
         tree.column("source", width=150)
         tree.column("proc", width=96, stretch=False)
-        tree.column("gran", width=104, stretch=False)
         tree.column("on", width=44, stretch=False, anchor="center")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         # ⑥ v3.4.4：补上横向滚动条（列宽被窗口截断时可以拖）
@@ -3003,18 +3062,19 @@ class App:
         self._uni_shown = False
         uni_row = ttk.Frame(uni)
         uni_row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(side="left", anchor="n")
-        self._wb_uni_text = tk.Text(uni_row, height=3, width=40, wrap="none")
-        self._wb_uni_text.pack(side="left", padx=4)
+        ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(anchor="w")
+        # v3.5.0：文本框与按钮改上下两行，右栏较窄时「保存」按钮也不会被裁掉
+        self._wb_uni_text = tk.Text(uni_row, height=3, wrap="none")
+        self._wb_uni_text.pack(fill="x", pady=(2, 4))
         for _a in ((self._wb_event or {}).get("attachments") or []):
             self._wb_uni_text.insert("end", str(_a.get("path") or "") + "\n")
         uni_btns = ttk.Frame(uni_row)
-        uni_btns.pack(side="left", anchor="n", padx=4)
+        uni_btns.pack(fill="x")
         ttk.Button(uni_btns, text="添加文件…", width=10,
                    command=self._wb_uni_add_file).pack(side="left")
         ttk.Button(uni_btns, text="保存", width=6,
-                   command=self._wb_uni_save).pack(side="left", pady=4)
-        ttk.Label(uni, foreground="#888", wraplength=560, justify="left",
+                   command=self._wb_uni_save).pack(side="left", padx=6)
+        ttk.Label(uni, foreground="#888", wraplength=430, justify="left",
                   text="每人专属的内容（如带各自水印/口令的 PDF）用左侧流水线条目处理；"
                        "这里只放所有人同一份的文件，会进入每位收件人的附件包。"
                   ).pack(anchor="w", padx=8, pady=(0, 4))
@@ -3556,12 +3616,26 @@ class App:
                                command=lambda: self._wb_export_attach_path_template(item))
             b_tpl.pack(side="left", padx=4)
             ttk.Label(box, text=(
-                "每行一个文件路径。从 Excel 导入时路径与收件人一一对应；"
-                "所有人同一份文件用「统一附件」按钮设置。"
-                if False else
-                "每行一个文件路径，从 Excel 导入时与收件人一一对应；"
-                "全员共用同一份文件请用「统一附件」按钮。"),
-                foreground="#888", wraplength=880, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+                "「从 Excel 导入路径…」按「收件人名称 + 附件路径」两列导入，"
+                "每位收件人只收到自己的文件；所有人同一份文件用「统一附件」。"),
+                foreground="#888", wraplength=470, justify="left").pack(
+                anchor="w", padx=8, pady=(0, 4))
+            # v3.5.0：显示当前路径来源（Excel 导入后会切成「按收件人附件路径」）
+            _src = str(params.get("path_source") or lp_v3.PATH_SOURCE_MANUAL)
+            _src_row = ttk.Frame(box)
+            _src_row.pack(fill="x", padx=8, pady=(0, 4))
+            if _src == lp_v3.PATH_SOURCE_MANUAL:
+                _src_txt = "当前：手填路径清单（所有收件人一样）"
+                _color = "#666"
+            else:
+                _src_txt = "当前：%s（每人不同；上方手填清单不生效）" % lp_v3.path_source_label(_src)
+                _color = "#8a6d3b"
+            ttk.Label(_src_row, text=_src_txt, foreground=_color,
+                      wraplength=340, justify="left").pack(side="left")
+            if _src != lp_v3.PATH_SOURCE_MANUAL:
+                ttk.Button(_src_row, text="改回手填路径", width=14,
+                           command=lambda: self._wb_reset_attach_path_source(item)
+                           ).pack(side="left", padx=6)
 
         # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
         r2 = ttk.Frame(box)
@@ -3641,23 +3715,12 @@ class App:
                 "默认只允许打印。全部取消 = 收件人只能打开查看，不能打印/编辑/复制。"),
                 wraplength=500, justify="left").pack(anchor="w", padx=8, pady=(0, 2))
 
-        # --- 产出粒度（条目级：这一条产出几份文件）---
-        r4 = ttk.Frame(box)
-        r4.pack(fill="x", padx=8, pady=4)
-        ttk.Label(r4, text="产出颗粒度（这一条产出几份文件）：").pack(side="left")
-        cur_gran = item.get("granularity") or "per_lp"
-        gran_var = self._wb_keep_var(tk.StringVar(value=GRANULARITY_LABELS.get(cur_gran, cur_gran)))
-        cb = ttk.Combobox(r4, textvariable=gran_var, state="readonly", width=16,
-                          values=[GRANULARITY_LABELS[g] for g in lp_v3.GRANULARITIES])
-        cb.pack(side="left", padx=4)
-        cb.bind("<<ComboboxSelected>>",
-                lambda _e: self._wb_set_item_gran(item, gran_var.get()))
-        ToolTip(cb, "\n".join("· %s：%s" % (GRANULARITY_LABELS[g],
-                                            lp_v3.GRANULARITY_DESC.get(g, ""))
-                              for g in lp_v3.GRANULARITIES)
-                   + "\n\n注意：事件里的「发送模式」决定几封邮件，这里决定这一条产出几份文件。")
-        ttk.Label(r4, foreground="#888",
-                  text=lp_v3.GRANULARITY_DESC.get(cur_gran, "")).pack(side="left", padx=8)
+
+        # --- v3.5.0：产出固定按分组（不再提供「产出颗粒度」设置）---
+        ttk.Label(box, foreground="#888", wraplength=500, justify="left",
+                  text="产出方式：按分组自动 —— 同一合并组共用一份文件；"
+                       "未分组的收件人各自一份。邮件分组在「收件人」页的「组」列维护。"
+                  ).pack(anchor="w", padx=8, pady=(0, 4))
 
         if kind == "generate":
             mbox = ttk.LabelFrame(parent, text=" 字段映射（Word 占位符 → 数据来源） ",
@@ -4000,9 +4063,15 @@ class App:
         self._wb_write_attach_files(item, self._wb_attach_files_from_text(tw), tw)
 
     def _wb_import_attach_paths(self, item, tw):
-        path = filedialog.askopenfilename(title="选择路径清单（Excel/CSV）",
-                                          filetypes=[("表格", "*.xlsx;*.csv"),
-                                                     ("所有文件", "*.*")])
+        """v3.5.0：按「收件人名称 + 附件路径」两列导入，路径落到每位收件人身上。
+
+        旧版把整列路径全部并进「手填清单」→ 所有收件人都会收到全部文件（用户反馈的 bug）。
+        现在：按名称匹配收件人，路径写进 rec["attachments"]，条目切换成
+        「按收件人附件路径」取文件，每位收件人只收到自己那份。
+        """
+        path = filedialog.askopenfilename(
+            title="选择路径清单（Excel/CSV，需含「收件人名称」列）",
+            filetypes=[("表格", "*.xlsx;*.csv"), ("所有文件", "*.*")])
         if not path:
             return
         try:
@@ -4010,45 +4079,96 @@ class App:
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
             return
-        if not rows:
-            messagebox.showerror("读取失败", "文件里读不到任何行")
+        if not rows or len(rows) < 2:
+            messagebox.showerror("读取失败", "文件里读不到数据行")
             return
         headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+        name_aliases = {a.lower() for a in HEADER_ALIASES.get("name", ())}
+        name_default = next((h for h in headers if h.lower() in name_aliases),
+                            headers[0] if headers else "")
+        path_default = next((h for h in headers
+                             if h in ("附件路径", "路径", "files", "attachments")),
+                            headers[-1] if headers else "")
         win = tk.Toplevel(self.root)
-        win.title("选择路径列")
+        win.title("从 Excel 导入路径")
         win.grab_set()
-        ttk.Label(win, text="哪一列是文件路径？", justify="left").pack(
-            anchor="w", padx=12, pady=(10, 4))
-        var = tk.StringVar(value=headers[0] if headers else "")
-        ttk.Combobox(win, textvariable=var, state="readonly", width=36,
-                     values=[h for h in headers if h]).pack(anchor="w", padx=12)
+        ttk.Label(win, justify="left", text=(
+            "按收件人对应导入：选「收件人名称」列和「附件路径」列，\n"
+            "导入后每位收件人只收到自己那行的文件（多个路径用 ; 分隔）。")
+        ).pack(anchor="w", padx=12, pady=(10, 6))
+        row1 = ttk.Frame(win)
+        row1.pack(fill="x", padx=12, pady=2)
+        ttk.Label(row1, text="收件人名称列：").pack(side="left")
+        name_var = tk.StringVar(value=name_default)
+        ttk.Combobox(row1, textvariable=name_var, state="readonly", width=24,
+                     values=[h for h in headers if h]).pack(side="left")
+        row2 = ttk.Frame(win)
+        row2.pack(fill="x", padx=12, pady=2)
+        ttk.Label(row2, text="附件路径列：").pack(side="left")
+        path_var = tk.StringVar(value=path_default)
+        ttk.Combobox(row2, textvariable=path_var, state="readonly", width=24,
+                     values=[h for h in headers if h]).pack(side="left")
 
         def ok():
-            win.destroy()
-            col = var.get()
-            if not col or col not in headers:
+            name_col = name_var.get()
+            path_col = path_var.get()
+            if not name_col or not path_col or name_col not in headers or path_col not in headers:
+                messagebox.showwarning("未选择列", "请选择收件人名称列和附件路径列", parent=win)
                 return
-            ci = headers.index(col)
-            cur = self._wb_attach_files_from_text(tw)
-            added = 0
-            for r in rows[1:]:
-                if ci >= len(r):
+            if name_col == path_col:
+                messagebox.showwarning("列重复", "两列不能是同一列", parent=win)
+                return
+            ni, pi = headers.index(name_col), headers.index(path_col)
+            ev = self._wb_event
+            by_name = {str(r.get("name", "")).strip(): r
+                       for r in (ev.get("recipients") or [])}
+            updated, unmatched, total_paths = 0, [], 0
+            for row in rows[1:]:
+                name = str(row[ni] or "").strip() if ni < len(row) else ""
+                if not name or name.startswith("示例："):
                     continue
-                for p in lp_v3.split_paths(str(r[ci] or "")):
-                    if p and p not in cur:
-                        cur.append(p)
-                        added += 1
-            self._wb_write_attach_files(item, cur, tw)
-            messagebox.showinfo("导入完成",
-                                "从「%s」的「%s」列导入 %d 条路径。"
-                                % (Path(path).name, col, added))
+                rec = by_name.get(name)
+                if rec is None:
+                    unmatched.append(name)
+                    continue
+                raw = row[pi] if pi < len(row) else ""
+                paths = lp_v3.split_paths("" if raw is None else str(raw))
+                rec["attachments"] = paths
+                updated += 1
+                total_paths += len(paths)
+            if updated == 0:
+                messagebox.showwarning("没有匹配到收件人",
+                                       "文件里的收件人名称和当前事件对不上，未导入任何路径。\n"
+                                       "未匹配：%s" % "、".join(unmatched[:10]), parent=win)
+                return
+            params = item.setdefault("params", {})
+            params["path_source"] = lp_v3.PATH_SOURCE_RECIPIENT
+            params["files"] = []        # 手填清单不再生效，避免所有人收到全部文件
+            self._wb_save()
+            win.destroy()
+            self._wb_fill_pipe_table(keep_sel=item.get("id"))
+            self._wb_render_params(item)
+            msg = ("已按收件人对应导入 %d 条路径（%d 位收件人）。\n\n"
+                   "这条附加文件已切换为「按收件人附件路径」取文件："
+                   "每位收件人只收到自己那份。\n"
+                   "可用「导出路径模板」核对或再次编辑。") % (total_paths, updated)
+            if unmatched:
+                msg += "\n\n以下收件人名称在事件里找不到（未导入）：\n" + "、".join(unmatched[:10])
+            messagebox.showinfo("导入完成", msg)
 
         btns = ttk.Frame(win)
         btns.pack(pady=10)
         ttk.Button(btns, text="导入", command=ok).pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
 
-    # ---------- 外部数据表 ----------
+    def _wb_reset_attach_path_source(self, item):
+        """把附加文件条目改回「手填路径清单」。"""
+        params = item.setdefault("params", {})
+        params["path_source"] = lp_v3.PATH_SOURCE_MANUAL
+        params["files"] = []
+        self._wb_save()
+        self._wb_fill_pipe_table(keep_sel=item.get("id"))
+        self._wb_render_params(item)
 
     def _wb_pick_sheet(self, item):
         path = filedialog.askopenfilename(title="选择外部数据表",
@@ -4180,15 +4300,6 @@ class App:
             perms = [x for x in perms if x != pk]
         params["permissions"] = perms
         self._wb_save()
-        self._wb_render_params(item)
-
-    def _wb_set_item_gran(self, item, label):
-        for g, lab in GRANULARITY_LABELS.items():
-            if lab == label:
-                item["granularity"] = g
-                break
-        self._wb_save()
-        self._wb_fill_pipe_table(keep_sel=item.get("id"))
         self._wb_render_params(item)
 
     # ---------- 步骤 3：附件 ----------
