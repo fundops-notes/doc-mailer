@@ -56,9 +56,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.3.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.3.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -2593,6 +2593,13 @@ class App:
         self._wb_show_step(self._wb_step)
         messagebox.showinfo("已套用", "已添加字段列：" + "、".join(cols))
 
+    def _fingerprint_notice(self):
+        """同封邮件内不同路径但内容相同的附件提示（只提示，不去重、不改路径）。"""
+        try:
+            return lp_v3.attachment_fingerprint_warnings(self._wb_event)
+        except Exception:
+            return []
+
     def _wb_check_attachments(self):
         total, missing = 0, []
         for rec in self._wb_event.get("recipients", []):
@@ -2600,14 +2607,21 @@ class App:
                 total += 1
                 if not Path(path).exists():
                     missing.append("%s：%s" % (rec.get("name", ""), path))
+        fp = self._fingerprint_notice()
+        fp_text = ("\n\n【内容重复提示】同一封邮件内以下文件内容完全相同"
+                   "（不同路径），两份都会发送，请确认是否有意如此：\n"
+                   + "\n".join(fp)) if fp else ""
         if not missing:
-            messagebox.showinfo("附件检查", "全部就绪：%d 个附件路径均存在。" % total)
+            (messagebox.showwarning if fp else messagebox.showinfo)(
+                "附件检查",
+                "全部就绪：%d 个附件路径均存在。" % total + fp_text)
         else:
             lines = "\n".join(missing[:15]) + ("…" if len(missing) > 15 else "")
             messagebox.showwarning("附件检查",
                                    "%d/%d 个就绪，以下 %d 个不存在：\n\n%s\n\n"
                                    "缺失的附件在生成草稿时会被跳过并记入日志。"
-                                   % (total - len(missing), total, len(missing), lines))
+                                   % (total - len(missing), total, len(missing), lines)
+                                   + fp_text)
 
     def _wb_fill_passwords(self):
         n = 0
@@ -3744,14 +3758,19 @@ class App:
         missing = [a.get("path", "") for a in self._wb_event.get("attachments", [])
                    if not (a.get("path") and Path(a["path"]).exists())]
         total = len(self._wb_event.get("attachments", []))
+        fp = self._fingerprint_notice()
+        fp_text = ("\n\n【内容重复提示】同一封邮件内以下文件内容完全相同"
+                   "（不同路径），两份都会发送，请确认是否有意如此：\n"
+                   + "\n".join(fp)) if fp else ""
         if not missing:
-            messagebox.showinfo("附件检查", "全部就绪：%d 个附件文件均存在。" % total)
+            (messagebox.showwarning if fp else messagebox.showinfo)(
+                "附件检查", "全部就绪：%d 个附件文件均存在。" % total + fp_text)
         else:
             messagebox.showwarning("附件检查",
                                    "%d/%d 个就绪，以下不存在：\n\n%s\n\n"
                                    "缺失的附件在生成草稿时会被跳过并记入日志。"
                                    % (total - len(missing), total,
-                                      "\n".join(missing[:15])))
+                                      "\n".join(missing[:15])) + fp_text)
 
     # ---------- 步骤 4：邮件模板 ----------
 

@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.3.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.3.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -2104,24 +2104,61 @@ def assemble_attachments(event, unit, final_outputs, dup_log=None):
             if event_uses_recipient_paths(event):
                 break          # 已由流水线条目按路径来源产出，不重复附加
             _add(p)
-    # 去重：路径 → 内容指纹（保持顺序，保留首个）
+    # 去重：仅按路径（同一路径只挂一份）。
+    # 内容指纹相同但路径不同的文件【全部保留、不做去重】——只在 dup_log 里
+    # 记 (首份, 重复份) 供调用方提示（用户拍板 2026-10-24：提示而非去重）。
     seen_path, seen_hash, out = set(), {}, []
     for p in files:
         key = str(p).lower()
         if key in seen_path:
-            if dup_log is not None:
-                dup_log.append((p, p))     # 同路径重复（理论上少见）
-            continue
+            continue                        # 同一路径 = 同一个文件，只挂一份
         seen_path.add(key)
         digest = _file_digest(p)
         if digest is not None and digest in seen_hash:
             if dup_log is not None:
-                dup_log.append((seen_hash[digest], p))
-            continue
-        if digest is not None:
-            seen_hash[digest] = p
-        out.append(p)
+                dup_log.append((seen_hash[digest], p))   # 仅记录，不丢弃
+        else:
+            if digest is not None:
+                seen_hash[digest] = p
+        out.append(p)                       # 无论指纹是否重复都保留
     return out, missing
+
+
+def attachment_fingerprint_warnings(event):
+    """按草稿单元（=每封邮件）扫描附件的内容指纹重复。
+
+    范围：事件级静态附件 + 成员的收件人专属附件（不含流水线产物——
+    每人一份的产物按人各有水印/口令，内容天然不同；all/组粒度产物是单文件）。
+    只报告"同封邮件内、不同路径、指纹（大小+SHA256）相同"的组合，
+    **不改任何数据、不去重**（用户拍板 2026-10-24）。
+    返回 [str] 警告文案。
+    """
+    warns = []
+    for key, unit in draft_units(event):
+        paths = []
+        for a in event.get("attachments") or []:
+            if _attachment_matches(a, unit):
+                pth = str(a.get("path") or "").strip()
+                if pth and Path(pth).exists():
+                    paths.append(pth)
+        if not event_uses_recipient_paths(event):
+            for r in unit.get("recipients") or []:
+                for pth in r.get("attachments") or []:
+                    if pth and Path(pth).exists():
+                        paths.append(str(pth))
+        by_digest = {}
+        for pth in paths:
+            d = _file_digest(pth)
+            if d is None:
+                continue
+            prev = by_digest.get(d)
+            if prev is None:
+                by_digest[d] = pth
+            elif prev.lower() != pth.lower():
+                warns.append("[%s] %s 与 %s 内容完全相同（不同路径），"
+                             "两份都会进入这封邮件，请确认是否有意如此"
+                             % (key, Path(prev).name, Path(pth).name))
+    return warns
 
 
 def draft_units(event):
@@ -2339,6 +2376,7 @@ def preflight(event, store=None):
         "drafts": len(draft_units(event)),
         "expected_files": len(steps) * len(draft_units(event)),
     }
+    warnings.extend(attachment_fingerprint_warnings(event))
     return errors, warnings, info
 
 
@@ -2519,9 +2557,9 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         dup_log = []
         files, missing = assemble_attachments(event, unit, final_files,
                                               dup_log=dup_log)
-        for kept, dropped in dup_log:
-            _log("[附件去重] %s 与 %s 内容相同，仅保留前者"
-                 % (Path(kept).name, Path(dropped).name))
+        for first, dup in dup_log:
+            _log("[附件重复提示] %s 与 %s 内容相同（不同路径），已全部保留，请人工确认"
+                 % (Path(first).name, Path(dup).name))
         item = {
             "key": key,
             "kind": "group" if unit.get("group") else "lp",
