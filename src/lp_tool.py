@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths,
                    sync_scenario_to_event)
 
-APP_VERSION = "3.4.8"
+APP_VERSION = "3.4.9"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.8"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.4.9"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -5165,7 +5165,18 @@ class App:
                              % (info["tag"], (info.get("asset_size") or 0) // 1048576)))
                 last = [None]
 
-                def _prog(pct):
+                def _prog(blocknum, blocksize=1, totalsize=0):
+                    """urllib.request.urlretrieve 的 reporthook 固定传 3 个参数
+                    (blocknum, blocksize, totalsize)。v3.4.9 修复：旧签名只收 1 个，
+                    真正下载时抛 TypeError →「自动更新失败」。"""
+                    try:
+                        total = int(totalsize or 0)
+                        done = int(blocknum or 0) * int(blocksize or 1)
+                    except Exception:
+                        return
+                    if total <= 0:
+                        return
+                    pct = max(0, min(100, int(done * 100 / total)))
                     if pct != last[0] and pct % 20 == 0:
                         last[0] = pct
                         self._q.put(("log", "[更新] 下载进度 %d%%" % pct))
@@ -5180,6 +5191,17 @@ class App:
                         raise RuntimeError("下载校验失败（期望 %s…，实际 %s…）"
                                            % (digest[:20], got[:20]))
                     self._q.put(("log", "[更新] SHA256 校验通过"))
+                else:
+                    self._q.put(("log", "[更新] 未取到 SHA256 摘要（API 可能限流），"
+                                        "改用 zip 完整性校验"))
+                with zipfile.ZipFile(zip_path) as _zf:
+                    bad = _zf.testzip()
+                    if bad:
+                        raise RuntimeError("下载包损坏（首个坏文件：%s）" % bad)
+                    names = _zf.namelist()
+                if "app/" not in "".join(names[:50]) and not any(
+                        n.startswith("app/") for n in names):
+                    self._q.put(("log", "[更新] 警告：更新包顶层不是 app/，按目录结构继续"))
                 if staging.exists():
                     import shutil as _sh
                     _sh.rmtree(staging)

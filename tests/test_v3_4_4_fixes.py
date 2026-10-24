@@ -157,9 +157,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_348():
-    assert lp_tool.APP_VERSION == "3.4.8"
-    assert lp_v3.APP_VERSION == "3.4.8"
+def test_version_is_349():
+    assert lp_tool.APP_VERSION == "3.4.9"
+    assert lp_v3.APP_VERSION == "3.4.9"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -676,3 +676,54 @@ def test_mapping_dialog_lists_all_placeholders_and_preselects_row(app, tmp_path)
     assert item["mapping"]["{{Due_Date}}"] == "fields.Call_Amount"
     saved, _e = a.store.load_event(ev["id"])
     assert saved["pipeline"][0]["mapping"]["{{Due_Date}}"] == "fields.Call_Amount"
+
+def test_self_update_progress_hook_and_staging(app, tmp_path, monkeypatch):
+    """回归：自动更新下载时 _prog 只收 1 个参数，urlretrieve 传 3 个 → TypeError。
+    这里用假 urlretrieve 走完整下载→解压→生成更新脚本链路（不真重启）。"""
+    import queue
+    import shutil
+    import time
+    import urllib.request
+    import zipfile
+
+    a, _mb, _fd, _err = app
+    appdir = tmp_path / "appdir"
+    appdir.mkdir()
+    monkeypatch.setattr(lp_tool, "app_dir", lambda: appdir)
+
+    fake_zip = tmp_path / "fake_update.zip"
+    with zipfile.ZipFile(str(fake_zip), "w") as z:
+        z.writestr("app/lp_tool.py", "print('new version')\n")
+        z.writestr("app/start.bat", "@echo off\n")
+
+    def fake_retrieve(url, filename, reporthook=None, data=None):
+        # urlretrieve 的 reporthook 固定按 3 个参数调用
+        if reporthook:
+            reporthook(1, 1024, 4096)
+            reporthook(4, 1024, 4096)
+        shutil.copyfile(str(fake_zip), filename)
+        return str(filename), {}
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_retrieve)
+    info = {"asset_url": "http://example.invalid/doc-mailer_portable.zip",
+            "asset_digest": "", "tag": "v9.9.9",
+            "asset_size": fake_zip.stat().st_size}
+    a._self_update(info)
+    items = []
+    end = time.time() + 10
+    while time.time() < end:
+        try:
+            while True:
+                items.append(a._q.get_nowait())
+        except queue.Empty:
+            pass
+        if any(k == "update_ready" for k, _ in items):
+            break
+        time.sleep(0.05)
+    errs = [i for i in items if i[0] == "update_err"]
+    assert not errs, "自动更新不应失败：%s" % errs
+    assert any(k == "update_ready" for k, _ in items), items
+    assert (appdir / ".update_staging" / "app" / "lp_tool.py").exists()
+    bat = (appdir / "run_update.bat").read_text(encoding="ascii", errors="ignore")
+    assert "robocopy" in bat and "lp_data" in bat and "start" in bat
+    assert not (appdir / ".update_pkg.zip").exists(), "下载包应在解压后删除"
