@@ -1,0 +1,116 @@
+# v3.4.3 验收任务提示词（交给接手 agent，整段复制）
+
+你接手桌面工具「文档分发助手」v3.4.3 的**验收任务**。上一轮已完成 8 项需求的实现
+并发布了 Release v3.4.3，但其中部分改动曾出现"补丁未落盘/打包未同步"的问题
+（历史发生过 3 次），所以本轮的核心是**独立验收**：逐项验证真实行为，不要相信
+任何"已完成"的表述，一切以你实测为准。
+
+## 一、项目坐标
+
+- 工作区根：`C:\Users\ian\.zcode\workspace\draft-cb79fb36-0da4-49bb-bce6-0ba69eabb0e3`
+- 源码：根目录 `lp_tool.py`（GUI）/ `lp_v3.py`（核心逻辑）/ `watermark_encrypt.py`
+- Git 仓库：`lp-doc-mailer/`（remote = github.com/fundops-notes/doc-mailer，main = `34f1823`）
+- 测试：`lp-doc-mailer/tests/`（208 条 pytest）
+- Release：v3.4.3（id=422643200），资产 `doc-mailer_v3.4.3_portable.zip` + `doc-mailer_win64.zip`
+- 背景文档：`lp-doc-mailer/docs/HANDOFF_v3.0.md`（§23 是本轮改动记录）
+
+技术栈：Python 3.14 + tkinter + PyMuPDF 1.28 + pywin32(Word/Outlook COM) + openpyxl。
+用户机器是**非中文 Windows**（历史多次编码事故，见 HANDOFF §6/§17）。
+
+## 二、本轮 8 项改动（逐项验收）
+
+**验收方式要求**：①③⑥⑦⑧ 用"驱动真实 GUI"验证（import lp_tool、建 App、
+open_event、操作控件、断言状态），不要只看代码；②⑤ 涉及真实 Word/Outlook COM，
+可复用 `lp-doc-mailer/tests/` 里 word_batch / fake_outlook 的 fixture 模式；
+测试用 `tempfile` 隔离数据目录（monkeypatch `lp_v3.default_base_dir`），结束后清理。
+
+### ① 收件人页无「附件路径」列
+- 工作台收件人表（`_wb_rec_tree`）、收件人库表（`_pool_tree`）、编辑收件人对话框、
+  Excel 导入模板（`lp-doc-mailer/examples/收件人清单导入模板.xlsx`）四处都应没有该列/字段。
+- Excel 导入时若出现「附件路径」列应被忽略或收进自定义字段，**不得**映射到
+  `rec["attachments"]` 主键。
+- 注意：`rec["attachments"]` 数据本体仍保留（流水线「路径来源」兼容旧数据），
+  只是 UI 不再露出。
+
+### ② Word-MailMerge 条目（原「生成文档」）
+- 类型名显示为 "Word-MailMerge"（ITEM_KIND_LABELS）。
+- 参数区有「说明」按钮（弹窗含占位符写法/处理顺序/水印口令来源）、
+  「导出要素模板」（Excel 预填本事件收件人，列=检测出的占位符）、
+  「下载示例 Word 模板」（真实生成 .docx，含 Client_Name/Call_Amount/Unfunded/
+  Due_Date/Bank_Name/Account_No 六个占位符）。
+- 加密勾选后出现「发送人统一密码」选项（勾选+密码框，存 settings.gp_owner_mode /
+  gp_owner_pw，即 GP 统一权限口令机制）。
+- 处理行尾有提示「水印文字与各人打开口令在『收件人』处维护」。
+
+### ②b 预设占位符 Client_Name
+- `lp_v3.field_source_options()` 返回值含 ("Client_Name", "预设", ...)；
+  `BUILTIN_ALIASES["name"]` 含 "client_name"，所以模板写
+  `{{Client_Name}}` 或 `{{client_name}}` 都能替换为收件人名称。
+
+### ③ 「产出颗粒度」文案
+- 参数区标签、条目表列头、相关提示全部用「产出颗粒度」（不再是「产出粒度」）。
+
+### ④⑤ 流水线页左右分栏 + 对应表 + 处理按钮
+- 页面结构：**PanedWindow 左右分栏**——左=条目表+参数区，右=统一附件（折叠按钮）
+  +「▶ 处理」按钮+**收件人↔文件对应表**。
+- 对应表（`_wb_map_tree`）：列=收件人名称/将收到的文件/文件路径/状态，grid 布局
+  带纵横向滚动条；双击「文件路径」列出现行内 Entry 可编辑；
+  表下「保存自定义编辑」写入 `event["process_overrides"]`（需持久化到
+  `lp_data/events/<id>.json` —— normalize_event 白名单必须含 process_results 和
+  process_overrides，这两个键历史上曾被洗掉过）。
+- 「▶ 处理」按钮：按当前参数**全量重跑**流水线（每次清空上次 process_results），
+  走真实 Word→PDF→水印→加密，完成后把每位收件人的产物路径回填对应表。
+  验收：建 2 收件人的事件 + Word 模板 + generate 条目（to_pdf/watermark/encrypt 全勾）
+  → 点处理 → 断言 2 份 PDF 存在、各自口令可解、权限仅打印、水印文字在、
+  `event["process_results"]` 逐人回填并持久化。
+- 统一附件折叠：默认收起（pack_forget），点「📎 统一附件…」展开，再点收起。
+
+### ⑥ 表格/输入适配
+- 事件表、流水线条目表有横向滚动条；root.minsize(960, 620)。
+
+### ⑦ 默认正常窗口
+- `root.geometry("1280x800")`，**无** `root.state("zoomed")`。
+
+### ⑧ 软件图标
+- 根目录 `icon.ico` 存在；App __init__ 里 `root.iconbitmap`；exe 构建带 `--icon icon.ico`。
+
+### ⑤ 处理时的重复文件行为（v3.3.1 拍板，本轮保持）
+- 同一路径只挂一份；**不同路径、内容指纹（大小+SHA256）相同 → 全部保留**，
+  只在运行日志/预检 warnings/检查附件弹窗三处提示（`[附件重复提示] ... 请人工确认`）。
+- 验收用两个内容相同、文件名不同的文件造重复场景，断言两份都在附件包里且有提示。
+
+## 三、已知问题（验收时确认仍未修，报告即可）
+
+1. **占位符别名大小写敏感**：`{{LP名称}}`（大写 LP）不替换，`{{lp名称}}` 才行。
+   用户已决定不修，验收时确认行为一致即可。
+2. **打开口令在界面明文**（权限口令已遮罩 ••••）。用户已决定不修。
+3. **附加文件条目**的「路径来源」下拉已删，但 `lp_v3.py` 的
+   `PATH_SOURCE_RECIPIENT` / `resolve_item_paths` 逻辑仍在（兼容旧数据，UI 不露出）——
+   确认 UI 无下拉即可，核心代码不必删。
+4. Word 进程残留 1 个/进程（WINWORD 无头实例，进程退出不消失）。
+   清理命令见 HANDOFF §14.6。验收后建议清理一次。
+
+## 四、回归基线
+
+- `python sync_release.py` → [OK]
+- `python -m pytest lp-doc-mailer/tests -q` → **208 passed**（本机有 Word；
+  CI 模拟加 `LP_SKIP_WORD_TESTS=1` → 199 passed / 9 skipped）
+- 打包：`python pack_portable.py` 读回断言全 [OK]；exe 45.1MB 签名 Valid
+  （构建命令必须带 `--exclude-module pandas pyarrow numpy scipy IPython matplotlib polars win32com.test --icon icon.ico`，否则 115MB）
+
+## 五、验收产出要求
+
+1. 一份验收报告：8 项需求逐项 PASS/FAIL + 证据（截图路径或断言输出）。
+2. 发现任何新问题按 P0/P1/P2 分级列出，不要顺手修（除非用户授权）。
+3. 若某项 FAIL：写清复现步骤与根因定位，等用户决定是否修。
+4. 验收用的临时数据放 tempfile 并在结束时清理；Outlook 测试草稿用完即删
+   （搜主题前缀标记）。
+5. 不要改业务代码。只有测试脚本（可新建 `e2e_v34_verify.py` 放工作区根）。
+
+## 六、红线（违反即失败）
+
+- 全库不得出现 Outlook `.Send()` 调用（只允许 `mail.Save()`）。
+- 权限口令不得进入邮件正文/标题/模板字段表。
+- 不得删除 `签名/`、`LP_Tool_绿色版/runtime/`、git 仓库本体。
+- 不得 force push、不得改写已发布 tag。
+- 发布检查断言 `lp_tool.py` 里存在 `'APP_VERSION = "3.4.3"'` 字面量，别改成 import。
