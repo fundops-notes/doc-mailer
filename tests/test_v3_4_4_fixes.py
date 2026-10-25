@@ -162,9 +162,9 @@ def _save_event(app, name, recips, pipeline=None):
     return ev
 
 
-def test_version_is_380():
-    assert lp_tool.APP_VERSION == "3.8.0"
-    assert lp_v3.APP_VERSION == "3.8.0"
+def test_version_is_381():
+    assert lp_tool.APP_VERSION == "3.8.1"
+    assert lp_v3.APP_VERSION == "3.8.1"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -813,10 +813,19 @@ def test_left_nav_and_saas_styles(app):
     """v3.8.0：左侧导航 + Modern Enterprise SaaS 主题。"""
     a, _mb, _fd, _err = app
     a.root.update()
-    assert set(a._nav_buttons.keys()) == {"home", "settings", "help"}
+    assert set(a._nav_buttons.keys()) == {"events", "pool", "runs", "settings", "help"}
     for b in a._nav_buttons.values():
         assert not _descendant(b, a.content), "导航按钮应在内容区外的左栏"
-    assert a._nav_buttons["home"].cget("style") in ("NavOn.TButton", "Nav.TButton")
+    assert a._nav_buttons["events"].cget("style") in ("NavOn.TButton", "Nav.TButton")
+    # 工作台三个入口并列，点击切换内容且高亮
+    a.show_home_section("pool")
+    a.root.update()
+    assert a.home_nb.index(a.home_nb.select()) == 1
+    assert a.home_title_label.cget("text") == "收件人库"
+    assert a._nav_buttons["pool"].cget("style") == "NavOn.TButton"
+    a.show_home_section("runs")
+    a.root.update()
+    assert a.home_title_label.cget("text") == "执行历史"
     a.show_screen("settings")
     a.root.update()
     assert a._nav_buttons["settings"].cget("style") == "NavOn.TButton"

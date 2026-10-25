@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.8.1"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.8.0"' 字面量，别改成 import。
+# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.8.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -739,6 +739,13 @@ class App:
                         font=(SAAS_FONT, 10, "bold"))
         style.map("NavOn.TButton", background=[("active", MORANDI_HOME_ON)])
         style.configure("TNotebook", background=MORANDI_BG, borderwidth=0)
+        style.layout("Plain.TNotebook",
+                     [("Plain.TNotebook.client", {"sticky": "nswe"})])
+        try:
+            style.layout("TNotebook.Tab", [])
+        except Exception:
+            pass
+        style.configure("Plain.TNotebook", background=MORANDI_BG, borderwidth=0)
         style.configure("TNotebook.Tab", background=MORANDI_BG,
                         foreground=MORANDI_MUTED, padding=(14, 8),
                         font=(SAAS_FONT, 10))
@@ -776,29 +783,42 @@ class App:
         outer = tk.Frame(root, bg=MORANDI_BG)
         outer.pack(fill="both", expand=True)
         self._shell_widgets.append(outer)
-        sidebar = tk.Frame(outer, bg=MORANDI_TOP, width=216,
+        sidebar = tk.Frame(outer, bg=MORANDI_TOP, width=176,
                            highlightbackground=MORANDI_LINE, highlightthickness=1)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
         brand = tk.Frame(sidebar, bg=MORANDI_TOP)
-        brand.pack(fill="x", padx=18, pady=(20, 18))
+        brand.pack(fill="x", padx=16, pady=(18, 14))
         tk.Label(brand, text="文档分发助手", bg=MORANDI_TOP, fg=MORANDI_TEXT,
-                 font=(SAAS_FONT, 13, "bold"), anchor="w").pack(fill="x")
+                 font=(SAAS_FONT, 12, "bold"), anchor="w").pack(fill="x")
         tk.Label(brand, text="Document Dispatch", bg=MORANDI_TOP, fg=MORANDI_MUTED,
                  font=(SAAS_FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
 
         tk.Label(sidebar, text="工作台", bg=MORANDI_TOP, fg="#94A3B8",
-                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=20, pady=(4, 4))
+                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=18, pady=(2, 3))
         self._nav_buttons = {}
-        for key, text in (("home", "事件库"), ("settings", "设置"), ("help", "帮助")):
+        for key, text in (("events", "事件"), ("pool", "收件人库"),
+                          ("runs", "执行历史")):
+            b = ttk.Button(sidebar, text=text, style="Nav.TButton",
+                           command=lambda k=key: self.show_home_section(k))
+            b.pack(fill="x", padx=10, pady=2)
+            self._nav_buttons[key] = b
+
+        tk.Label(sidebar, text="系统", bg=MORANDI_TOP, fg="#94A3B8",
+                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=18, pady=(14, 3))
+        for key, text in (("settings", "设置"), ("help", "帮助")):
             b = ttk.Button(sidebar, text=text, style="Nav.TButton",
                            command=lambda k=key: self.show_screen(k))
-            b.pack(fill="x", padx=12, pady=2)
+            b.pack(fill="x", padx=10, pady=2)
             self._nav_buttons[key] = b
+
         tk.Frame(sidebar, bg=MORANDI_TOP).pack(fill="both", expand=True)
         tk.Label(sidebar, text="v" + APP_VERSION, bg=MORANDI_TOP, fg=MORANDI_MUTED,
-                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=20, pady=(0, 16))
+                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=18, pady=(0, 4))
+        ttk.Button(sidebar, text="检查更新",
+                   command=lambda: self.check_update(False)).pack(
+            fill="x", padx=12, pady=(0, 14))
 
         # ---- 右侧主区域 ----
         main = tk.Frame(outer, bg=MORANDI_BG)
@@ -814,8 +834,6 @@ class App:
         self.crumb.pack(side="left")
         right = tk.Frame(top_inner, bg=MORANDI_TOP)
         right.pack(side="right")
-        ttk.Button(right, text="检查更新",
-                   command=lambda: self.check_update(False)).pack(side="right")
         # 事件操作（进入事件显示）
         self._ev_actions = tk.Frame(right, bg=MORANDI_TOP)
         self._ev_actions.pack(side="right", padx=(0, 8))
@@ -836,7 +854,12 @@ class App:
         self.show_screen("home")
 
     def _set_nav_active(self, name):
-        active = {"event": "home"}.get(name, name)
+        if name == "event":
+            active = "events"
+        elif name == "home":
+            active = self._home_tab_key() if hasattr(self, "home_nb") else "events"
+        else:
+            active = name
         for key, b in getattr(self, "_nav_buttons", {}).items():
             try:
                 b.configure(style="NavOn.TButton" if key == active else "Nav.TButton")
@@ -870,11 +893,12 @@ class App:
                 builder(frame)
         self._screens[name].pack(fill="both", expand=True)
         self._set_crumb({
-            "home": "事件库", "settings": "设置", "help": "帮助",
+            "home": "事件", "settings": "设置", "help": "帮助",
         }.get(name, name))
         self._set_nav_active(name)
         if name == "home":
             self._refresh_home()
+            self._on_home_tab_changed()
         elif name == "settings":
             self._refresh_settings()
 
@@ -900,11 +924,14 @@ class App:
 
         head = ttk.Frame(f)
         head.pack(fill="x", pady=(0, 4))
-        ttk.Label(head, text="事件库", style="Head.TLabel").pack(side="left")
-        ttk.Label(head, text="一次分发 = 一个事件：发送模式 + 收件人 + 流水线 + 邮件模板",
-                  style="Sub.TLabel").pack(side="left", padx=12)
+        self.home_title_label = ttk.Label(head, text="事件", style="Head.TLabel")
+        self.home_title_label.pack(side="left")
+        self.home_sub_label = ttk.Label(
+            head, text="一次分发 = 一个事件：发送模式 + 收件人 + 流水线 + 邮件模板",
+            style="Sub.TLabel")
+        self.home_sub_label.pack(side="left", padx=12)
 
-        self.home_nb = ttk.Notebook(f)
+        self.home_nb = ttk.Notebook(f, style="Plain.TNotebook")
         self.home_nb.pack(fill="both", expand=True)
 
         self.home_tab_ev = ttk.Frame(self.home_nb)
@@ -918,6 +945,8 @@ class App:
         self._build_events_tab(self.home_tab_ev)
         self._build_pool_tab(self.home_tab_pool)
         self._build_runs_tab(self.home_tab_runs)
+        self.home_nb.bind("<<NotebookTabChanged>>",
+                          lambda _e: self._on_home_tab_changed())
 
     def _build_events_tab(self, parent):
         bar = ttk.Frame(parent)
@@ -985,6 +1014,41 @@ class App:
                 paned.paneconfigure(child, weight=w)
             except Exception:
                 pass
+
+    HOME_SECTIONS = (("events", "事件", "一次分发 = 一个事件：发送模式 + 收件人 + 流水线 + 邮件模板"),
+                     ("pool", "收件人库", "常用的那批收件人，跨事件复用"),
+                     ("runs", "执行历史", "每次草稿生成的审计记录"))
+
+    def _home_tab_key(self):
+        try:
+            idx = int(self.home_nb.index(self.home_nb.select()))
+        except Exception:
+            idx = 0
+        return self.HOME_SECTIONS[max(0, min(idx, 2))][0]
+
+    def _on_home_tab_changed(self):
+        if getattr(self, "_current_screen", "") != "home":
+            return
+        key = self._home_tab_key()
+        title, sub = next(((t, d) for k, t, d in self.HOME_SECTIONS if k == key),
+                          ("事件", ""))
+        try:
+            self.home_title_label.configure(text=title)
+            self.home_sub_label.configure(text=sub)
+            self._set_crumb(title)
+        except Exception:
+            pass
+        self._set_nav_active("home")
+
+    def show_home_section(self, key):
+        """侧栏工作台入口：事件 / 收件人库 / 执行历史。"""
+        self.show_screen("home")
+        frames = {"events": self.home_tab_ev, "pool": self.home_tab_pool,
+                  "runs": self.home_tab_runs}
+        frame = frames.get(key)
+        if frame is not None and hasattr(self, "home_nb"):
+            self.home_nb.select(frame)
+        self._on_home_tab_changed()
 
     def _refresh_home(self):
         self._refresh_events_tab()
@@ -1155,7 +1219,7 @@ class App:
         f = parent if parent is not None else getattr(self, "home_tab_pool", None)
         if f is None:
             return
-        ttk.Label(f, text="收件人库", style="Head.TLabel").pack(anchor="w")
+
         ttk.Label(f, text=(
             "常用的那批收件人，跨事件复用。\n"
             "「从事件导入…」把某个事件的收件人整个收进库；「添加到事件…」把库里的人并进某个事件。\n"
@@ -1597,7 +1661,7 @@ class App:
         f = parent if parent is not None else getattr(self, "home_tab_runs", None)
         if f is None:
             return
-        ttk.Label(f, text="执行历史", style="Head.TLabel").pack(anchor="w")
+
         ttk.Label(f, text=(
             "每一次生成草稿都会留一条记录（时间、每个收件人拿到了哪些文件、有没有出错）。\n"
             "双击一行看详情。执行记录是审计材料，这里只看不删。"),
