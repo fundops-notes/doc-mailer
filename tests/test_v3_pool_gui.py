@@ -395,6 +395,166 @@ def test_workbench_recipients_step_has_pool_buttons(app):
     assert any("从收件人库添加" in t for t in labels), labels
     assert any("存入收件人库" in t for t in labels), labels
 
+
+# -------------------------------------------------- v3.8.2 按标签挑选库收件人
+
+def _open_pool_picker(app, ev):
+    app.open_event(ev["id"])
+    app._wb_add_from_pool()
+    win = _new_toplevel(app)
+    tree = next(w for w in _walk(win) if isinstance(w, tk.ttk.Treeview))
+    combo = next(w for w in _walk(win) if isinstance(w, tk.ttk.Combobox))
+    return win, tree, combo
+
+
+def _filter_pool(app, combo, label):
+    combo.set(label)
+    combo.event_generate("<<ComboboxSelected>>")
+    app.root.update()
+
+
+def _picker_names(tree):
+    return {tree.item(row, "values")[0] for row in tree.get_children()}
+
+
+def test_pool_picker_lists_unique_tags_and_shows_tag_column(app):
+    _pool_rec(app, "甲公司", tags=["重点", "华东"])
+    _pool_rec(app, "乙公司", tags=["重点"])
+    _pool_rec(app, "未分类", tags=[])
+    # 真正叫“未打标签”的标签也能和筛选入口区分。
+    _pool_rec(app, "特殊标签", tags=["未打标签"])
+    win, tree, combo = _open_pool_picker(app, _event(app, "目标事件"))
+    assert str(combo.cget("state")) == "readonly"
+    assert list(combo.cget("values")) == [
+        "全部收件人", "未打标签", "标签：华东", "标签：未打标签", "标签：重点"]
+    assert tree.cget("columns") == ("name", "to", "tags")
+    assert len(tree.get_children()) == 4
+    row = next(row for row in tree.get_children()
+               if tree.item(row, "values")[0] == "甲公司")
+    assert tree.item(row, "values")[2] == "重点、华东"
+    _filter_pool(app, combo, "标签：未打标签")
+    assert _picker_names(tree) == {"特殊标签"}
+    _click_dialog_button(win, "取消")
+
+
+def test_pool_picker_batch_adds_exact_tag_and_preserves_event_passwords(app):
+    _pool_rec(app, "甲公司", tags=["重点", "华东"], cc="cc@example.com")
+    _pool_rec(app, "乙公司", tags=["重点"])
+    _pool_rec(app, "丙公司", tags=["重点客户"])
+    _pool_rec(app, "丁公司", tags=[])
+    ev = _event(app, "目标事件", [{"name": "甲公司", "to": "existing@example.com",
+                                       "open_pw": "event-open", "owner_pw": "event-owner",
+                                       "fields": {"Due_Date": "2026/11/01"}}])
+    pool_before = app.store.list_pool()
+    win, tree, combo = _open_pool_picker(app, ev)
+    _filter_pool(app, combo, "标签：重点")
+    assert _picker_names(tree) == {"甲公司", "乙公司"}
+    _click_dialog_button(win, "全选当前列表")
+    assert len(tree.selection()) == 2
+    _click_dialog_button(win, "添加")
+    saved, err = app.store.load_event(ev["id"])
+    assert not err
+    people = {r["name"]: r for r in saved["recipients"]}
+    assert set(people) == {"甲公司", "乙公司"}
+    assert people["甲公司"]["to"] == "existing@example.com"
+    assert people["甲公司"]["cc"] == "cc@example.com"
+    assert people["甲公司"]["open_pw"] == "event-open"
+    assert people["甲公司"]["owner_pw"] == "event-owner"
+    assert people["甲公司"]["fields"] == {"Due_Date": "2026/11/01"}
+    assert app.store.list_pool() == pool_before
+
+
+def test_pool_picker_switch_filter_clears_hidden_selection(app):
+    _pool_rec(app, "华东客户", tags=["华东"])
+    _pool_rec(app, "华南客户", tags=["华南"])
+    ev = _event(app, "目标事件")
+    win, tree, combo = _open_pool_picker(app, ev)
+    _filter_pool(app, combo, "标签：华东")
+    _click_dialog_button(win, "全选当前列表")
+    assert len(tree.selection()) == 1
+    _filter_pool(app, combo, "标签：华南")
+    assert not tree.selection()
+    assert _picker_names(tree) == {"华南客户"}
+    labels = [str(w.cget("text")) for w in _walk(win)
+              if isinstance(w, tk.ttk.Label)]
+    assert "显示 1 / 共 2 位；已选 0 位" in labels
+    _click_dialog_button(win, "全选当前列表")
+    _click_dialog_button(win, "添加")
+    saved, _ = app.store.load_event(ev["id"])
+    assert [r["name"] for r in saved["recipients"]] == ["华南客户"]
+
+
+def test_pool_picker_untagged_and_cancel_leave_event_unchanged(app):
+    _pool_rec(app, "有标签", tags=["重点"])
+    _pool_rec(app, "无标签", tags=[])
+    ev = _event(app, "目标事件", [{"name": "已有客户"}])
+    win, tree, combo = _open_pool_picker(app, ev)
+    before, _ = app.store.load_event(ev["id"])
+    _filter_pool(app, combo, "未打标签")
+    assert _picker_names(tree) == {"无标签"}
+    _click_dialog_button(win, "全选当前列表")
+    _click_dialog_button(win, "取消选择")
+    assert not tree.selection()
+    _filter_pool(app, combo, "全部收件人")
+    assert _picker_names(tree) == {"有标签", "无标签"}
+    _click_dialog_button(win, "全选当前列表")
+    _click_dialog_button(win, "取消")
+    after, _ = app.store.load_event(ev["id"])
+    assert after == before
+
+
+def test_pool_picker_empty_filter_warns_and_adds_nothing(app, no_messagebox):
+    _pool_rec(app, "有标签", tags=["重点"])
+    ev = _event(app, "目标事件")
+    win, tree, combo = _open_pool_picker(app, ev)
+    _filter_pool(app, combo, "未打标签")
+    assert not tree.get_children()
+    _click_dialog_button(win, "全选当前列表")
+    _click_dialog_button(win, "取消选择")
+    _click_dialog_button(win, "添加")
+    assert ("warning", "未选择") in no_messagebox
+    assert win.winfo_exists()
+    saved, _ = app.store.load_event(ev["id"])
+    assert not saved["recipients"]
+    _click_dialog_button(win, "取消")
+
+
+def test_pool_picker_select_all_includes_filtered_rows_below_scroll(app):
+    for i in range(35):
+        _pool_rec(app, "批量客户%02d" % i, tags=["同一批"])
+    _pool_rec(app, "其他客户", tags=["另一批"])
+    ev = _event(app, "目标事件")
+    win, tree, combo = _open_pool_picker(app, ev)
+    _filter_pool(app, combo, "标签：同一批")
+    assert len(tree.get_children()) == 35
+    _click_dialog_button(win, "全选当前列表")
+    assert len(tree.selection()) == 35
+    _click_dialog_button(win, "添加")
+    saved, _ = app.store.load_event(ev["id"])
+    assert len(saved["recipients"]) == 35
+    assert "其他客户" not in {r["name"] for r in saved["recipients"]}
+
+
+@pytest.mark.parametrize("geometry", ["820x560", "700x460"])
+def test_pool_picker_actions_are_visible_at_default_and_minimum_size(app, geometry):
+    _pool_rec(app, "甲公司", tags=["重点"])
+    win, _tree, _combo = _open_pool_picker(app, _event(app, "目标事件"))
+    app.root.deiconify()
+    try:
+        win.geometry(geometry)
+        app.root.update()
+        buttons = [w for w in _walk(win) if isinstance(w, tk.ttk.Button)
+                   and str(w.cget("text")) in ("全选当前列表", "取消选择", "添加", "取消")]
+        assert len(buttons) == 4
+        for button in buttons:
+            assert button.winfo_ismapped(), button.cget("text")
+            assert button.winfo_rooty() >= win.winfo_rooty()
+            assert button.winfo_rooty() + button.winfo_height() <= win.winfo_rooty() + win.winfo_height()
+            assert button.winfo_rootx() + button.winfo_width() <= win.winfo_rootx() + win.winfo_width()
+        _click_dialog_button(win, "取消")
+    finally:
+        app.root.withdraw()
+
 # ---------------------------------------------------------------- v3.7.0
 
 def test_pool_tags_saved_and_filtered(app):

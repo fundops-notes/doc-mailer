@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.8.1"
+APP_VERSION = "3.8.2"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.8.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -2902,39 +2902,93 @@ class App:
         if not pool:
             messagebox.showinfo("收件人库是空的",
                                 "收件人库里还没有人。\n"
-                                "可以先在「事件库 → 收件人库」标签页里新建，"
+                                "可以先在左侧「收件人库」里新建，"
                                 "或用「存入收件人库」把某个事件的收件人存进去。")
             return
         win = tk.Toplevel(self.root)
         win.title("从收件人库添加")
-        win.geometry("620x520")
+        win.geometry("820x560")
+        win.minsize(700, 460)
+        win.transient(self.root)
         win.grab_set()
         ttk.Label(win, text=(
-            "勾选要加进「%s」的收件人。\n"
+            "选择要加进「%s」的收件人，可按标签筛选后全选当前列表。\n"
             "按名称合并：本事件里已有的收件人口令不会被覆盖，只补空缺。"
             % ev.get("name", "")), justify="left").pack(anchor="w", padx=12, pady=(10, 4))
+        filters = ttk.Frame(win)
+        filters.pack(fill="x", padx=12, pady=(4, 6))
+        ttk.Label(filters, text="标签筛选").pack(side="left")
+        tags = sorted({t for r in pool for t in (r.get("tags") or [])},
+                      key=str.casefold)
+        tag_var = tk.StringVar(master=win, value="全部收件人")
+        tag_choices = {"标签：" + t: t for t in tags}
+        tag_combo = ttk.Combobox(
+            filters, textvariable=tag_var, state="readonly", width=24,
+            values=["全部收件人", "未打标签"] + list(tag_choices))
+        tag_combo.pack(side="left", padx=(8, 12))
+        count_var = tk.StringVar(master=win)
+        ttk.Label(win, textvariable=count_var).pack(anchor="w", padx=12)
+        ttk.Label(win, text="切换标签会清空当前选择；可用 Ctrl / Shift 多选。",
+                  style="Sub.TLabel").pack(anchor="w", padx=12, pady=(2, 6))
+        # 先为底部操作保留空间，避免列表把“添加 / 取消”挤出窗口。
+        btns = ttk.Frame(win)
+        btns.pack(side="bottom", pady=10)
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=12)
-        tree = ttk.Treeview(frame, columns=["name", "to"], show="headings",
+        tree = ttk.Treeview(frame, columns=["name", "to", "tags"], show="headings",
                             selectmode="extended", height=16)
         tree.heading("name", text="收件人名称")
         tree.heading("to", text="To")
-        tree.column("name", width=280)
-        tree.column("to", width=260)
+        tree.heading("tags", text="标签")
+        tree.column("name", width=210, minwidth=140)
+        tree.column("to", width=280, minwidth=180)
+        tree.column("tags", width=260, minwidth=160)
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        ids = {}
-        for i, r in enumerate(pool):
-            iid = "p%d" % i
-            ids[iid] = r
-            tree.insert("", "end", iid=iid, values=(r.get("name", ""), r.get("to", "")))
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        ids = {"p%d" % i: r for i, r in enumerate(pool)}
+
+        def update_count(_event=None):
+            count_var.set("显示 %d / 共 %d 位；已选 %d 位" % (
+                len(tree.get_children()), len(pool), len(tree.selection())))
+
+        def refresh(_event=None):
+            # 删除旧行也会清空选择，确保隐藏项不会被意外添加。
+            tree.delete(*tree.get_children())
+            selected_tag = tag_choices.get(tag_var.get())
+            for iid, r in ids.items():
+                rec_tags = r.get("tags") or []
+                if tag_var.get() == "未打标签" and rec_tags:
+                    continue
+                if selected_tag is not None and selected_tag not in rec_tags:
+                    continue
+                tree.insert("", "end", iid=iid, values=(
+                    r.get("name", ""), r.get("to", ""), "、".join(rec_tags)))
+            update_count()
+
+        def select_all():
+            tree.selection_set(tree.get_children())
+            update_count()
+
+        def clear_selection():
+            tree.selection_remove(tree.selection())
+            update_count()
+
+        ttk.Button(filters, text="全选当前列表", command=select_all).pack(side="left", padx=4)
+        ttk.Button(filters, text="取消选择", command=clear_selection).pack(side="left", padx=4)
+        tag_combo.bind("<<ComboboxSelected>>", refresh)
+        tree.bind("<<TreeviewSelect>>", update_count)
+        refresh()
 
         def ok():
             recs = [ids[i] for i in tree.selection() if i in ids]
             if not recs:
-                messagebox.showwarning("未选择", "请先勾选要添加的收件人", parent=win)
+                messagebox.showwarning("未选择", "请先选择要添加的收件人", parent=win)
                 return
             new_ev, added, updated = lp_v3.merge_recipients_into_event(ev, recs)
             ok2, err = self.store.save_event(new_ev)
@@ -2949,8 +3003,6 @@ class App:
                                 % (added, updated), parent=win)
             win.destroy()
 
-        btns = ttk.Frame(win)
-        btns.pack(pady=10)
         ttk.Button(btns, text="添加", command=ok).pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=6)
 
