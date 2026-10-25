@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.8.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.8.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -1313,6 +1313,28 @@ class Store:
             except OSError as e:
                 return False, str(e)
         return False, "收件人不存在"
+
+    def merge_pool_records(self, records):
+        """导入库记录并保存新增和同名更新；只补空缺、保留口令、合并标签。"""
+        pool = self.list_pool()
+        stats = {"added": 0, "updated": 0, "ids": []}
+        for record in records:
+            src = dict(record)
+            src.pop("id", None)
+            src["fields"] = {}  # 事件字段不随联系人入库。
+            pool, new_rec, is_update = pool_merge_recipient(pool, src)
+            target = new_rec
+            if is_update:
+                target = next((r for r in pool if r.get("name") == src.get("name")), None)
+            if target is None:
+                continue
+            ok, err, saved = self.save_pool_recipient(target)
+            if not ok:
+                return False, err, stats
+            stats["updated" if is_update else "added"] += 1
+            if saved["id"] not in stats["ids"]:
+                stats["ids"].append(saved["id"])
+        return True, None, stats
 
     # ----- 内部工具 -----
 
@@ -3090,6 +3112,51 @@ def validate_recipient_rows(rows, existing_names=None, check_files=True):
 
 # ---------- 导出 ----------
 
+POOL_TAG_HEADERS = {"标签", "联系人标签", "收件人标签", "tag", "tags"}
+
+
+def parse_pool_tags(value):
+    """库标签：支持常用分隔符和导出时对特殊标签使用的 JSON 列表。"""
+    if isinstance(value, list):
+        values = value
+    else:
+        text = str(value or "").strip()
+        try:
+            values = json.loads(text) if text.startswith("[") else None
+        except (ValueError, TypeError):
+            values = None
+        if not isinstance(values, list):
+            values = re.split(r"[;,；，、\r\n]+", text)
+    tags = []
+    for value in values:
+        tag = str(value).strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def validate_pool_recipient_rows(rows, existing_names=None, check_files=True):
+    """库专用导入：识别标签，明确忽略事件字段，不改变事件导入语义。"""
+    result = validate_recipient_rows(rows, existing_names, check_files)
+    tag_cols = [c for c in result["field_cols"] if c.casefold() in POOL_TAG_HEADERS]
+    ignored = [c for c in result["field_cols"] if c not in tag_cols]
+    result["unknown_cols"] = []
+    result["field_cols"] = []
+    result["ignored_cols"] = ignored
+    if ignored:
+        result["notes"].append("以下列属于事件数据，本次不导入收件人库：" + "、".join(ignored))
+    result["notes"].append("同名联系人只补空缺，已有口令保留；标签取并集，空白标签不会清空原标签。")
+    for item in result["items"]:
+        rec = item.get("record") or {}
+        fields = rec.get("fields") or {}
+        rec["tags"] = parse_pool_tags([tag for col in tag_cols
+                                       for tag in parse_pool_tags(fields.get(col, ""))])
+        rec["fields"] = {}
+        for i, warning in enumerate(item["warnings"]):
+            if "与已有收件人同名" in warning:
+                item["warnings"][i] = "与已有联系人同名，按名称补空合并；已有口令保留，标签合并"
+    return result
+
 EXPORT_BASE_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密送",
                        "邮件标题", "附件路径", "合并组", "打开口令", "权限口令"]
 
@@ -3140,6 +3207,42 @@ def recipients_to_rows(recipients, include_passwords=True):
         for k in extra:
             row.append(fields.get(k, ""))
         rows.append(row)
+    return rows
+
+
+def pool_recipients_to_rows(recipients, include_passwords=True):
+    """库 Excel：基础资料加标签，排除历史事件字段；标签可无损往返。"""
+    recs = [dict(r, fields={}) for r in recipients]
+    rows = recipients_to_rows(recs, include_passwords)
+    rows[0].append("标签")
+    for row, rec in zip(rows[1:], recs):
+        tags = parse_pool_tags(rec.get("tags") or [])
+        special = any(re.search(r"[;,；，、\r\n]", t) or t.startswith("[") for t in tags)
+        row.append(json.dumps(tags, ensure_ascii=False) if special else "；".join(tags))
+    return rows
+
+
+def events_recipients_to_rows(events, include_passwords=True):
+    """跨事件明细：所有事件共用字段并集表头，各行按同一列顺序填值。"""
+    names, recs = [], []
+    for event in events:
+        for rec in event.get("recipients") or []:
+            names.append(event.get("name", ""))
+            recs.append(rec)
+    headers = ["所属事件"] + list(EXPORT_BASE_HEADERS)
+    keys = list(dict.fromkeys(k for rec in recs for k in (rec.get("fields") or {})))
+    for key in keys:
+        label = key if key not in headers else "本事件字段：" + key
+        original, suffix = label, 2
+        while label in headers:
+            label = "%s（%d）" % (original, suffix)
+            suffix += 1
+        headers.append(label)
+    rows = [headers]
+    for name, rec in zip(names, recs):
+        base = recipients_to_rows([dict(rec, fields={})], include_passwords)[1]
+        fields = rec.get("fields") or {}
+        rows.append([name] + base + [fields.get(key, "") for key in keys])
     return rows
 
 

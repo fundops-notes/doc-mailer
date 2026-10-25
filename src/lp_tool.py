@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.8.2"
+APP_VERSION = "3.8.3"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.8.1"' 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -962,15 +962,18 @@ class App:
         self.home_status.pack(side="right")
         bar2 = ttk.Frame(parent)
         bar2.pack(fill="x", pady=(0, 8))
-        for text, cmd in (("导入收件人…", self._lib_import_recipients),
-                          ("导出收件人…", self._lib_export_recipients),
-                          ("导出全部收件人…", self._lib_export_all_recipients),
-                          ("导出事件…", self._lib_export_event),
+        for text, cmd in (("导出事件…", self._lib_export_event),
                           ("导入事件备份…", self._lib_import_event),
                           ("备份全部…", self._lib_export_backup)):
             ttk.Button(bar2, text=text, command=cmd).pack(side="left", padx=(0, 4))
         ttk.Button(bar2, text="刷新", command=self._refresh_home).pack(
             side="left", padx=(8, 0))
+        more = ttk.Menubutton(bar2, text="更多导出…")
+        self._events_export_menu = tk.Menu(more, tearoff=False)
+        self._events_export_menu.add_command(label="导出各事件收件人明细…",
+                                             command=self._lib_export_all_recipients)
+        more.configure(menu=self._events_export_menu)
+        more.pack(side="left", padx=(4, 0))
 
         paned = tk.PanedWindow(parent, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -1240,9 +1243,9 @@ class App:
             ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
         )
         secondary = (
-            ("导入 Excel/CSV", self._pool_import, "按收件人清单模板导入"),
-            ("导出 Excel", self._pool_export, "把收件人库导出成 Excel"),
-            ("下载导入模板", self._wb_export_template, "收件人清单模板"),
+            ("导入联系人 Excel/CSV", self._pool_import, "导入联系人基础资料与标签，不导入事件字段"),
+            ("导出联系人 Excel", self._pool_export, "导出库内联系人与标签"),
+            ("下载联系人模板", self._pool_export_template, "包含标签列的联系人专用模板"),
         )
         for text, cmd, tip in primary:
             b = ttk.Button(bar, text=text, command=cmd)
@@ -1534,27 +1537,11 @@ class App:
         if not recips:
             messagebox.showinfo("提示", "这个事件还没有收件人")
             return
-        pool = self.store.list_pool()
-        added = updated = 0
-        touched = []
-        for rec in recips:
-            src = dict(rec)
-            src.pop("id", None)
-            src["fields"] = {}      # v3.7.1：事件字段不进入收件人库
-            pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, src)
-            if new_rec is not None:
-                ok, err, _saved = self.store.save_pool_recipient(new_rec)
-                if not ok:
-                    messagebox.showerror("保存失败", err)
-                    return
-                touched.append(new_rec.get("id"))
-                added += 1
-            elif is_update:
-                hit = next((r for r in pool
-                            if r.get("name") == src.get("name")), None)
-                if hit and hit.get("id"):
-                    touched.append(hit["id"])
-                updated += 1
+        ok, err, stats = self.store.merge_pool_records(recips)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        added, updated, touched = stats["added"], stats["updated"], stats["ids"]
         self._refresh_pool_tab()
         messagebox.showinfo("已收入收件人库",
                             "新增 %d 位，按名称合并 %d 位（库里的口令保留）。"
@@ -1609,44 +1596,55 @@ class App:
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
             return
-        result = lp_v3.validate_recipient_rows(rows)
+        result = lp_v3.validate_pool_recipient_rows(
+            rows, existing_names=[r.get("name", "") for r in self.store.list_pool()])
         action = self._show_import_result(result, path)
         if not action:
             return
-        pool = self.store.list_pool()
-        added = updated = 0
+        records = []
         for item in result.get("items") or []:
             if action == "ok_only" and item.get("status") == "error":
                 continue
             rec = dict(item.get("record") or {})
-            rec["fields"] = {}      # v3.7.1：库不保存事件自定义字段
-            if not rec.get("name"):
-                continue
-            pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, rec)
-            if new_rec is not None:
-                ok, err, _saved = self.store.save_pool_recipient(new_rec)
-                if not ok:
-                    messagebox.showerror("保存失败", err)
-                    return
-                added += 1
-            elif is_update:
-                updated += 1
+            if rec.get("name"):
+                records.append(rec)
+        ok, err, stats = self.store.merge_pool_records(records)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
         self._refresh_pool_tab()
         messagebox.showinfo("导入完成",
-                            "收件人库新增 %d 位，按名称合并 %d 位。" % (added, updated))
+                            "收件人库新增 %d 位，按名称合并 %d 位。" % (stats["added"], stats["updated"]))
 
     def _pool_export(self):
         pool = self.store.list_pool()
         if not pool:
             messagebox.showinfo("提示", "收件人库还是空的")
             return
-        rows = lp_v3.recipients_to_rows(pool)
+        rows = lp_v3.pool_recipients_to_rows(pool)
         self._write_xlsx_sheets(
             "收件人库.xlsx",
-            [("收件人库", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
+            [("收件人库", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24, 30])],
             "已导出",
             "收件人库已导出。\n\n注意：文件里含打开口令与权限口令，属敏感文件，"
             "请按与 lp_data/ 相同的管控要求保存。")
+
+    def _pool_export_template(self):
+        """联系人专用模板：基础资料和标签，不混入本次业务字段。"""
+        headers = lp_v3.import_template_headers(["标签"])
+        sample = {"收件人名称": "示例：某某公司", "收件人": "contact@example.com", "标签": "重点；华东"}
+        guide = [["列名", "说明"],
+                 ["收件人名称 / 收件人", "必填：联系人名称和邮箱；多邮箱用分号分隔"],
+                 ["标签", "多个标签用分号、逗号或换行分隔；同名联系人标签合并，空白不清空"],
+                 ["同名联系人", "只补空缺资料，已有邮箱和打开/权限口令不覆盖"],
+                 ["打开口令 / 权限口令", "两个口令应不同；已有联系人口令始终保留"],
+                 ["本次业务字段", "金额、截止日期等请在事件工作台导入，不写入联系人库"]]
+        self._write_xlsx_sheets(
+            "联系人导入模板.xlsx",
+            [("联系人", [headers, [sample.get(h, "") for h in headers]],
+              [36, 20, 28, 16, 16, 22, 14, 14, 24, 30]),
+             ("填写说明", guide, [26, 90])],
+            "模板已导出", "请填写联系人基础资料和标签，再到收件人库导入。")
 
     # ================= 执行历史（事件库里的第四个标签页，P4） =================
 
@@ -2282,7 +2280,7 @@ class App:
              "按表头名识别列；未识别的列会作为自定义字段收进来，供文档映射使用。"),
             ("下载导入模板", self._wb_export_template,
              "导出一份带表头、示例行和「填写说明」页的 Excel。"),
-            ("导出收件人 Excel", self._wb_export_recipients,
+            ("导出本事件收件人", self._wb_export_recipients,
              "把当前事件的收件人清单导出成 Excel。"),
             ("新增", self._wb_edit_recipient, "手工添加一位收件人。"),
             ("编辑", self._wb_edit_recipient, "编辑选中的收件人（也可直接双击行）。"),
@@ -2414,7 +2412,7 @@ class App:
             self._wb_show_step(self._wb_step)
 
     def _do_import_recipients(self, ev):
-        """导入收件人清单（收件人步骤与事件库共用同一套流程）。
+        """导入本次事件的收件人清单。
 
         选文件 → 逐行数据校验 → 可视化导入结果 → 写入事件。
         返回统计 dict；用户取消则返回 None。
@@ -2593,66 +2591,17 @@ class App:
 
     # ---------- 导出 / 备份 ----------
 
-    def _lib_import_recipients(self):
-        """事件库里的「导入收件人」：导入到当前选中的事件。"""
-        eid = self._selected_event_id()
-        if not eid:
-            messagebox.showinfo("提示", "请先在事件表里选中一个事件")
-            return
-        ev, err = self.store.load_event(eid)
-        if not ev:
-            messagebox.showerror("读取失败", err or "事件不存在")
-            return
-        stats = self._do_import_recipients(ev)
-        if not stats:
-            return
-        msg = "导入完成：新增 %d，更新 %d" % (stats["added"], stats["updated"])
-        if stats["skipped"]:
-            msg += "，跳过 %d 行错误" % stats["skipped"]
-        if stats["filled"]:
-            msg += "。自动生成缺失口令 %d 个" % stats["filled"]
-        if stats["field_cols"]:
-            msg += "\n收进自定义字段列：" + "、".join(stats["field_cols"])
-        messagebox.showinfo("导入完成", msg)
-        self._refresh_home()
-
-    def _lib_export_recipients(self):
-        """导出选中事件的收件人清单（Excel）。"""
-        eid = self._selected_event_id()
-        if not eid:
-            messagebox.showinfo("提示", "请先在事件表里选中一个事件")
-            return
-        ev, err = self.store.load_event(eid)
-        if not ev:
-            messagebox.showerror("读取失败", err or "事件不存在")
-            return
-        recips = ev.get("recipients") or []
-        if not recips:
-            messagebox.showinfo("提示", "这个事件还没有收件人")
-            return
-        rows = lp_v3.recipients_to_rows(recips)
-        name = "收件人清单_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 40)
-        self._write_xlsx_sheets(
-            name, [("收件人清单", rows, [36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
-            "已导出",
-            "收件人清单已导出。\n\n注意：文件里含打开口令与权限口令，属于敏感文件，"
-            "请按与 lp_data/ 相同的管控要求保存。")
-
     def _lib_export_all_recipients(self):
         """导出全部事件的收件人（合并，带「所属事件」列）。"""
         events = self.store.list_events()
         if not events:
             messagebox.showinfo("提示", "还没有事件")
             return
-        rows = [["所属事件"] + list(lp_v3.EXPORT_BASE_HEADERS)]
-        for e in events:
-            for r in (e.get("recipients") or []):
-                one = lp_v3.recipients_to_rows([r])
-                rows.append([e.get("name", "")] + one[1])
+        rows = lp_v3.events_recipients_to_rows(events)
         self._write_xlsx_sheets(
-            "全部收件人清单.xlsx",
-            [("全部收件人", rows, [26, 36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
-            "已导出", "全部事件的收件人已导出（含口令，属敏感文件）。")
+            "各事件收件人明细.xlsx",
+            [("各事件收件人明细", rows, [26, 36, 20, 28, 16, 16, 22, 34, 14, 14, 24])],
+            "已导出", "各事件收件人明细已导出，同一联系人可在不同事件中重复出现（含口令，属敏感文件）。")
 
     def _lib_export_event(self):
         """导出单个事件配置（JSON 备份，可再导入还原）。"""
@@ -2678,7 +2627,7 @@ class App:
             messagebox.showerror("导出失败", str(e))
             return
         messagebox.showinfo("已导出",
-                            "事件配置已导出。\n\n还原方式：事件库 → 导入收件人… 旁边的"
+                            "事件配置已导出。\n\n还原方式：事件列表 → "
                             "「导入事件备份…」（或直接把这个 JSON 放回 lp_data/events/）。")
 
     def _lib_export_backup(self):
@@ -3013,21 +2962,11 @@ class App:
         if not recips:
             messagebox.showinfo("提示", "这个事件还没有收件人")
             return
-        pool = self.store.list_pool()
-        added = updated = 0
-        for rec in recips:
-            src = dict(rec)
-            src.pop("id", None)
-            src["fields"] = {}      # v3.7.1：事件字段不进入收件人库
-            pool, new_rec, is_update = lp_v3.pool_merge_recipient(pool, src)
-            if new_rec is not None:
-                ok, err, _saved = self.store.save_pool_recipient(new_rec)
-                if not ok:
-                    messagebox.showerror("保存失败", err)
-                    return
-                added += 1
-            elif is_update:
-                updated += 1
+        ok, err, stats = self.store.merge_pool_records(recips)
+        if not ok:
+            messagebox.showerror("保存失败", err)
+            return
+        added, updated = stats["added"], stats["updated"]
         self._refresh_pool_tab()
         messagebox.showinfo("已存入收件人库",
                             "新增 %d 位，按名称合并 %d 位（库里已有的口令保留）。\n"
