@@ -1880,4 +1880,10 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - 最终pytest：306 passed，60.46s，无skipped。真实GUI+Word e2e：191 PASS / 0 FAIL / 15 INFO；含旧188项流程及3组布局审查回执。Outlook使用fake，不代表真实邮箱集成验收。
 - 布局审查：1280×800、960×620、实际最大化（本机1872×1057）×默认/125%/150% Tk字号缩放。每档99个参数控件及198个其他页面操作逐一显露，共891次检查、不可达0；150%字号另查事件信息/收件人编辑/字段映射/水印设置4个弹窗，按钮未裁切、窗口在屏幕内；无Tk回调错误。每份回执绑定根源码SHA256，截图已检查。未修改系统DPI设置。
 - 构建成功，签名exe=48,363,240 B，Authenticode Valid；隔离启动实际标题v3.8.4，正常退出0、临时数据清理通过。根源码/src/便携镜像一致，项目lp_data的32件文件哈希未变；Downloads/doc-mailer当前不存在，本轮未操作用户安装数据。证书/runtime/.git保留，Outlook唯一写调用仍为lp_v3.py:2424 mail.Save。
-- 根目录layout_audit_v384.py、e2e_v384_verify.py为本轮原生验收入口；证据验收_v3.8.4/evidence/，截图screens/，备份backups/。发布结果和两包下载复核在发版后补记。
+- 根目录layout_audit_v384.py、e2e_v384_verify.py为本轮原生验收入口；证据验收_v3.8.4/evidence/，截图screens/，备份backups/。
+- 代码commit/tag：`39368aaf7125a11ea60cfe7724326cfd9ce10c9d`；CI run **40321539154** completed/success，head_sha与tag一致。Release **id=424214288**：https://github.com/fundops-notes/doc-mailer/releases/tag/v3.8.4 ，正文普通文本。新版本两资产已上传并重新下载，ZIP完整性、大小、SHA256与本地/GitHub digest、便携源码与版本、用户数据排除均通过；下载exe=48,363,240 B，Authenticode Valid，签名证书与本地一致。旧tag未改写，无force push。
+
+| 资产 | 字节 | SHA256 | 下载校验 |
+| --- | ---: | --- | --- |
+| doc-mailer_v3.8.4_portable.zip | 46435541 | `033FEED07052809C62F97CAB07A9E5035FC01862703B76593DCE0E736133B2EE` | 一致 |
+| doc-mailer_win64.zip | 47915948 | `2682095F62BBBF4092988D25DE9A59EE4930BE05893CCA7520B79845475C535C` | 一致 |
