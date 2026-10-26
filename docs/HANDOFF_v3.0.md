@@ -1936,4 +1936,12 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - 两处版本字面量3.9.3，源码/说明镜像一致。367 pytest passed（73.42s，无跳过）；原生Tk+Office71 PASS/0 FAIL（Outlook fake Save）；真实下载+原生安装15项通过，安装备份/数据字节校验及进度窗显示通过。更新测试目标为已发布3.9.1包，安装器为3.9.3，重启禁用另验exe启动。
 - PyInstaller构建成功，exe48,394,240 B/签名Valid；隔离启动v3.9.3退出0，临时目录清理。开发lp_data32文件完全未变；AST mail.Save1处/Send0处。旧失败测试目录清理被策略拦截，保留且不进入发行包。
 - 证据在根目录验收_v3.9.3/evidence与screens，报告修复与发布报告_v3.9.3.md；本地事件证据验收_流水线诊断_20261027/evidence。旧3.9.1首次升级仍使用旧器，进度功能从3.9.3生效；exe手动下载升级。
-- 新tag/CI/Release与下载双包校验完成后补录；旧tag不改写。
+- 发版已完成，详见下方；旧tag未改写。
+
+
+发布与下载校验已完成：
+
+- 新tag v3.9.3 / 代码commit adbff4e4c20859ebf13219e9d4a79c8757a4d9c2；CI run 40375453846 completed/success，head_sha与tag一致。https://github.com/fundops-notes/doc-mailer/actions/runs/40375453846
+- Release id=424599468：https://github.com/fundops-notes/doc-mailer/releases/tag/v3.9.3 。发布正文普通文本；两个签名发行包均重新下载，SHA256与本地及GitHub digest一致；大小、ZIP完整性、源码版本、用户数据排除全部通过。
+- 下载exe签名Valid，证书指纹9106B492E4A041627FDA67A389BA23474475A26E，与本地一致。证据release_upload.log、release_verify.log、release_verify_current.json、downloaded_signature.json。
+- 便携包46,449,451 B / SHA256 0ADB72ACAC76BF236FAFD18AB285899A2603BE5D2E58EA55EA652720D624FE41；win64包47,948,633 B / SHA256 E3E892DB31002FC13C4C18375C4CF679591B4E99BBBC962D760DEF792417C6DF。
