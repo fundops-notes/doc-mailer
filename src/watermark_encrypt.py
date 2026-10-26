@@ -618,6 +618,58 @@ def generate_notice_docx(template_path, output_path, replacements, batch=None):
             b.close()
 
 
+PDF_CONVERT_EXTENSIONS = {".doc", ".docx", ".rtf", ".txt", ".html", ".htm",
+                          ".xls", ".xlsx", ".ppt", ".pptx", ".png", ".jpg", ".jpeg",
+                          ".bmp", ".tif", ".tiff"}
+
+
+def file_to_pdf(source, output_path, batch=None):
+    """Convert supported documents/images; only private Office instances are used."""
+    suffix = Path(source).suffix.lower()
+    if suffix == ".pdf":
+        import shutil
+        if Path(source).resolve() != Path(output_path).resolve():
+            shutil.copy2(source, output_path)
+        return
+    if suffix not in PDF_CONVERT_EXTENSIONS:
+        raise ValueError("不支持将 %s 转为 PDF；请取消转 PDF 后原样附加。" % (suffix or "该格式"))
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+        with fitz.open(source) as image:
+            content = image.convert_to_pdf()
+        with fitz.open("pdf", content) as document:
+            document.save(output_path)
+        return
+    if suffix not in {".xls", ".xlsx", ".ppt", ".pptx"}:
+        return docx_to_pdf(source, output_path, batch=batch)
+    import pythoncom
+    import win32com.client
+    pythoncom.CoInitialize()
+    application = document = None
+    try:
+        if suffix in {".xls", ".xlsx"}:
+            application = win32com.client.DispatchEx("Excel.Application")
+            application.Visible = False
+            application.DisplayAlerts = False
+            application.AutomationSecurity = 3
+            document = application.Workbooks.Open(str(Path(source).resolve()), UpdateLinks=0, ReadOnly=True)
+            document.ExportAsFixedFormat(0, str(Path(output_path).resolve()))
+        else:
+            application = win32com.client.DispatchEx("PowerPoint.Application")
+            application.AutomationSecurity = 3
+            document = application.Presentations.Open(str(Path(source).resolve()), ReadOnly=True, WithWindow=False)
+            document.SaveAs(str(Path(output_path).resolve()), 32)
+    finally:
+        if document is not None:
+            if suffix in {".xls", ".xlsx"}:
+                document.Close(False)
+            else:
+                document.Close()
+        if application is not None:
+            application.Quit()
+        document = application = None
+        pythoncom.CoUninitialize()
+
+
 def docx_to_pdf(src_docx, output_path, batch=None):
     """docx → pdf（Word COM 导出）。"""
     own = batch is None

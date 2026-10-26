@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.8.4"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.0"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -684,6 +684,17 @@ def normalize_item(it):
     for b in ("to_pdf", "watermark", "encrypt"):
         if b in params:
             p[b] = bool(params[b])
+    if params.get("input_type") in ("pdf", "file", "excel"):
+        p["input_type"] = params["input_type"]
+    path_map = params.get("path_map")
+    if isinstance(path_map, dict):
+        p["path_map"] = {str(k): split_paths(v) if isinstance(v, str) else
+                         [str(x) for x in v] for k, v in path_map.items()
+                         if isinstance(v, (str, list))}
+    if params.get("preserve_name"):
+        p["preserve_name"] = True
+    if isinstance(params.get("target_scope"), dict):
+        p["target_scope"] = dict(params["target_scope"])
     ftpl = params.get("filename_tpl")
     if isinstance(ftpl, str):
         p["filename_tpl"] = ftpl.strip()
@@ -717,11 +728,59 @@ def normalize_item(it):
 
 def new_item(kind="generate", name=""):
     """新建一个条目。"""
-    it = normalize_item({"kind": kind, "name": name})
+    variant = kind if kind in ("pdf", "file", "excel") else None
+    it = normalize_item({"kind": "attach" if variant else kind, "name": name,
+                         "params": {"input_type": variant} if variant else {}})
+    if variant == "excel":
+        it["params"]["path_source"] = "item.paths"
     if not it["name"]:
         it["name"] = {"generate": "新生成文档",
-                       "attach": "新附加文件"}.get(kind, "新条目")
+                       "attach": "新附加文件", "pdf": "PDF 文件",
+                       "file": "非 PDF 文件", "excel": "Excel 按 LP 匹配"}.get(kind, "新条目")
     return it
+
+
+def item_input_type(item):
+    if item.get("kind", "generate") == "generate":
+        return "generate"
+    params = item.get("params") or {}
+    if params.get("input_type") in ("pdf", "file", "excel"):
+        return params["input_type"]
+    if params.get("path_source", PATH_SOURCE_MANUAL) != PATH_SOURCE_MANUAL:
+        return "excel"
+    files = params.get("files") or []
+    return "pdf" if files and all(Path(p).suffix.lower() == ".pdf" for p in files) else "file"
+
+
+def item_type_label(item):
+    return {"generate": "Word MailMerge", "pdf": "PDF 文件", "file": "非 PDF 文件",
+            "excel": "Excel 按 LP 匹配"}[item_input_type(item)]
+
+
+def upgrade_pipeline_event(event):
+    """Expose old static attachments in the new pipeline, without writing on read."""
+    import copy
+    ev = copy.deepcopy(event)
+    if ev.get("pipeline_ui_version") == "3.9":
+        return ev
+    for index, attachment in enumerate(ev.get("attachments") or []):
+        path = attachment.get("path") or ""
+        if not path:
+            continue
+        item = new_item("pdf" if Path(path).suffix.lower() == ".pdf" else "file",
+                        "原统一附件 · " + Path(path).name)
+        item["id"] = "%s-legacy-common-%d" % (ev.get("id", "event"), index)
+        item["params"].update(files=[path], preserve_name=True, target_scope=attachment)
+        item["granularity"] = "all" if attachment.get("scope", "all") == "all" else "per_lp"
+        ev.setdefault("pipeline", []).append(item)
+    ev["attachments"] = []
+    if any(r.get("attachments") for r in ev.get("recipients") or []) and not event_uses_recipient_paths(ev):
+        item = new_item("excel", "原收件人专属文件")
+        item["id"] = "%s-legacy-recipient-files" % ev.get("id", "event")
+        item["params"]["path_source"] = PATH_SOURCE_RECIPIENT
+        ev.setdefault("pipeline", []).append(item)
+    ev["pipeline_ui_version"] = "3.9"
+    return ev
 
 
 def item_uses_sheet(item):
@@ -787,6 +846,9 @@ def normalize_event(ev):
     }
     if not isinstance(ev, dict):
         return out
+    for key in ("pipeline_ui_version", "process_signature"):
+        if isinstance(ev.get(key), str):
+            out[key] = ev[key]
     pr = ev.get("process_results")
     if isinstance(pr, dict):
         out["process_results"] = pr
@@ -1185,6 +1247,20 @@ class Store:
         event = normalize_event(event)
         event["updated_at"] = _now_str()
         self.ensure_dirs()
+        path = self.event_path(event["id"])
+        if path.exists() and event.get("pipeline_ui_version") == "3.9":
+            previous, read_error = read_json_file(path)
+            if read_error:
+                return False, read_error
+            if isinstance(previous, dict) and previous.get("pipeline_ui_version") != "3.9":
+                try:
+                    import shutil
+                    backup_dir = self.data_dir / "backups"
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    shutil.copy2(path, backup_dir / (path.stem + ".pre_v3_9_0_" + stamp + ".json"))
+                except OSError as error:
+                    return False, "旧事件备份失败，未保存：%s" % error
         ok, err = write_json_file(self.event_path(event["id"]), event)
         return ok, err
 
@@ -1740,6 +1816,8 @@ def path_source_options(event=None, recipient=None, sheet_cols=None):
 def path_source_label(src):
     """来源键 → 人话（给提示框/日志用）。"""
     src = str(src or PATH_SOURCE_MANUAL)
+    if src == "item.paths":
+        return "Excel按LP对应"
     if src == PATH_SOURCE_MANUAL:
         return "手填路径"
     if src == PATH_SOURCE_RECIPIENT:
@@ -1769,7 +1847,10 @@ def resolve_item_paths(item, unit, event, ctx=None):
         members = (unit or {}).get("recipients") or []
         rec = members[0] if members else {}
     raw = ""
-    if src == PATH_SOURCE_RECIPIENT:
+    if src == "item.paths":
+        paths = (params.get("path_map") or {}).get(rec.get("name", ""), [])
+        raw = ";".join(paths) if isinstance(paths, list) else str(paths)
+    elif src == PATH_SOURCE_RECIPIENT:
         raw = ";".join(str(p) for p in (rec.get("attachments") or []))
     elif src.startswith(PATH_SOURCE_FIELD_PREFIX):
         raw = str((rec.get("fields") or {}).get(src[len(PATH_SOURCE_FIELD_PREFIX):], "") or "")
@@ -2059,7 +2140,13 @@ def execute_item(item, unit, event, ctx):
                     continue
                 raise RuntimeError("文件不存在：%s" % sp)
             base = item_output_name(event, unit, sp)
+            if params.get("preserve_name"):
+                base = Path(sp).stem
             dst = outdir / (base + Path(sp).suffix)
+            suffix_index = 2
+            while any(str(existing).lower() == str(dst).lower() for existing in cur):
+                dst = outdir / (base + "_%d" % suffix_index + Path(sp).suffix)
+                suffix_index += 1
             shutil.copy2(sp, str(dst))
             cur.append(dst)
         if not cur:
@@ -2068,11 +2155,23 @@ def execute_item(item, unit, event, ctx):
             raise RuntimeError("「附加文件」没有选择任何文件")
 
     # ---- 处理链：转 PDF → 加水印 → 加密（顺序固定） ----
-    if kind == "generate" and params.get("to_pdf"):
-        docx = cur if isinstance(cur, Path) else cur[0]
-        out = outdir / (docx.stem + ".pdf")
-        wm.docx_to_pdf(str(docx), str(out), batch=ctx.word)
-        cur = out
+    if params.get("to_pdf"):
+        converted = []
+        reserved = {p.name.lower() for p in ([cur] if isinstance(cur, Path) else cur)
+                    if p.suffix.lower() == ".pdf"}
+        for source in [cur] if isinstance(cur, Path) else list(cur):
+            if source.suffix.lower() == ".pdf":
+                converted.append(source)
+            else:
+                target = outdir / (source.stem + ".pdf")
+                suffix_index = 2
+                while target.name.lower() in reserved:
+                    target = outdir / (source.stem + "_%d.pdf" % suffix_index)
+                    suffix_index += 1
+                reserved.add(target.name.lower())
+                wm.file_to_pdf(str(source), str(target), batch=ctx.word)
+                converted.append(target)
+        cur = converted[0] if len(converted) == 1 else converted
 
     if params.get("watermark"):
         targets = [cur] if isinstance(cur, Path) else list(cur)
@@ -2146,6 +2245,9 @@ def run_items(event, outdir, word=None, only_recips=None, log=None, progress=Non
         units = build_units(event, gran)
         cur = {}
         for ukey, unit in units:
+            target_scope = (it.get("params") or {}).get("target_scope")
+            if target_scope and not _attachment_matches(target_scope, unit):
+                continue
             if only_recips is not None:
                 names = set(r.get("name", "") for r in unit.get("recipients") or [])
                 if not (names & set(only_recips)):
@@ -2200,7 +2302,7 @@ def event_uses_recipient_paths(event):
         if (it.get("kind") or "generate") != "attach":
             continue
         src = str(((it.get("params") or {}).get("path_source") or PATH_SOURCE_MANUAL))
-        if src == PATH_SOURCE_RECIPIENT:
+        if src in (PATH_SOURCE_RECIPIENT, "item.paths"):
             return True
     return False
 
@@ -2219,7 +2321,7 @@ def _file_digest(path):
         return None
 
 
-def assemble_attachments(event, unit, final_outputs, dup_log=None):
+def assemble_attachments(event, unit, final_outputs, dup_log=None, complete=False):
     """组装附件包。返回 (文件列表, 缺失文件列表)。
 
     附件包 = 所有流水线条目的产物 + 事件级静态附件 + 收件人专属附件。
@@ -2241,10 +2343,10 @@ def assemble_attachments(event, unit, final_outputs, dup_log=None):
 
     for p in final_outputs or []:
         _add(p)
-    for a in event.get("attachments") or []:
+    for a in ([] if complete else event.get("attachments") or []):
         if _attachment_matches(a, unit):
             _add(a.get("path"))
-    for r in unit.get("recipients") or []:
+    for r in ([] if complete else unit.get("recipients") or []):
         for p in r.get("attachments") or []:
             if event_uses_recipient_paths(event):
                 break          # 已由流水线条目按路径来源产出，不重复附加
@@ -2499,10 +2601,18 @@ def preflight(event, store=None):
                 warnings.append("%s：专属附件不存在（将被跳过）：%s"
                                 % (r.get("name", ""), p))
 
+    # Saved per-person file lists are final attachment selections.
+    custom = event.get("process_overrides") or {}
+    automatic = [r for r in recips if r.get("name", "") not in custom]
+    for name, paths in custom.items():
+        paths = split_paths(paths) if isinstance(paths, str) else paths
+        for path in paths if isinstance(paths, list) else []:
+            if not Path(path).is_file():
+                errors.append("%s：保存的自定义文件不存在：%s" % (name, path))
     # --- 流水线条目 ---
-    if not steps:
+    if not steps and automatic:
         errors.append("流水线为空，没有任何启用的条目")
-    for i, it in enumerate(steps):
+    for i, it in enumerate(steps if automatic else []):
         label = "第%d条 %s" % (i + 1, it.get("name") or
                                ITEM_KIND_LABELS.get(it.get("kind"), ""))
         kind = it.get("kind") or "generate"
@@ -2565,6 +2675,21 @@ def preflight(event, store=None):
                 for sp in files:
                     if not Path(str(sp)).exists():
                         errors.append("%s：文件不存在：%s" % (label, sp))
+        if kind == "attach":
+            paths = list(params.get("files") or [])
+            if params.get("path_source", PATH_SOURCE_MANUAL) != PATH_SOURCE_MANUAL:
+                paths = []
+                for recipient in automatic:
+                    selected, _ = resolve_item_paths(it, {"rep": recipient}, event)
+                    paths.extend(selected)
+            for source in paths:
+                suffix = Path(source).suffix.lower()
+                if params.get("input_type") == "pdf" and suffix != ".pdf":
+                    errors.append("%s：PDF入口只能添加PDF文件：%s" % (label, source))
+                if params.get("to_pdf") and suffix != ".pdf" and suffix not in wm.PDF_CONVERT_EXTENSIONS:
+                    errors.append("%s：该格式不支持转PDF：%s" % (label, source))
+                if params.get("input_type") in ("file", "excel") and suffix != ".pdf" and not params.get("to_pdf") and (params.get("watermark") or params.get("encrypt")):
+                    errors.append("%s：非PDF文件需先勾选转PDF，才能加水印/加密" % label)
         if params.get("encrypt"):
             if not params.get("watermark") and kind == "generate" \
                     and not params.get("to_pdf"):
@@ -2640,9 +2765,11 @@ def _item_preview_files(event, item, unit):
     kind = (item or {}).get("kind") or "generate"
     for one in _item_units_for(item, unit):
         if kind == "attach":
-            for sp in params.get("files") or []:
+            paths, _ = resolve_item_paths(item, one, event)
+            for sp in paths:
                 base = item_output_name(event, one, str(sp))
-                out.append(base + Path(str(sp)).suffix)
+                extension = ".pdf" if params.get("to_pdf") else Path(str(sp)).suffix
+                out.append(base + extension)
         else:
             src = params.get("template_path", "")
             base = item_output_name(
@@ -2653,6 +2780,57 @@ def _item_preview_files(event, item, unit):
     return out
 
 
+def processing_signature(event):
+    """Fingerprint processing settings and source-file versions, excluding mail edits."""
+    import hashlib
+    paths = set()
+    for item in event.get("pipeline") or []:
+        params = item.get("params") or {}
+        paths.update(str(p) for p in params.get("files") or [])
+        paths.update(p for values in (params.get("path_map") or {}).values() for p in values)
+        paths.add(str(params.get("template_path") or ""))
+        paths.add(str((item.get("sheet") or {}).get("path") or ""))
+    for recipient in event.get("recipients") or []:
+        paths.update(recipient.get("attachments") or [])
+    for item in event.get("pipeline") or []:
+        if item.get("kind") == "attach":
+            for _, unit in build_units(event, item.get("granularity") or "per_lp"):
+                selected, _ = resolve_item_paths(item, unit, event)
+                paths.update(selected)
+    versions = []
+    for path in sorted(paths - {""}):
+        try:
+            info = Path(path).stat()
+            versions.append((str(Path(path).resolve()), info.st_size, info.st_mtime_ns))
+        except OSError:
+            versions.append((path, None, None))
+    data = {k: event.get(k) for k in ("pipeline", "recipients", "attachments", "options", "process_overrides")}
+    data["source_versions"] = versions
+    return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def prepared_files_for_unit(event, unit):
+    files = []
+    for recipient in unit.get("recipients") or []:
+        name = recipient.get("name", "")
+        values = (event.get("process_overrides") or {}).get(name)
+        if values is None:
+            values = (event.get("process_results") or {}).get(name, [])
+        files.extend(split_paths(values) if isinstance(values, str) else values)
+    return list(dict.fromkeys(str(path) for path in files))
+
+
+def prepared_files_current(event):
+    if not event.get("process_results") or event.get("process_signature") != processing_signature(event):
+        return False
+    if any(r.get("name", "") not in (event.get("process_results") or {})
+           and r.get("name", "") not in (event.get("process_overrides") or {})
+           for r in event.get("recipients") or []):
+        return False
+    return all(Path(p).is_file() for _, unit in draft_units(event)
+               for p in prepared_files_for_unit(event, unit))
+
+
 def preview_plan(event):
     """产出清单预览（不执行）。返回 [(草稿单元, 说明, [文件名...])]。
 
@@ -2660,9 +2838,13 @@ def preview_plan(event):
     """
     steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
     out = []
-    if not steps:
+    if not steps and not event.get("process_overrides"):
         return out
+    prepared = prepared_files_current(event)
     for key, unit in draft_units(event):
+        if prepared:
+            out.append((key, unit, [Path(p).name for p in prepared_files_for_unit(event, unit)]))
+            continue
         names = []
         for it in steps:
             names += _item_preview_files(event, it, unit)
@@ -2677,13 +2859,14 @@ def preview_plan(event):
 
 
 def run_event(store, event, only_recips=None, log=None, progress=None,
-              create_drafts=True, outdir=None, word=None):
+              create_drafts=True, outdir=None, word=None, reuse_processed=False):
     """执行一个发送事件，返回执行记录（Run）。
 
     只建草稿，绝不发送。执行记录写进 lp_data/runs/。
     word: 可传入外部 WordBatch（GUI 的常驻工作线程用）；不给就用本线程的共享实例。
     """
     started = _now_str()
+    signature = processing_signature(event)
     run = {
         "id": _new_id("run"),
         "event_id": event.get("id", ""),
@@ -2696,6 +2879,7 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         "errors": [],
         "warnings": [],
         "logs": [],
+        "only_recips": sorted(only_recips) if only_recips is not None else None,
     }
 
     def _log(msg):
@@ -2723,9 +2907,16 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
 
     # Word 实例按线程复用：每次新建都会残留一个 WINWORD.EXE（见 default_word_batch 注释）
     word = word or default_word_batch()
-    outputs, pw, perr = run_items(event, base_out, word=word,
-                                 only_recips=only_recips, log=_log,
-                                 progress=progress)
+    cached = bool(reuse_processed and prepared_files_current(event))
+    automatic = dict(event, recipients=[r for r in event.get("recipients") or []
+                     if r.get("name", "") not in (event.get("process_overrides") or {})])
+    if cached or not automatic["recipients"]:
+        outputs, pw, perr = {}, [], []
+        if cached:
+            _log("使用已处理并核对的文件，不重复转换或覆盖自定义对应。")
+    else:
+        outputs, pw, perr = run_items(automatic, base_out, word=word,
+                                     only_recips=only_recips, log=_log, progress=progress)
     run["warnings"] = list(warnings) + list(pw)
     for ukey, sid, msg in perr:
         run["errors"].append("[%s] %s" % (sid, msg))
@@ -2769,8 +2960,24 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         rep = unit.get("rep") or {}
         final_files = _final_for(unit)
         dup_log = []
-        files, missing = assemble_attachments(event, unit, final_files,
-                                              dup_log=dup_log)
+        if cached:
+            files, missing = assemble_attachments(event, unit, prepared_files_for_unit(event, unit),
+                                                  dup_log=dup_log, complete=True)
+        elif any(r.get("name", "") in (event.get("process_overrides") or {}) for r in unit.get("recipients") or []):
+            selected = []
+            for recipient in unit.get("recipients") or []:
+                name = recipient.get("name", "")
+                if name in (event.get("process_overrides") or {}):
+                    values = event["process_overrides"][name]
+                    selected.extend(split_paths(values) if isinstance(values, str) else values)
+                else:
+                    one = dict(unit, recipients=[recipient], rep=recipient, lp_name=name,
+                               group_key=group_key_of(recipient))
+                    prepared, absent = assemble_attachments(event, one, _final_for(one))
+                    selected.extend([str(p) for p in prepared] + absent)
+            files, missing = assemble_attachments(event, unit, selected, dup_log=dup_log, complete=True)
+        else:
+            files, missing = assemble_attachments(event, unit, final_files, dup_log=dup_log)
         for first, dup in dup_log:
             _log("[附件重复提示] %s 与 %s 内容相同（不同路径），已全部保留，请人工确认"
                  % (Path(first).name, Path(dup).name))
@@ -2838,6 +3045,7 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
     else:
         run["status"] = "ok"
     run["finished_at"] = _now_str()
+    run["process_signature"] = signature
     run["info"] = info
     ok, save_err = store.save_run(run)
     if not ok:

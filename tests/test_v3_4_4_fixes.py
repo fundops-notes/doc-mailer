@@ -70,6 +70,10 @@ class _MB:
         self.calls.append(("ask", str(title), str(msg)))
         return True
 
+    def askokcancel(self, title, msg="", **k):
+        self.calls.append(("confirm_save", str(title), str(msg)))
+        return bool(self.answer3)
+
     def askyesnocancel(self, title, msg="", **k):
         self.calls.append(("ask3", str(title), str(msg)))
         return self.answer3
@@ -163,8 +167,8 @@ def _save_event(app, name, recips, pipeline=None):
 
 
 def test_version_is_381():
-    assert lp_tool.APP_VERSION == "3.8.4"
-    assert lp_v3.APP_VERSION == "3.8.4"
+    assert lp_tool.APP_VERSION == "3.9.0"
+    assert lp_v3.APP_VERSION == "3.9.0"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -272,22 +276,15 @@ def test_pipeline_left_right_layout_and_scrollbar(app, tmp_path):
     assert _descendant(a._wb_pipe_tree, left), "条目表必须在左栏"
     assert _descendant(a._wb_params_frame, left), "参数区必须在左栏"
     assert _descendant(a._wb_map_tree, right), "对应表必须在右栏"
-    assert _descendant(a._wb_process_btn, right), "处理按钮必须在右栏"
-    assert _descendant(a._uni_btn_holder, right), "统一附件折叠按钮必须在右栏"
+    assert a._wb_process_btn is None, "处理动作合并到下一步"
+    assert not _buttons(a._wb_content, "📎 统一附件")
     assert a._wb_pipe_tree.winfo_manager() == "grid", "条目表和完整宽度的滚动条用grid共同布局，且仍属于左栏"
     # ⑥ 横向滚动条
     assert str(a._wb_pipe_tree.cget("xscrollcommand")), "流水线条目表必须有横向滚动条"
     horiz = [w for w in _walk(a._wb_pipe_tree.master)
              if _cls(w) == "TScrollbar" and str(w.cget("orient")) == "horizontal"]
     assert horiz, "流水线条目表容器里应有横向滚动条控件"
-    # 统一附件默认收起、可展开收起
-    assert a._uni_frame.winfo_manager() == ""
-    _buttons(a._wb_content, "📎 统一附件")[0][1].invoke()
-    a.root.update()
-    assert a._uni_frame.winfo_manager() == "pack"
-    _buttons(a._wb_content, "📎 统一附件")[0][1].invoke()
-    a.root.update()
-    assert a._uni_frame.winfo_manager() == ""
+    assert "处理" in a._wb_next_btn.cget("text")
 
 
 def test_word_mailmerge_missing_buttons_are_wired(app, tmp_path):
@@ -323,14 +320,14 @@ def test_attach_item_has_path_template_export(app, tmp_path):
     att.write_bytes(b"%PDF-1.4 x")
     ev = _save_event(a, "路径模板", [{"name": "甲", "to": "a@x.com",
                                       "open_pw": "Open123456", "owner_pw": "Owner123456"}],
-                     pipeline=[{"kind": "attach", "params": {"files": [str(att)]}}])
+                     pipeline=[{"kind": "attach", "params": {"files": [], "input_type": "excel", "path_source": "item.paths", "path_map": {"甲": [str(att)]}}}])
     a.open_event(ev["id"])
     a._wb_show_step(1)
     a.root.update()
     tree = a._wb_pipe_tree
     tree.selection_set(tree.get_children()[0])
     a.root.update()
-    assert any("导出路径模板" in t for t, _b in _buttons(a._wb_content))
+    assert any("导出对应模板" in t for t, _b in _buttons(a._wb_content))
     out = tmp_path / "路径模板.xlsx"
     fd.save_path = str(out)
     a._wb_export_attach_path_template(a._wb_event["pipeline"][0])
@@ -794,10 +791,10 @@ def test_attach_excel_import_maps_paths_per_recipient(app, tmp_path, monkeypatch
     a.root.update()
     saved, _e = a.store.load_event(ev["id"])
     recs = {r["name"]: r for r in saved["recipients"]}
-    assert recs["甲"]["attachments"] == [str(tmp_path / "甲.pdf")]
-    assert recs["乙"]["attachments"] == [str(tmp_path / "乙.pdf")]
+    assert not recs["甲"]["attachments"]
+    assert not recs["乙"]["attachments"]
     it = saved["pipeline"][0]
-    assert it["params"]["path_source"] == lp_v3.PATH_SOURCE_RECIPIENT
+    assert it["params"]["path_source"] == "item.paths"
     assert it["params"]["files"] == []
     # 引擎按人取路径
     unit = {"rep": recs["甲"], "recipients": [recs["甲"]], "lp_name": "甲",
@@ -1274,9 +1271,10 @@ def test_mail_page_button_visible_and_toolbar_not_duplicated(app):
     btn_texts = [str(w.cget("text")) for w in _walk(a._wb_content)
                  if _cls(w) == "TButton"]
     assert "保存模板" in btn_texts
-    assert "预生成 →" in btn_texts
+    assert "预生成 →" not in btn_texts
+    assert "预生成" in a._wb_next_btn.cget("text")
     font_labels = [w for w in _walk(a._wb_content)
-                   if _cls(w) in ("TLabel",) and str(w.cget("text")) == " 字体"]
+                   if _cls(w) in ("TLabel",) and str(w.cget("text")).strip() == "字体"]
     assert len(font_labels) == 1, "工具栏不应重复"
 
 
@@ -1311,8 +1309,8 @@ def test_unsaved_mail_discard_keeps_old(app):
     old = a._wb_event["mail"]["subject"]
     a.mail_subject_var.set("不要的主题")
     mb.answer3 = False
-    a._wb_next_step()
-    assert a._wb_step == 3
+    a._wb_prev_step()
+    assert a._wb_step == 1
     saved, _e = a.store.load_event(ev["id"])
     assert saved["mail"]["subject"] == old
 

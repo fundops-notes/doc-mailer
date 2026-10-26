@@ -215,7 +215,7 @@ def test_process_reveals_progress_log_on_current_page(layout_app, monkeypatch, t
     monkeypatch.setattr(lp_v3,'preflight',lambda *args:([],[],{}))
     monkeypatch.setattr(a,'_submit_job',lambda _job:None)
     monkeypatch.setattr(a,'_default_outdir',lambda:tmp_path/'output')
-    a._wb_process_btn.invoke()
+    a._wb_next_btn.invoke()
     settle(a)
     assert a._wb_step==1
     assert visible(a._wb_pipe_log)
