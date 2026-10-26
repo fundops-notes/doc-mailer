@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -772,12 +772,25 @@ def upgrade_pipeline_event(event):
         item["granularity"] = "all" if attachment.get("scope", "all") == "all" else "per_lp"
         ev.setdefault("pipeline", []).append(item)
     ev["attachments"] = []
-    if any(r.get("attachments") for r in ev.get("recipients") or []) and not event_uses_recipient_paths(ev):
-        item = new_item("excel", "原收件人专属文件")
-        item["id"] = "%s-legacy-recipient-files" % ev.get("id", "event")
-        item["params"]["path_source"] = PATH_SOURCE_RECIPIENT
-        item["params"]["preserve_name"] = True
-        ev.setdefault("pipeline", []).append(item)
+    recipients = ev.get("recipients") or []
+    if any(r.get("attachments") for r in recipients):
+        legacy = [item for item in ev.get("pipeline") or []
+                  if item.get("kind") == "attach" and
+                  (item.get("params") or {}).get("path_source") == PATH_SOURCE_RECIPIENT]
+        if not legacy and not event_uses_recipient_paths(ev):
+            item = new_item("excel", "原收件人专属文件")
+            item["id"] = "%s-legacy-recipient-files" % ev.get("id", "event")
+            item["params"]["preserve_name"] = True
+            ev.setdefault("pipeline", []).append(item)
+            legacy = [item]
+        if legacy:
+            for item in legacy:
+                item.setdefault("params", {}).update(
+                    input_type="excel", path_source="item.paths", files=[],
+                    path_map={r.get("name", ""): split_paths(r["attachments"]) if isinstance(r.get("attachments"), str)
+                              else list(r.get("attachments") or []) for r in recipients})
+            for recipient in recipients:
+                recipient["attachments"] = []  # Moved, not duplicated into a hidden fallback.
     ev["pipeline_ui_version"] = "3.9"
     return ev
 
@@ -811,6 +824,8 @@ def event_upgrade_plan(event):
     recipients = event.get("recipients") or []
     if not isinstance(recipients, list) or any(not isinstance(r, dict) for r in recipients):
         blockers.append("收件人结构无法安全转换，原文件未修改。")
+    elif any(not isinstance(r.get("attachments") or [], (str, list)) for r in recipients):
+        blockers.append("旧收件人附件格式无法安全转换，原文件未修改。")
     if blockers:
         return {"from_version": version or "未标记", "target_version": APP_VERSION,
                 "blocking": blockers, "changes": [], "stale_override_names": []}
@@ -840,11 +855,17 @@ def event_upgrade_plan(event):
         changes.append("%d位收件人的旧产物对应仍覆盖当前流水线，需要停用旧覆盖并重新处理。" % len(stale))
     if event.get("attachments"):
         changes.append("原统一附件将转换为流水线条目，并保留文件名与适用范围。")
-    legacy_recipient_files = bool(any(r.get("attachments") for r in event.get("recipients") or [])
-                                 and not event_uses_recipient_paths(event))
+    has_recipient_files = any(r.get("attachments") for r in recipients)
+    if has_recipient_files and len({r.get("name", "") for r in recipients}) != len(recipients):
+        blockers.append("存在同名收件人，无法安全转换逐人附件关系，请先核对。")
+    legacy_references = any((item.get("params") or {}).get("path_source") == PATH_SOURCE_RECIPIENT
+                            for item in pipeline if item.get("kind") == "attach")
+    legacy_recipient_files = bool(has_recipient_files)
+    if has_recipient_files and not legacy_references and event_uses_recipient_paths(event):
+        blockers.append("旧收件人附件与独立Excel对应并存，无法自动判断应保留哪套关系；请先核对，原文件未修改。")
     legacy_common_files = bool(event.get("attachments"))
     if legacy_recipient_files:
-        changes.append("隐藏的旧收件人附件将升级为独立Excel对应条目，保留各人的文件关系。")
+        changes.append("旧收件人附件将移入条目独立的Excel对应表，保留关系并停用隐藏旧字段。")
     return {"from_version": version or "未标记", "target_version": APP_VERSION,
             "blocking": blockers, "changes": changes, "stale_override_names": stale,
             "needs_confirmation": bool(stale or (event.get("pipeline_ui_version") == "3.9"
@@ -1343,7 +1364,7 @@ class Store:
             if expected_sha256 and hashlib.sha256(original).hexdigest() != expected_sha256:
                 return False, "事件已被修改，请重新读取后升级。", None
             candidate, plan = upgrade_compatible_event(json.loads(original.decode("utf-8-sig")))
-            backup = self._backup_event(path, "pre_v3_9_2")
+            backup = self._backup_event(path, "pre_v" + APP_VERSION.replace(".", "_"))
             if path.read_bytes() != original:
                 return False, "事件已被修改，已停止升级，原文件未覆盖。", None
             candidate["updated_at"] = _now_str()
@@ -1372,7 +1393,7 @@ class Store:
             legacy_ui = event.get("pipeline_ui_version") == "3.9" and previous.get("pipeline_ui_version") != "3.9"
             if isinstance(previous, dict) and (legacy_ui or previous.get("config_version") != APP_VERSION):
                 try:
-                    self._backup_event(path, "pre_v3_9_0" if legacy_ui else "pre_v3_9_2")
+                    self._backup_event(path, "pre_v3_9_0" if legacy_ui else "pre_v" + APP_VERSION.replace(".", "_"))
                 except OSError as error:
                     return False, "旧事件备份失败，未保存：%s" % error
         ok, err = write_json_file(self.event_path(event["id"]), event)

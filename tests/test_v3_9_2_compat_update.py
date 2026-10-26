@@ -6,6 +6,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 import urllib.request
 import zipfile
 
@@ -71,9 +72,12 @@ def test_hidden_attachments_upgrade_even_when_old_ui_marker_is_present(tmp_path)
     ok, error, report = store.upgrade_event(event['id'])
     assert ok, error
     saved = json.loads(path.read_text(encoding='utf-8'))
-    assert len(saved['pipeline']) == 2 and saved['recipients'] == event['recipients']
+    assert len(saved['pipeline']) == 2
+    assert [{k:v for k,v in r.items() if k!='attachments'} for r in saved['recipients']] == [{k:v for k,v in r.items() if k!='attachments'} for r in event['recipients']]
     assert saved['unknown_metadata'] == event['unknown_metadata']
-    assert saved['pipeline'][-1]['params']['path_source'] == lp_v3.PATH_SOURCE_RECIPIENT
+    assert saved['pipeline'][-1]['params']['path_source'] == 'item.paths'
+    assert saved['pipeline'][-1]['params']['path_map'] == {r['name']:r['attachments'] for r in event['recipients']}
+    assert all(not r['attachments'] for r in saved['recipients'])
     assert saved['pipeline'][-1]['params']['preserve_name']
     again, _ = lp_v3.upgrade_compatible_event(saved)
     assert len(again['pipeline']) == 2
@@ -245,7 +249,11 @@ def test_progress_window_visible_cancel_works_and_duplicate_start_is_blocked(app
     app.root.deiconify()
     assert app._self_update({'tag':'v9.9.9','asset_url':'fake'})
     assert started.wait(2)
-    app.root.update()
+    deadline=time.monotonic()+3
+    while time.monotonic()<deadline:
+        app.root.update()
+        if '已下载' in app._update_detail_var.get(): break
+        time.sleep(.02)
     assert app._update_window.winfo_ismapped()
     assert '已下载' in app._update_detail_var.get()
     assert not app._self_update({'tag':'v9.9.9','asset_url':'fake'})
@@ -303,3 +311,40 @@ def test_office_pdf_conversion_owns_separate_com_thread(tmp_path, monkeypatch, e
     assert [name for name, _ in calls] == ['initialize', 'open', 'export', 'close', 'quit', 'uninitialize']
     assert all(thread != caller for _, thread in calls)
     assert len({thread for _, thread in calls}) == 1
+
+
+@pytest.mark.parametrize('action', ['disable', 'delete'])
+def test_migrated_attachment_cannot_reappear_when_item_disabled_or_deleted(tmp_path, action):
+    event, _ = make_event(tmp_path)
+    event['pipeline_ui_version'] = '3.9'
+    for index, recipient in enumerate(event['recipients']):
+        recipient['attachments'] = [pdf(tmp_path/('legacy%d.pdf'%index), 'OLD%d'%index)]
+    upgraded, _ = lp_v3.upgrade_compatible_event(event)
+    assert all(not recipient['attachments'] for recipient in upgraded['recipients'])
+    assert len(upgraded['pipeline']) == 2
+    if action == 'disable': upgraded['pipeline'][-1]['enabled'] = False
+    else: upgraded['pipeline'].pop()
+    again, plan = lp_v3.upgrade_compatible_event(upgraded)
+    assert len(again['pipeline']) == len(upgraded['pipeline']) and not plan.get('needs_confirmation')
+    run=lp_v3.run_event(lp_v3.Store(tmp_path),again,create_drafts=False,outdir=tmp_path/'out')
+    assert run['status']=='ok' and all(len(row['files'])==1 for row in run['items'])
+
+
+def test_disabled_old_reference_is_converted_without_reenabling_it(tmp_path):
+    event,_=make_event(tmp_path)
+    item=lp_v3.new_item('excel');item['enabled']=False
+    item['params']['path_source']=lp_v3.PATH_SOURCE_RECIPIENT;event['pipeline'].append(item)
+    for recipient in event['recipients']:recipient['attachments']='a.pdf;b.pdf'
+    upgraded, _=lp_v3.upgrade_compatible_event(event)
+    assert len(upgraded['pipeline'])==2 and not upgraded['pipeline'][-1]['enabled']
+    assert upgraded['pipeline'][-1]['params']['path_map']['LP_A']==['a.pdf','b.pdf']
+    assert not upgraded['recipients'][0]['attachments']
+
+
+def test_ambiguous_old_and_new_excel_relationships_require_manual_review(tmp_path):
+    event,item=make_event(tmp_path,'excel')
+    item['params']['path_map']={'LP_A':['new.pdf']}
+    event['recipients'][0]['attachments']=['old.pdf']
+    store=lp_v3.Store(tmp_path);path=write_raw(store,event);before=path.read_bytes()
+    ok,error,report=store.upgrade_event(event['id'])
+    assert not ok and '无法自动判断' in error and path.read_bytes()==before

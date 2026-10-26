@@ -167,8 +167,8 @@ def _save_event(app, name, recips, pipeline=None):
 
 
 def test_version_is_381():
-    assert lp_tool.APP_VERSION == "3.9.2"
-    assert lp_v3.APP_VERSION == "3.9.2"
+    assert lp_tool.APP_VERSION == "3.9.3"
+    assert lp_v3.APP_VERSION == "3.9.3"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -198,7 +198,7 @@ def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
     assert saved["recipients"][0]["attachments"] == [str(att)]
 
 
-def test_edit_recipient_keeps_legacy_attachments(app, tmp_path):
+def test_edit_recipient_preserves_upgraded_attachment_relationships(app, tmp_path):
     a, _mb, _fd, _err = app
     att = tmp_path / "旧附件.pdf"
     att.write_bytes(b"%PDF-1.4 x")
@@ -221,8 +221,11 @@ def test_edit_recipient_keeps_legacy_attachments(app, tmp_path):
             break
     a.root.update()
     saved, _e = a.store.load_event(ev["id"])
-    assert saved["recipients"][0]["attachments"] == [str(att)], \
-        "编辑收件人不能清空旧 rec['attachments']"
+    assert saved["recipients"][0]["attachments"] == []
+    mapped = [item for item in saved['pipeline'] if (item.get('params') or {}).get('path_source') == 'item.paths']
+    assert any(item['params']['path_map'].get('甲公司') == [str(att)] for item in mapped), \
+        "编辑收件人必须保留已迁入条目的附件关系"
+    assert att.read_bytes() == b"%PDF-1.4 x"
 
 
 def test_import_template_has_no_attachment_column(app, tmp_path):
