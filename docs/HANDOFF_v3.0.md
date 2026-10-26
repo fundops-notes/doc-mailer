@@ -1911,4 +1911,8 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - 最终复核发现：两个紧凑编辑器通过插入字段菜单写入内容时未标脏，邮件下一步漏提示。3项新增真实控件回归在v3.9.0全部复现；v3.9.1调用既有_mark_active_dirty，统一模板和单封编辑都纳入原未保存保护，取消不前进且不改磁盘事件。
 - 两处APP_VERSION字面量3.9.1，使用说明镜像同步；v3.9.0 tag保留。包含§42全部四入口/下一步/紧凑工具栏功能，未改数据迁移或布局。
 - 最终340 pytest passed（77.98s，无跳过）；真实Tk+Word/Excel/PowerPoint e2e71 PASS/0 FAIL，Outlook为fake Save。当前源码补充150%字号55参数控件/4弹窗通过；完整1134次三尺寸三字号布局证据沿用未改布局的v3.9.0。
-- exe=48,379,168 B，签名Valid；隔离真实启动v3.9.1、正常退出0、临时数据清理。原数据32文件哈希不变，WINWORD=0。证据验收_v3.9.1/、修复与发布报告_v3.9.1.md；发布CI/Release/下载校验待补录。
+- exe=48,379,168 B，签名Valid；隔离真实启动v3.9.1、正常退出0、临时数据清理。原数据32文件哈希不变，WINWORD=0。证据验收_v3.9.1/、修复与发布报告_v3.9.1.md；发布完成见下。
+
+- 代码commit/tag 01fa2de1207605383ee76ba92b4def1c165441c6 / v3.9.1，普通push，历史tag未动。CI run40356670381 completed/success，head_sha与tag一致。Release id=424475951，https://github.com/fundops-notes/doc-mailer/releases/tag/v3.9.1 。两个资产从Release重新下载，SHA256与本地及GitHub digest一致，大小、ZIP完整性、源码版本、用户数据排除均通过；下载exe签名Valid，证书与本地相同。发布正文为普通文本。
+
+下载结果：便携包46,441,358 B / SHA256 5F80299BBDAD1BD46C5492AB345D4504F488C3B5475866E9FEE8B9628A8FAECF；win64包47,933,170 B / SHA256 89A4A1297A7950446AA9CC5101098C6D19248CA9A33F22DFE0ACEF24FA706087。证据release_verify_current.json、release_verify.log、downloaded_signature.json、release_upload.log。
