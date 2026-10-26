@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.1"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.2"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -761,8 +761,6 @@ def upgrade_pipeline_event(event):
     """Expose old static attachments in the new pipeline, without writing on read."""
     import copy
     ev = copy.deepcopy(event)
-    if ev.get("pipeline_ui_version") == "3.9":
-        return ev
     for index, attachment in enumerate(ev.get("attachments") or []):
         path = attachment.get("path") or ""
         if not path:
@@ -778,6 +776,7 @@ def upgrade_pipeline_event(event):
         item = new_item("excel", "原收件人专属文件")
         item["id"] = "%s-legacy-recipient-files" % ev.get("id", "event")
         item["params"]["path_source"] = PATH_SOURCE_RECIPIENT
+        item["params"]["preserve_name"] = True
         ev.setdefault("pipeline", []).append(item)
     ev["pipeline_ui_version"] = "3.9"
     return ev
@@ -790,6 +789,80 @@ def item_uses_sheet(item):
         return True
     ps = str(((item or {}).get("params") or {}).get("path_source") or "")
     return ps.startswith(PATH_SOURCE_SHEET_PREFIX)
+
+
+def event_upgrade_plan(event):
+    """Inspect before normalizing: ambiguous/newer configurations must not be lost."""
+    blockers, changes, stale = [], [], []
+    if not isinstance(event, dict):
+        return {"from_version": "无法识别", "target_version": APP_VERSION,
+                "blocking": ["事件结构无法识别，原文件未修改。"], "changes": [], "stale_override_names": []}
+    version = str(event.get("config_version") or "")
+    version_parts = lambda value: tuple(int(n) for n in re.findall(r"\d+", value)[:3])
+    if version and version_parts(version) > version_parts(APP_VERSION):
+        blockers.append("事件由更高版本 %s 保存，请先升级程序。" % version)
+    pipeline = event.get("pipeline") or []
+    if not isinstance(pipeline, list):
+        blockers.append("流水线结构无法识别，原文件未修改，请先检查配置。")
+        pipeline = []
+    for index, item in enumerate(pipeline):
+        if not isinstance(item, dict) or item.get("kind", "generate") not in ("generate", "attach"):
+            blockers.append("第%d条的类型无法安全转换，原文件未修改。" % (index + 1))
+    recipients = event.get("recipients") or []
+    if not isinstance(recipients, list) or any(not isinstance(r, dict) for r in recipients):
+        blockers.append("收件人结构无法安全转换，原文件未修改。")
+    if blockers:
+        return {"from_version": version or "未标记", "target_version": APP_VERSION,
+                "blocking": blockers, "changes": [], "stale_override_names": []}
+    ids = {item.get("id") for item in pipeline if isinstance(item, dict)}
+    results = event.get("process_results") or {}
+    overrides = event.get("process_overrides") or {}
+    if not isinstance(overrides, dict) or not isinstance(results, dict):
+        blockers.append("文件对应结构无法识别，原文件未修改。")
+        overrides, results = {}, {}
+    for name, values in overrides.items():
+        paths = split_paths(values) if isinstance(values, str) else values
+        previous = results.get(name) or []
+        if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            blockers.append("旧文件对应的路径格式无法安全转换，原文件未修改。")
+            continue
+        if isinstance(previous, str):
+            previous = split_paths(previous)
+        if not paths or paths != previous:
+            continue  # An independently selected custom file list is intentional.
+        origins = [Path(path).parent.name for path in paths]
+        generated = all(re.match(r"^it-\d{8}-\d{6}-[0-9a-f]+$", origin)
+                        or "-legacy-common-" in origin or origin.endswith("-legacy-recipient-files")
+                        for origin in origins)
+        if generated and any(origin not in ids for origin in origins):
+            stale.append(name)
+    if stale:
+        changes.append("%d位收件人的旧产物对应仍覆盖当前流水线，需要停用旧覆盖并重新处理。" % len(stale))
+    if event.get("attachments"):
+        changes.append("原统一附件将转换为流水线条目，并保留文件名与适用范围。")
+    legacy_recipient_files = bool(any(r.get("attachments") for r in event.get("recipients") or [])
+                                 and not event_uses_recipient_paths(event))
+    legacy_common_files = bool(event.get("attachments"))
+    if legacy_recipient_files:
+        changes.append("隐藏的旧收件人附件将升级为独立Excel对应条目，保留各人的文件关系。")
+    return {"from_version": version or "未标记", "target_version": APP_VERSION,
+            "blocking": blockers, "changes": changes, "stale_override_names": stale,
+            "needs_confirmation": bool(stale or (event.get("pipeline_ui_version") == "3.9"
+                                                  and (legacy_recipient_files or legacy_common_files)))}
+
+
+def upgrade_compatible_event(event):
+    plan = event_upgrade_plan(event)
+    if plan["blocking"]:
+        raise ValueError("\n".join(plan["blocking"]))
+    upgraded = upgrade_pipeline_event(event)
+    for name in plan["stale_override_names"]:
+        upgraded.get("process_overrides", {}).pop(name, None)
+    if plan["changes"]:
+        upgraded["process_results"] = {}
+        upgraded.pop("process_signature", None)
+    upgraded["config_version"] = APP_VERSION
+    return upgraded, plan
 
 
 def normalize_mail(mail):
@@ -846,7 +919,7 @@ def normalize_event(ev):
     }
     if not isinstance(ev, dict):
         return out
-    for key in ("pipeline_ui_version", "process_signature"):
+    for key in ("pipeline_ui_version", "process_signature", "config_version"):
         if isinstance(ev.get(key), str):
             out[key] = ev[key]
     pr = ev.get("process_results")
@@ -1241,24 +1314,65 @@ class Store:
             return None, err
         if data is None:
             return None, None
+        plan = event_upgrade_plan(data)
+        if plan["blocking"]:
+            return None, "\n".join(plan["blocking"])
         return normalize_event(data), None
 
+    def _backup_event(self, path, suffix):
+        import shutil
+        backup_dir = self.data_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup = backup_dir / (path.stem + "." + suffix + "_" + stamp + ".json")
+        original = path.read_bytes()
+        shutil.copy2(path, backup)
+        if backup.read_bytes() != original:
+            raise OSError("备份内容校验失败")
+        previous = path.with_suffix(path.suffix + ".bak")
+        if previous.exists():
+            shutil.copy2(previous, backup.with_suffix(".previous_bak"))
+        return backup
+
+    def upgrade_event(self, event_id, expected_sha256=None):
+        """Back up exact raw bytes, then atomically apply only known upgrades."""
+        import hashlib
+        path = self.event_path(event_id)
+        try:
+            original = path.read_bytes()
+            if expected_sha256 and hashlib.sha256(original).hexdigest() != expected_sha256:
+                return False, "事件已被修改，请重新读取后升级。", None
+            candidate, plan = upgrade_compatible_event(json.loads(original.decode("utf-8-sig")))
+            backup = self._backup_event(path, "pre_v3_9_2")
+            if path.read_bytes() != original:
+                return False, "事件已被修改，已停止升级，原文件未覆盖。", None
+            candidate["updated_at"] = _now_str()
+            ok, error = write_json_file(path, candidate)
+            plan["backup_path"] = str(backup)
+            return ok, error, plan
+        except (OSError, ValueError, TypeError) as error:
+            return False, "旧设置升级失败，原文件未覆盖：%s" % error, None
+
     def save_event(self, event):
+        plan = event_upgrade_plan(event)
+        if plan["blocking"]:
+            return False, "\n".join(plan["blocking"])
         event = normalize_event(event)
+        event["config_version"] = APP_VERSION
         event["updated_at"] = _now_str()
         self.ensure_dirs()
         path = self.event_path(event["id"])
-        if path.exists() and event.get("pipeline_ui_version") == "3.9":
+        if path.exists():
             previous, read_error = read_json_file(path)
             if read_error:
                 return False, read_error
-            if isinstance(previous, dict) and previous.get("pipeline_ui_version") != "3.9":
+            previous_plan = event_upgrade_plan(previous)
+            if previous_plan["blocking"]:
+                return False, "\n".join(previous_plan["blocking"])
+            legacy_ui = event.get("pipeline_ui_version") == "3.9" and previous.get("pipeline_ui_version") != "3.9"
+            if isinstance(previous, dict) and (legacy_ui or previous.get("config_version") != APP_VERSION):
                 try:
-                    import shutil
-                    backup_dir = self.data_dir / "backups"
-                    backup_dir.mkdir(parents=True, exist_ok=True)
-                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    shutil.copy2(path, backup_dir / (path.stem + ".pre_v3_9_0_" + stamp + ".json"))
+                    self._backup_event(path, "pre_v3_9_0" if legacy_ui else "pre_v3_9_2")
                 except OSError as error:
                     return False, "旧事件备份失败，未保存：%s" % error
         ok, err = write_json_file(self.event_path(event["id"]), event)
@@ -2540,6 +2654,10 @@ def preflight(event, store=None):
     errors 会中止执行；warnings 只提示（缺失附件等会被跳过）。
     """
     errors, warnings = [], []
+    upgrade = event_upgrade_plan(event)
+    errors.extend(upgrade["blocking"])
+    if upgrade["stale_override_names"]:
+        errors.append("检测到旧产物对应覆盖当前流水线，请先备份并升级旧设置，未开始处理。")
     recips = event.get("recipients") or []
     opts = event.get("options") or {}
     steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
@@ -2654,7 +2772,7 @@ def preflight(event, store=None):
                              "group_key": group_key_of(_r),
                              "group": (_r.get("group") or "").strip()}
                     try:
-                        _paths, _lab = resolve_item_paths(item, _unit, event)
+                        _paths, _lab = resolve_item_paths(it, _unit, event)
                     except Exception as _e:
                         warnings.append("%s：%s 取路径失败：%s"
                                         % (label, _r.get("name", ""), _e))
@@ -2910,6 +3028,9 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
     cached = bool(reuse_processed and prepared_files_current(event))
     automatic = dict(event, recipients=[r for r in event.get("recipients") or []
                      if r.get("name", "") not in (event.get("process_overrides") or {})])
+    _log("文件处理计划：启用%d条；按流水线处理%d位；沿用自定义对应%d位。"
+         % (len([i for i in event.get("pipeline") or [] if i.get("enabled", True)]),
+            len(automatic["recipients"]), len(event.get("recipients") or []) - len(automatic["recipients"])))
     if cached or not automatic["recipients"]:
         outputs, pw, perr = {}, [], []
         if cached:
@@ -2924,6 +3045,16 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
     # 收集产物：所有条目的产物都进附件包（每个条目内部已把中间产物处理掉，
 # 返回的就是最终产物——docx 已转 pdf、pdf 已加水印/加密）
     steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
+    failed_ids = {sid for _, sid, _ in perr}
+    run["pipeline_stats"] = {
+        "enabled": len(steps),
+        "executed": sum(bool(values) or iid in failed_ids for iid, values in outputs.items()),
+        "completed": sum(bool(values) and any(values.values()) and iid not in failed_ids
+                         for iid, values in outputs.items()),
+        "failed": len(failed_ids),
+        "custom_recipients": len(event.get("recipients") or []) - len(automatic["recipients"]),
+        "reused_processed": cached,
+    }
 
     def _outputs_of(item, unit):
         """某条目在某个收件人/合并组下的产物文件。
@@ -3047,13 +3178,15 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
     run["finished_at"] = _now_str()
     run["process_signature"] = signature
     run["info"] = info
+    counts = run["pipeline_stats"]
+    _log("===== 完成：流水线执行 %d/%d 条；收件人成功 %d，失败 %d，跳过 %d ====="
+         % (counts["executed"], counts["enabled"], run["stats"]["ok"],
+            run["stats"]["fail"], run["stats"]["skip"]))
     ok, save_err = store.save_run(run)
     if not ok:
         # 执行记录写不进去要让人知道（否则「执行历史」里什么都没有却查不到原因）
         run["warnings"].append("执行记录保存失败：%s" % save_err)
         _log("执行记录保存失败：%s" % save_err)
-    _log("===== 完成：成功 %d，失败 %d，跳过 %d ====="
-         % (run["stats"]["ok"], run["stats"]["fail"], run["stats"]["skip"]))
     return run
 
 

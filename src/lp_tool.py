@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.1"
+APP_VERSION = "3.9.2"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -115,6 +115,123 @@ def app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).parent
+
+
+def _write_update_helper(base, source):
+    """Install with native PowerShell file operations and a second progress window."""
+    base, source = Path(base).resolve(), Path(source).resolve()
+    relative = source.relative_to(base)
+    if relative.parts[0] != ".update_staging":
+        raise ValueError("更新来源目录无效")
+    script = r'''param([int]$WaitProcessId=__PID__,[switch]$NoUi,[switch]$NoRestart)
+$ErrorActionPreference='Stop'
+$root=[IO.Path]::GetFullPath($PSScriptRoot)
+$staging=Join-Path $root '.update_staging'
+$source=Join-Path $root '__SOURCE__'
+$backup=Join-Path $root ('.update_backups\'+(Get-Date -Format 'yyyyMMdd_HHmmss_ffff'))
+$form=$null
+$restored=New-Object 'System.Collections.Generic.List[string]'
+$created=New-Object 'System.Collections.Generic.List[string]'
+function Protected([string]$relative) {
+    $parts=$relative -split '[\\/]'
+    return ($parts -contains 'lp_data' -or $parts -contains '.update_backups' -or
+        [IO.Path]::GetFileName($relative) -in @('lp_data.json','lp_data.json.bak','lp_data.json.tmp','lp_run_log.csv','lp_data.example.json','run_update.ps1','run_update.bat'))
+}
+function Destination([string]$relative) {
+    $target=[IO.Path]::GetFullPath((Join-Path $root $relative))
+    if (-not $target.StartsWith($root+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw '更新文件路径越界' }
+    return $target
+}
+function Progress([string]$stage,[int]$value) {
+    if ($script:lastProgress -ne $value) {
+        $script:lastProgress=$value
+        try {
+            $record=@{stage=$stage;percent=[Math]::Max(0,[Math]::Min(100,$value))} | ConvertTo-Json
+            $record | Set-Content -LiteralPath (Join-Path $root '.update_progress.json.tmp') -Encoding UTF8
+            Move-Item -LiteralPath (Join-Path $root '.update_progress.json.tmp') -Destination (Join-Path $root '.update_progress.json') -Force
+        } catch { }
+    }
+}
+try {
+    if (-not $NoUi) {
+        Add-Type -AssemblyName System.Windows.Forms
+        $form=New-Object Windows.Forms.Form
+        $form.Text='文档分发助手 · 正在安装更新'; $form.ClientSize=New-Object Drawing.Size(520,135)
+        $form.StartPosition='CenterScreen'; $form.FormBorderStyle='FixedDialog'; $form.MaximizeBox=$false; $form.MinimizeBox=$false
+        $form.ControlBox=$false
+        $label=New-Object Windows.Forms.Label; $label.SetBounds(20,20,480,45); $form.Controls.Add($label)
+        $bar=New-Object Windows.Forms.ProgressBar; $bar.SetBounds(20,80,480,22); $form.Controls.Add($bar)
+        $label.Text='正在等待程序退出并准备安装…'
+        $progressFile=Join-Path $root '.update_progress.json'
+        Remove-Item -LiteralPath $progressFile -Force -ErrorAction SilentlyContinue
+        $quotedScript='"'+$PSCommandPath.Replace('"','')+'"'
+        $child=Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$quotedScript,'-WaitProcessId',$WaitProcessId,'-NoUi','-NoRestart') -WindowStyle Hidden -PassThru
+        $timer=New-Object Windows.Forms.Timer; $timer.Interval=100
+        $timer.Add_Tick({
+            try {
+                if (Test-Path -LiteralPath $progressFile) {
+                    $state=Get-Content -LiteralPath $progressFile -Raw | ConvertFrom-Json
+                    $label.Text=$state.stage; $bar.Value=[int]$state.percent
+                }
+            } catch { }
+            if ($child.HasExited) { $timer.Stop(); $form.Close() }
+        })
+        $timer.Start(); $form.ShowDialog() | Out-Null
+        $timer.Dispose(); $form.Dispose(); $form=$null
+        $child.WaitForExit(); $resultCode=$child.ExitCode
+        if ($resultCode -ne 0) { [Windows.Forms.MessageBox]::Show('更新未完成，已尝试恢复原程序。用户数据未覆盖。请查看更新回执与备份。','更新失败') | Out-Null }
+        elseif (-not $NoRestart) { Start-Process -FilePath (Join-Path $root 'start.bat') -WorkingDirectory $root -WindowStyle Hidden }
+        exit $resultCode
+    }
+    while ($WaitProcessId -gt 0 -and (Get-Process -Id $WaitProcessId -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 150; Progress '等待程序退出…' 0 }
+    $source=[IO.Path]::GetFullPath($source)
+    if (-not $source.StartsWith($staging,[StringComparison]::OrdinalIgnoreCase)) { throw '更新来源目录越界' }
+    $files=@(Get-ChildItem -LiteralPath $source -Recurse -File | Where-Object { -not (Protected $_.FullName.Substring($source.Length+1)) })
+    if (-not $files.Count) { throw '更新包没有程序文件' }
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
+    $data=Join-Path $root 'lp_data'
+    if (Test-Path -LiteralPath $data) { Copy-Item -LiteralPath $data -Destination (Join-Path $backup 'lp_data') -Recurse -Force }
+    $index=0
+    foreach ($file in $files) {
+        $relative=$file.FullName.Substring($source.Length+1); $target=Destination $relative
+        if (Test-Path -LiteralPath $target) {
+            if ((Get-Item -LiteralPath $target).PSIsContainer) { throw '目标文件与现有文件夹冲突' }
+            $saved=Join-Path (Join-Path $backup 'program') $relative
+            New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($saved)) -Force | Out-Null
+            Copy-Item -LiteralPath $target -Destination $saved -Force
+            $restored.Add($relative)
+        }
+        $index++; Progress ('备份程序文件 '+$index+'/'+$files.Count) ([int](30*$index/$files.Count))
+    }
+    $index=0
+    foreach ($file in $files) {
+        $relative=$file.FullName.Substring($source.Length+1); $target=Destination $relative
+        $existed=Test-Path -LiteralPath $target
+        New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+        if (-not $existed) { $created.Add($relative) }
+        $index++; Progress ('正在安装 '+$index+'/'+$files.Count) (30+[int](70*$index/$files.Count))
+    }
+    @{success=$true;backup=$backup;files=$files.Count} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root '.update_result.json') -Encoding UTF8
+    # Only the explicitly named staging directory may be removed.
+    if ([IO.Path]::GetFullPath($staging) -ne (Join-Path $root '.update_staging')) { throw '清理目录校验失败' }
+    Remove-Item -LiteralPath $staging -Recurse -Force
+    Progress '更新完成，正在重新启动…' 100
+    if (-not $NoRestart) { Start-Process -FilePath (Join-Path $root 'start.bat') -WorkingDirectory $root -WindowStyle Hidden }
+} catch {
+    $failure=$_.Exception.Message
+    foreach ($relative in $restored) { Copy-Item -LiteralPath (Join-Path (Join-Path $backup 'program') $relative) -Destination (Destination $relative) -Force -ErrorAction SilentlyContinue }
+    foreach ($relative in $created) { Remove-Item -LiteralPath (Destination $relative) -Force -ErrorAction SilentlyContinue }
+    @{success=$false;error=$failure;backup=$backup} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root '.update_result.json') -Encoding UTF8
+    if (-not $NoUi) { [Windows.Forms.MessageBox]::Show('更新未完成，已尝试恢复原程序。数据未覆盖。'+[Environment]::NewLine+$failure,'更新失败') | Out-Null }
+    exit 1
+} finally { if ($form) { $form.Dispose() } }
+'''
+    script = script.replace("__PID__", str(os.getpid())).replace("__SOURCE__", str(relative).replace("'", "''"))
+    helper = base / "run_update.ps1"
+    helper.write_text(script, encoding="utf-8-sig")
+    (base / "run_update.bat").write_text('@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_update.ps1"\r\n', encoding="ascii")
+    return helper
 
 
 # ---------- v2 兼容纯逻辑（迁移、导入与回归测试仍依赖） ----------
@@ -2178,6 +2295,9 @@ class App:
         if not ev:
             messagebox.showerror("读取失败", "事件不存在")
             return
+        ev = self._wb_check_compatibility(ev)
+        if ev is None:
+            return False
         ev = lp_v3.upgrade_pipeline_event(ev)
         self._wb_event = ev
         self.cur_event_id = event_id
@@ -3580,6 +3700,29 @@ class App:
         self._wb_render_mapping_table()
 
 
+    def _wb_check_compatibility(self, event):
+        plan = lp_v3.event_upgrade_plan(event)
+        if plan["blocking"]:
+            messagebox.showerror("旧设置无法安全升级", "\n".join(plan["blocking"]))
+            return None
+        if not plan.get("needs_confirmation"):
+            return event
+        if not messagebox.askyesno("旧设置需要升级",
+                "检测到以下不兼容设置：\n\n" + "\n".join(plan["changes"]) +
+                "\n\n升级前会完整备份原事件，再停用失效覆盖并清除旧处理缓存。"
+                "收件人、口令、模板和原文件保留。\n\n现在升级旧设置？"):
+            return None
+        ok, error, report = self.store.upgrade_event(event["id"])
+        if not ok:
+            messagebox.showerror("升级未完成", error)
+            return None
+        upgraded, error = self.store.load_event(event["id"])
+        if error:
+            messagebox.showerror("读取失败", error)
+            return None
+        messagebox.showinfo("旧设置已升级", "原事件已备份，后续按当前流水线处理。\n\n备份：" + report["backup_path"])
+        return upgraded
+
     def _wb_process(self):
         """④⑤「处理」按钮：按上方条目参数全量重跑流水线（不用历史数据），
         完成后把每位收件人的产出文件路径回填到下方对应表。只生成文件，
@@ -3588,6 +3731,10 @@ class App:
             messagebox.showinfo("正在执行", "上一次处理还没结束，请等它完成。")
             return False
         ev = self._wb_event
+        checked = self._wb_check_compatibility(ev)
+        if checked is None:
+            return False
+        self._wb_event = ev = checked
         errs, _warns, _info = lp_v3.preflight(ev, self.store)
         if errs:
             messagebox.showerror("预检未通过（未开始处理）",
@@ -6171,89 +6318,178 @@ class App:
             return
         self._self_update(info)
 
+    def _open_update_progress(self, tag):
+        window = tk.Toplevel(self.root)
+        window.title("正在更新 · " + tag)
+        window.geometry("600x250")
+        window.minsize(480, 230)
+        window.transient(self.root)
+        self._update_window = window
+        panel = ttk.Frame(window, padding=18)
+        panel.pack(fill="both", expand=True)
+        self._update_stage_var = tk.StringVar(value="正在准备更新…")
+        self._update_detail_var = tk.StringVar(value="下载、校验和解压期间可取消，当前程序与数据不会被替换。")
+        self._update_percent_var = tk.StringVar(value="")
+        ttk.Label(panel, textvariable=self._update_stage_var, style="Head.TLabel").pack(anchor="w")
+        ttk.Label(panel, textvariable=self._update_detail_var, wraplength=550, justify="left").pack(fill="x", pady=12)
+        self._update_progressbar = ttk.Progressbar(panel, maximum=100, mode="determinate")
+        self._update_progressbar.pack(fill="x", pady=6)
+        ttk.Label(panel, textvariable=self._update_percent_var).pack(anchor="w")
+        self._update_cancel_button = ttk.Button(panel, text="取消更新", command=self._cancel_update)
+        self._update_cancel_button.pack(anchor="e", pady=(12, 0))
+        window.protocol("WM_DELETE_WINDOW", self._cancel_update)
+        window.update_idletasks()
+        if self.root.winfo_viewable():
+            window.grab_set()
+
+    def _cancel_update(self):
+        if getattr(self, "_updating", False):
+            self._update_cancel.set()
+            self._update_detail_var.set("正在取消，等待当前下载或文件操作结束…")
+            self._update_cancel_button.state(["disabled"])
+        else:
+            self._close_update_progress()
+
+    def _close_update_progress(self):
+        window = getattr(self, "_update_window", None)
+        if window is not None and window.winfo_exists():
+            self._update_progressbar.stop()
+            window.destroy()
+        self._update_window = None
+
+    def _update_progress(self, payload):
+        window = getattr(self, "_update_window", None)
+        if window is None or not window.winfo_exists():
+            return
+        title, percent, detail = payload
+        self._update_stage_var.set(title)
+        self._update_detail_var.set(detail)
+        self._update_progressbar.stop()
+        if percent is None:
+            self._update_progressbar.configure(mode="indeterminate")
+            self._update_progressbar.start(30)
+            self._update_percent_var.set("正在处理，总进度暂不可计算")
+        else:
+            self._update_progressbar.configure(mode="determinate", value=percent)
+            self._update_percent_var.set("更新准备进度 %d%%" % percent)
+
     def _self_update(self, info):
+        if getattr(self, "_updating", False):
+            window = getattr(self, "_update_window", None)
+            if window is not None and window.winfo_exists():
+                window.lift()
+            return False
+        if self.running:
+            messagebox.showinfo("正在处理", "请等待文件处理完成后再更新程序。")
+            return False
+        if not self._handle_unsaved_before_leave("更新程序"):
+            return False
+        self._updating = True
+        self._update_cancel = threading.Event()
+        cancel = self._update_cancel
+        self._open_update_progress(info["tag"])
+        base = app_dir().resolve()
+
         def work():
             import zipfile
             import hashlib
-            staging = app_dir() / ".update_staging"
-            zip_path = app_dir() / ".update_pkg.zip"
-            try:
-                self._q.put(("log", "[更新] 下载 %s（约 %dMB）…"
-                             % (info["tag"], (info.get("asset_size") or 0) // 1048576)))
-                last = [None]
-
-                def _prog(blocknum, blocksize=1, totalsize=0):
-                    """urllib.request.urlretrieve 的 reporthook 固定传 3 个参数
-                    (blocknum, blocksize, totalsize)。v3.4.9 修复：旧签名只收 1 个，
-                    真正下载时抛 TypeError →「自动更新失败」。"""
-                    try:
-                        total = int(totalsize or 0)
-                        done = int(blocknum or 0) * int(blocksize or 1)
-                    except Exception:
-                        return
-                    if total <= 0:
-                        return
-                    pct = max(0, min(100, int(done * 100 / total)))
-                    if pct != last[0] and pct % 20 == 0:
-                        last[0] = pct
-                        self._q.put(("log", "[更新] 下载进度 %d%%" % pct))
-
-                import urllib.request
-                urllib.request.urlretrieve(info["asset_url"], zip_path, reporthook=_prog)
-                raw = zip_path.read_bytes()
-                digest = (info.get("asset_digest") or "")
-                if digest.startswith("sha256:"):
-                    got = "sha256:" + hashlib.sha256(raw).hexdigest()
-                    if got != digest:
-                        raise RuntimeError("下载校验失败（期望 %s…，实际 %s…）"
-                                           % (digest[:20], got[:20]))
-                    self._q.put(("log", "[更新] SHA256 校验通过"))
-                else:
-                    self._q.put(("log", "[更新] 未取到 SHA256 摘要（API 可能限流），"
-                                        "改用 zip 完整性校验"))
-                with zipfile.ZipFile(zip_path) as _zf:
-                    bad = _zf.testzip()
-                    if bad:
-                        raise RuntimeError("下载包损坏（首个坏文件：%s）" % bad)
-                    names = _zf.namelist()
-                if "app/" not in "".join(names[:50]) and not any(
-                        n.startswith("app/") for n in names):
-                    self._q.put(("log", "[更新] 警告：更新包顶层不是 app/，按目录结构继续"))
+            import shutil
+            import stat
+            staging = base / ".update_staging"
+            zip_path = base / ".update_pkg.zip"
+            class Cancelled(Exception):
+                pass
+            def check_cancel():
+                if cancel.is_set():
+                    raise Cancelled()
+            def report(title, percent, detail):
+                check_cancel()
+                self._q.put(("update_progress", (title, percent, detail)))
+            def clear_staging():
+                if staging.resolve().parent != base or staging.name != ".update_staging":
+                    raise RuntimeError("更新临时目录校验失败")
                 if staging.exists():
-                    import shutil as _sh
-                    _sh.rmtree(staging)
-                with zipfile.ZipFile(zip_path) as z:
-                    z.extractall(staging)
-                src_dir = next((d for d in staging.iterdir() if d.is_dir()), staging)
-                # 更新脚本：等待程序退出 → 覆盖（保留用户数据）→ 重启
-                # 排除清单必须含 lp_data（v3 的用户数据目录）与旧版单文件，
-                # 否则 robocopy /MOVE 会把用户数据一起覆盖掉。
-                # 只能有**一条** robocopy：先复制再排除就已经晚了。
-                bat = app_dir() / "run_update.bat"
-                NLc = chr(10)
-                bat.write_text(
-                    "@echo off" + NLc +
-                    "chcp 65001 >nul 2>&1" + NLc +
-                    "cd /d \"%~dp0\"" + NLc +
-                    "ping -n 4 127.0.0.1 >nul" + NLc +
-                    'robocopy ".update_staging' + chr(92) + str(src_dir.name) + '" "." /E /MOVE '
-                    "/XF lp_data.json lp_run_log.csv lp_data.json.bak "
-                    "lp_data.json.tmp lp_data.example.json "
-                    "/XD lp_data >nul" + NLc +
-                    'rd /s /q ".update_staging" 2>nul' + NLc +
-                    'del ".update_pkg.zip" 2>nul' + NLc +
-                    'start "" "%~dp0start.bat"' + NLc +
-                    "exit" + NLc, encoding="ascii", errors="ignore")
+                    shutil.rmtree(staging)
+            try:
+                report("正在下载更新", 0, "正在连接下载服务器…")
+                last = [None]
+                def progress(blocknum, blocksize=1, totalsize=0):
+                    check_cancel()
+                    total = int(totalsize or 0)
+                    if total <= 0:
+                        total = int(info.get("asset_size") or 0)
+                    done = max(0, int(blocknum) * int(blocksize))
+                    if total > 0:
+                        done = min(done, total)
+                        percent = min(70, int(done * 70 / total))
+                        detail = "已下载 %.1f / %.1f MB（%d%%）" % (done / 1048576, total / 1048576, int(done * 100 / total))
+                    else:
+                        percent = None
+                        detail = "已下载 %.1f MB，服务器未提供总大小" % (done / 1048576)
+                    if percent != last[0] or percent is None:
+                        last[0] = percent
+                        report("正在下载更新", percent, detail)
+                import urllib.request
+                urllib.request.urlretrieve(info["asset_url"], zip_path, reporthook=progress)
+                check_cancel()
+                size = zip_path.stat().st_size
+                if info.get("asset_size") and size != int(info["asset_size"]):
+                    raise RuntimeError("下载大小不符，请重试")
+                report("正在校验下载文件", 72, "正在核对大小和 SHA256…")
+                digest = info.get("asset_digest") or ""
+                if digest.startswith("sha256:"):
+                    with zip_path.open("rb") as stream:
+                        actual = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+                    if actual.lower() != digest.lower():
+                        raise RuntimeError("下载文件 SHA256 校验失败，请重试")
+                report("正在检查更新包", 78, "正在检查 ZIP 完整性与文件路径…")
+                with zipfile.ZipFile(zip_path) as archive:
+                    if archive.testzip():
+                        raise RuntimeError("下载包损坏，请重试")
+                    members = archive.infolist()
+                    for member in members:
+                        target = (staging / member.filename.replace("\\", "/")).resolve()
+                        if not target.is_relative_to(staging.resolve()) or stat.S_ISLNK(member.external_attr >> 16):
+                            raise RuntimeError("更新包包含不安全的文件路径")
+                        parts = [p.lower() for p in Path(member.filename.replace("\\", "/")).parts]
+                        if "lp_data" in parts or (parts and parts[-1] in ("lp_data.json", "lp_data.json.bak", "lp_run_log.csv")):
+                            raise RuntimeError("更新包不应包含用户数据，已停止更新")
+                    clear_staging()
+                    staging.mkdir()
+                    total = max(1, sum(m.file_size for m in members))
+                    done, last_percent = 0, -1
+                    for member in members:
+                        check_cancel()
+                        archive.extract(member, staging)
+                        done += member.file_size
+                        percent = 82 + int(13 * done / total)
+                        if percent != last_percent:
+                            report("正在解压更新", percent, "已解压 %d%%" % int(done * 100 / total))
+                            last_percent = percent
+                source = staging / "app" if (staging / "app").is_dir() else staging
+                for filename in ("lp_tool.py", "lp_v3.py", "watermark_encrypt.py", "start.bat"):
+                    if not (source / filename).is_file():
+                        raise RuntimeError("更新包缺少必需文件：" + filename)
+                expected_version = str(info["tag"]).lstrip("vV")
+                for filename in ("lp_tool.py", "lp_v3.py"):
+                    match = re.search(r'APP_VERSION\s*=\s*"([^\"]+)"', (source / filename).read_text(encoding="utf-8"))
+                    if not match or match.group(1) != expected_version:
+                        raise RuntimeError("更新包版本与目标版本不一致")
+                report("正在准备安装", 97, "版本已核对；准备备份、替换和重启程序…")
+                _write_update_helper(base, source)
                 zip_path.unlink()
+                report("更新文件已准备完成", 100, "等待确认重启。安装时将备份原程序与配置，并显示安装进度。")
                 self._q.put(("update_ready", None))
-            except Exception as e:
-                try:
-                    zip_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                self._q.put(("update_err",
-                             "自动更新失败：%s\n可手动到 Releases 页下载。" % e))
-        threading.Thread(target=work, daemon=True).start()
+            except Cancelled:
+                zip_path.unlink(missing_ok=True)
+                clear_staging()
+                self._q.put(("update_cancelled", None))
+            except Exception as error:
+                zip_path.unlink(missing_ok=True)
+                self._q.put(("update_err", "自动更新失败：%s\n当前程序与数据未替换，可重试或到 Releases 下载。" % error))
+        self._update_thread = threading.Thread(target=work, daemon=True)
+        self._update_thread.start()
+        return True
 
     def log(self, msg):
         # 后台线程只投递消息，主线程轮询写入（Tk 非线程安全）
@@ -6272,7 +6508,10 @@ class App:
             status=getattr(self,"wb_status",None)
             if status is not None and status.winfo_exists():
                 stats=run.get("stats") or {}
-                status.configure(text="成功 %d · 失败 %d · 跳过 %d" % (stats.get("ok",0),stats.get("fail",0),stats.get("skip",0)))
+                pipeline=run.get("pipeline_stats") or {}
+                status.configure(text="流水线 %d/%d 条 · 收件人成功 %d · 失败 %d · 跳过 %d" %
+                                 (pipeline.get("executed",0),pipeline.get("enabled",0),stats.get("ok",0),stats.get("fail",0),stats.get("skip",0)),
+                                 wraplength=max(180,status.master.winfo_width()-24))
         success=bool(run and saved and run.get("status")=="ok" and not run.get("errors") and not (run.get("stats") or {}).get("fail"))
         if target is not None:
             if success:
@@ -6304,15 +6543,35 @@ class App:
                         # v3.4.7：更新信息处理异常不能静默（之前被外层 except 吞掉）
                         messagebox.showerror("检查更新",
                                              "处理更新信息失败：%s" % e)
+                elif kind == "update_progress":
+                    self._update_progress(payload)
+                elif kind == "update_cancelled":
+                    self._updating = False
+                    self._close_update_progress()
+                    messagebox.showinfo("已取消更新", "当前程序与数据未替换。")
                 elif kind == "update_err":
+                    self._updating = False
+                    self._close_update_progress()
                     messagebox.showwarning("检查更新", payload)
                 elif kind == "update_ready":
+                    self._updating = False
                     if messagebox.askyesno(
                             "更新就绪",
                             "新版已下载并通过校验。\n\n"
-                            "现在退出并完成更新？（数据与清单保留，完成后自动重启）"):
-                        os.startfile(str(app_dir() / "run_update.bat"))
-                        self.root.destroy()
+                            "现在退出并安装？将先备份程序与配置，显示安装进度，完成后自动重启。"):
+                        if self._handle_unsaved_before_leave("安装更新"):
+                            try:
+                                import subprocess
+                                subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                                  "-File", str(app_dir() / "run_update.ps1")],
+                                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                            except OSError as error:
+                                messagebox.showerror("无法启动安装", str(error))
+                            else:
+                                self._close_update_progress()
+                                self.root.destroy()
+                    else:
+                        self._close_update_progress()
                 elif kind == "done":
                     self.running = False
                     self._wb_set_running(False)
@@ -6322,6 +6581,9 @@ class App:
 
     def shutdown(self):
         """停掉后台轮询并拆掉外壳（测试与异常退出用）。"""
+        if getattr(self, "_updating", False):
+            self._update_cancel.set()
+        self._close_update_progress()
         if self._poll_id is not None:
             try:
                 self.root.after_cancel(self._poll_id)

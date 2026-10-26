@@ -167,8 +167,8 @@ def _save_event(app, name, recips, pipeline=None):
 
 
 def test_version_is_381():
-    assert lp_tool.APP_VERSION == "3.9.1"
-    assert lp_v3.APP_VERSION == "3.9.1"
+    assert lp_tool.APP_VERSION == "3.9.2"
+    assert lp_v3.APP_VERSION == "3.9.2"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -701,7 +701,9 @@ def test_self_update_progress_hook_and_staging(app, tmp_path, monkeypatch):
 
     fake_zip = tmp_path / "fake_update.zip"
     with zipfile.ZipFile(str(fake_zip), "w") as z:
-        z.writestr("app/lp_tool.py", "print('new version')\n")
+        z.writestr("app/lp_tool.py", 'APP_VERSION = "9.9.9"\n')
+        z.writestr("app/lp_v3.py", 'APP_VERSION = "9.9.9"\n')
+        z.writestr("app/watermark_encrypt.py", "# test payload\n")
         z.writestr("app/start.bat", "@echo off\n")
 
     def fake_retrieve(url, filename, reporthook=None, data=None):
@@ -733,7 +735,9 @@ def test_self_update_progress_hook_and_staging(app, tmp_path, monkeypatch):
     assert any(k == "update_ready" for k, _ in items), items
     assert (appdir / ".update_staging" / "app" / "lp_tool.py").exists()
     bat = (appdir / "run_update.bat").read_text(encoding="ascii", errors="ignore")
-    assert "robocopy" in bat and "lp_data" in bat and "start" in bat
+    assert "run_update.ps1" in bat
+    helper = (appdir / "run_update.ps1").read_text(encoding="utf-8-sig")
+    assert "lp_data" in helper and "Copy-Item -LiteralPath" in helper and "Start-Process" in helper
     assert not (appdir / ".update_pkg.zip").exists(), "下载包应在解压后删除"
 
 # ---------------------------------------------------------------- v3.5.0

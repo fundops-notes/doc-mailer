@@ -641,33 +641,44 @@ def file_to_pdf(source, output_path, batch=None):
         return
     if suffix not in {".xls", ".xlsx", ".ppt", ".pptx"}:
         return docx_to_pdf(source, output_path, batch=batch)
-    import pythoncom
-    import win32com.client
-    pythoncom.CoInitialize()
-    application = document = None
-    try:
-        if suffix in {".xls", ".xlsx"}:
-            application = win32com.client.DispatchEx("Excel.Application")
-            application.Visible = False
-            application.DisplayAlerts = False
-            application.AutomationSecurity = 3
-            document = application.Workbooks.Open(str(Path(source).resolve()), UpdateLinks=0, ReadOnly=True)
-            document.ExportAsFixedFormat(0, str(Path(output_path).resolve()))
-        else:
-            application = win32com.client.DispatchEx("PowerPoint.Application")
-            application.AutomationSecurity = 3
-            document = application.Presentations.Open(str(Path(source).resolve()), ReadOnly=True, WithWindow=False)
-            document.SaveAs(str(Path(output_path).resolve()), 32)
-    finally:
-        if document is not None:
+    # Excel/PowerPoint own their COM apartment. Their shutdown must not
+    # uninitialize the caller's live Word session in a mixed pipeline.
+    from concurrent.futures import ThreadPoolExecutor
+    def convert_office():
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        application = document = None
+        try:
             if suffix in {".xls", ".xlsx"}:
-                document.Close(False)
+                application = win32com.client.DispatchEx("Excel.Application")
+                application.Visible = False
+                application.DisplayAlerts = False
+                application.AutomationSecurity = 3
+                document = application.Workbooks.Open(str(Path(source).resolve()), UpdateLinks=0, ReadOnly=True)
+                document.ExportAsFixedFormat(0, str(Path(output_path).resolve()))
             else:
-                document.Close()
-        if application is not None:
-            application.Quit()
-        document = application = None
-        pythoncom.CoUninitialize()
+                application = win32com.client.DispatchEx("PowerPoint.Application")
+                application.AutomationSecurity = 3
+                document = application.Presentations.Open(str(Path(source).resolve()), ReadOnly=True, WithWindow=False)
+                document.SaveAs(str(Path(output_path).resolve()), 32)
+        finally:
+            try:
+                if document is not None:
+                    if suffix in {".xls", ".xlsx"}:
+                        document.Close(False)
+                    else:
+                        document.Close()
+            finally:
+                try:
+                    if application is not None:
+                        application.Quit()
+                finally:
+                    document = application = None
+                    pythoncom.CoUninitialize()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="LP-PDF-Office") as worker:
+        worker.submit(convert_office).result()
+
 
 
 def docx_to_pdf(src_docx, output_path, batch=None):
