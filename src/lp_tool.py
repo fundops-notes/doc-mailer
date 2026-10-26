@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.9.1"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -5807,6 +5807,7 @@ class App:
         tw = getattr(self, "body_text", None)
         if tw is not None:
             tw.insert("insert", text)
+            self._mark_active_dirty()
 
     def _ed_insert_image(self):
         from tkinter import filedialog as _fd
