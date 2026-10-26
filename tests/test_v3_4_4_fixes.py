@@ -163,8 +163,8 @@ def _save_event(app, name, recips, pipeline=None):
 
 
 def test_version_is_381():
-    assert lp_tool.APP_VERSION == "3.8.3"
-    assert lp_v3.APP_VERSION == "3.8.3"
+    assert lp_tool.APP_VERSION == "3.8.4"
+    assert lp_v3.APP_VERSION == "3.8.4"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -274,7 +274,7 @@ def test_pipeline_left_right_layout_and_scrollbar(app, tmp_path):
     assert _descendant(a._wb_map_tree, right), "对应表必须在右栏"
     assert _descendant(a._wb_process_btn, right), "处理按钮必须在右栏"
     assert _descendant(a._uni_btn_holder, right), "统一附件折叠按钮必须在右栏"
-    assert a._wb_pipe_tree.winfo_manager() == "pack", "条目表必须真正挂在左栏里"
+    assert a._wb_pipe_tree.winfo_manager() == "grid", "条目表和完整宽度的滚动条用grid共同布局，且仍属于左栏"
     # ⑥ 横向滚动条
     assert str(a._wb_pipe_tree.cget("xscrollcommand")), "流水线条目表必须有横向滚动条"
     horiz = [w for w in _walk(a._wb_pipe_tree.master)

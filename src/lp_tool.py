@@ -63,9 +63,9 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.8.3"
+APP_VERSION = "3.8.4"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
-# 注意：发布检查会断言 lp_tool.py 里存在 'APP_VERSION = "3.8.1"' 字面量，别改成 import。
+# 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
 UPDATE_REPO = "fundops-notes/doc-mailer"  # GitHub 仓库（自动更新源）
 APP_TITLE = f"文档分发助手 v{APP_VERSION}"
@@ -601,6 +601,211 @@ WB_STEP_MAIL = 2
 WB_STEP_OVERVIEW = 3
 
 
+class WrapFrame(ttk.Frame):
+    """A toolbar whose existing left-packed controls wrap at the available width."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+        self._layout_job = None
+        self.bind("<Configure>", self._queue_layout)
+        self.bind("<Map>", self._queue_layout)
+        self.bind("<Destroy>", self._cleanup, add=True)
+
+    def _queue_layout(self, _event=None):
+        if self._layout_job is None:
+            self._layout_job = self.after_idle(self._reflow)
+
+    def _reflow(self):
+        self._layout_job = None
+        width = self.winfo_width()
+        if width < 20:
+            return
+        children = self.winfo_children()
+        for child in children:
+            if child.winfo_manager() == "pack":
+                child.pack_forget()
+            if not getattr(child, "_wrap_frame_bound", False):
+                child._wrap_frame_bound = True
+                child.bind("<Configure>", self._queue_layout, add=True)
+        used, row_height, total = 0, 0, 0
+        for child in children:
+            if child.winfo_class() == "TLabel":
+                child.configure(wraplength=max(40, width - 12))
+            requested = child.winfo_reqwidth() + 6
+            if used and used + requested > width:
+                total += row_height + 4
+                used, row_height = 0, 0
+            child.place(x=used, y=total + 2)
+            used += requested
+            row_height = max(row_height, child.winfo_reqheight())
+        height = max(1, total + row_height + 4)
+        if int(self.cget("height")) != height:
+            self.configure(height=height)
+
+    def _cleanup(self, event):
+        if event.widget is self and self._layout_job is not None:
+            self.after_cancel(self._layout_job)
+            self._layout_job = None
+
+
+class ScrollFrame(ttk.Frame):
+    """Width-fitting form viewport, with local wheel routing and focus reveal."""
+
+    def __init__(self, parent, stretch=False, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, width=1, height=1, highlightthickness=0,
+                                bg=MORANDI_BG, yscrollincrement=1)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.content = ttk.Frame(self.canvas)
+        self.content._scroll_view = self
+        self._window = self.canvas.create_window(0, 0, window=self.content, anchor="nw")
+        self._stretch = stretch
+        self._focus_job = None
+        self._reveal_job = None
+        self.canvas.bind("<Configure>", self._resize)
+        self.content.bind("<Configure>", self._resize)
+        self._top = self.winfo_toplevel()
+        self._bindings = [(seq, self._top.bind(seq, fn, add=True)) for seq, fn in
+                          [("<MouseWheel>", self._wheel), ("<Button-4>", self._wheel),
+                           ("<Button-5>", self._wheel), ("<FocusIn>", self._focus)]]
+        self.bind("<Destroy>", self._cleanup, add=True)
+
+    def _resize(self, _event=None):
+        width = max(1, self.canvas.winfo_width())
+        height = max(self.content.winfo_reqheight(),
+                     self.canvas.winfo_height() if self._stretch else 1)
+        # Leave the embedded window's height natural. Pinning its current
+        # requested height prevents later form rebuilds from resizing it.
+        self.canvas.itemconfigure(self._window, width=width, height=0)
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _owns(self, widget):
+        while widget is not None:
+            if widget is self:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _wheel(self, event):
+        if not self.winfo_ismapped() or not self._owns(event.widget):
+            return
+        if event.widget.winfo_class() in ("Text", "Treeview", "Listbox"):
+            first, last = event.widget.yview()
+            if last - first < .999:
+                return  # The native text/list widget owns its own wheel scroll.
+        delta = getattr(event, "delta", 0)
+        units = (-1 if delta > 0 else 1) * max(1, abs(int(delta / 120))) if delta else (
+            -1 if getattr(event, "num", None) == 4 else 1)
+        nearest = event.widget
+        while nearest is not None and not isinstance(nearest, ScrollFrame):
+            nearest = getattr(nearest, "master", None)
+        if nearest is not None and nearest is not self:
+            inner_first, inner_last = nearest.canvas.yview()
+            if (units < 0 and inner_first > 0) or (units > 0 and inner_last < 1):
+                return
+        first, last = self.canvas.yview()
+        if (units < 0 and first <= 0) or (units > 0 and last >= 1):
+            return
+        self.canvas.yview_scroll(units * 48, "units")
+        return "break"
+
+    def _focus(self, event):
+        if self._owns(event.widget):
+            if self._focus_job is not None:
+                self.after_cancel(self._focus_job)
+            self._focus_job = self.after_idle(lambda w=event.widget: self._reveal_focus(w))
+
+    def _reveal_focus(self, widget):
+        self._focus_job = None
+        if widget.winfo_exists():
+            self.ensure_visible(widget)
+
+    def ensure_visible(self, widget, settle=2):
+        """Reveal a control in this form without scrolling unrelated widgets."""
+        self.update_idletasks()
+        self._resize()
+        if not self._owns(widget):
+            return
+        y = widget.winfo_rooty() - self.content.winfo_rooty()
+        height = min(widget.winfo_height(), self.canvas.winfo_height() - 8)
+        top = self.canvas.canvasy(0)
+        viewport = self.canvas.winfo_height()
+        total = max(1, self.content.winfo_height())
+        if y < top:
+            self.canvas.yview_moveto(max(0, y - 4) / total)
+        elif y + height > top + viewport:
+            self.canvas.yview_moveto(max(0, y + height + 4 - viewport) / total)
+        ancestor = self.master
+        while ancestor is not None:
+            outer = getattr(ancestor, "_scroll_view", None)
+            if outer is not None:
+                outer.ensure_visible(widget)
+                break
+            ancestor = ancestor.master
+        if settle:
+            if self._reveal_job is not None:
+                self.after_cancel(self._reveal_job)
+            def finish():
+                self._reveal_job = None
+                if widget.winfo_exists():
+                    self.ensure_visible(widget, settle=settle-1)
+            self._reveal_job = self.after_idle(finish)
+
+    def _cleanup(self, event):
+        if event.widget is not self:
+            return
+        if self._focus_job is not None:
+            self.after_cancel(self._focus_job)
+        if self._reveal_job is not None:
+            self.after_cancel(self._reveal_job)
+        for sequence, binding in self._bindings:
+            try:
+                self._top.unbind(sequence, binding)
+            except tk.TclError:
+                pass
+
+
+def _fit_labels(parent):
+    """Wrap explanatory text at its actual container width, including after resize."""
+    for widget in parent.winfo_children():
+        if (widget.winfo_class() == "TLabel" and len(str(widget.cget("text"))) >= 24
+                and not isinstance(widget.master, WrapFrame)
+                and not getattr(widget, "_wrap_bound", False)):
+            widget._wrap_bound = True
+            def fit(_event=None, label=widget, container=widget.master):
+                if label.winfo_exists() and container.winfo_width() > 40:
+                    label.configure(wraplength=max(40, container.winfo_width() - 24))
+            widget.master.bind("<Configure>", fit, add=True)
+            fit()
+        _fit_labels(widget)
+
+
+def _grid_scrolled_tree(frame, tree, vertical, horizontal):
+    tree.grid(row=0, column=0, sticky="nsew")
+    vertical.grid(row=0, column=1, sticky="ns")
+    horizontal.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+
+
+def _path_text(parent, height):
+    frame = ttk.Frame(parent)
+    frame.pack(fill="x", pady=(2, 4))
+    text = tk.Text(frame, height=height, width=20, wrap="none")
+    vertical = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+    horizontal = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+    text.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+    _grid_scrolled_tree(frame, text, vertical, horizontal)
+    return text
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -790,10 +995,13 @@ class App:
 
         brand = tk.Frame(sidebar, bg=MORANDI_TOP)
         brand.pack(fill="x", padx=16, pady=(18, 14))
+        brand_size = 11 if float(root.tk.call("tk", "scaling")) > 1.8 else 12
         tk.Label(brand, text="文档分发助手", bg=MORANDI_TOP, fg=MORANDI_TEXT,
-                 font=(SAAS_FONT, 12, "bold"), anchor="w").pack(fill="x")
+                 font=(SAAS_FONT, brand_size, "bold"), anchor="w", wraplength=140,
+                 justify="left").pack(fill="x")
         tk.Label(brand, text="Document Dispatch", bg=MORANDI_TOP, fg=MORANDI_MUTED,
-                 font=(SAAS_FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
+                 font=(SAAS_FONT, 8), anchor="w", wraplength=140,
+                 justify="left").pack(fill="x", pady=(2, 0))
 
         tk.Label(sidebar, text="工作台", bg=MORANDI_TOP, fg="#94A3B8",
                  font=(SAAS_FONT, 8), anchor="w").pack(fill="x", padx=18, pady=(2, 3))
@@ -831,7 +1039,6 @@ class App:
         top_inner.pack(fill="both", expand=True, padx=24)
         self.crumb = tk.Label(top_inner, text="", bg=MORANDI_TOP, fg=MORANDI_MUTED,
                               font=(SAAS_FONT, 9), anchor="w")
-        self.crumb.pack(side="left")
         right = tk.Frame(top_inner, bg=MORANDI_TOP)
         right.pack(side="right")
         # 事件操作（进入事件显示）
@@ -846,6 +1053,7 @@ class App:
         for _b in self._ev_actions_btns:
             _b.pack(side="left", padx=(0, 6))
         self._ev_actions.pack_forget()
+        self.crumb.pack(side="left", fill="x", expand=True)
 
         content_host = ttk.Frame(main)
         content_host.pack(fill="both", expand=True, padx=24, pady=(20, 24))
@@ -891,6 +1099,7 @@ class App:
             }.get(name)
             if builder:
                 builder(frame)
+                _fit_labels(frame)
         self._screens[name].pack(fill="both", expand=True)
         self._set_crumb({
             "home": "事件", "settings": "设置", "help": "帮助",
@@ -949,7 +1158,7 @@ class App:
                           lambda _e: self._on_home_tab_changed())
 
     def _build_events_tab(self, parent):
-        bar = ttk.Frame(parent)
+        bar = WrapFrame(parent)
         bar.pack(fill="x", pady=(0, 4))
         ttk.Button(bar, text="＋ 新建事件", style="Accent.TButton",
                    command=self._new_event).pack(side="left", padx=(0, 6))
@@ -960,7 +1169,7 @@ class App:
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
         self.home_status = ttk.Label(bar, text="", style="Sub.TLabel")
         self.home_status.pack(side="right")
-        bar2 = ttk.Frame(parent)
+        bar2 = WrapFrame(parent)
         bar2.pack(fill="x", pady=(0, 8))
         for text, cmd in (("导出事件…", self._lib_export_event),
                           ("导入事件备份…", self._lib_import_event),
@@ -1230,9 +1439,9 @@ class App:
             "库里也存着口令，与 lp_data/ 其余部分同管控级别。"),
             style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
 
-        bar = ttk.Frame(f)
+        bar = WrapFrame(f)
         bar.pack(fill="x", pady=(0, 4))
-        bar2 = ttk.Frame(f)
+        bar2 = WrapFrame(f)
         bar2.pack(fill="x", pady=(0, 8))
         primary = (
             ("＋ 新增", self._pool_new, "在收件人库里新增一条"),
@@ -1263,9 +1472,7 @@ class App:
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
+        _grid_scrolled_tree(frame, tree, vsb, hsb)
         tree.bind("<Double-1>", lambda _e: self._pool_edit())
         self._pool_tree = tree
         self._pool_iids = {}
@@ -1682,9 +1889,7 @@ class App:
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
+        _grid_scrolled_tree(frame, tree, vsb, hsb)
         tree.bind("<Double-1>", lambda _e: self._runs_detail())
         self._runs_tree = tree
         self._runs_ids = {}
@@ -1816,6 +2021,9 @@ class App:
 
     def _build_settings(self, parent=None):
         f = parent if parent is not None else self._screens["settings"]
+        viewport = ScrollFrame(f, stretch=True)
+        viewport.pack(fill="both", expand=True)
+        f = viewport.content
         ttk.Label(f, text="设置", style="Head.TLabel").pack(anchor="w", pady=(0, 4))
         ttk.Label(f, text="全局默认：新建事件时带出，可单独覆盖。",
                   style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
@@ -1824,13 +2032,14 @@ class App:
         row.pack(fill="x", pady=2)
         ttk.Label(row, text="默认输出目录：").pack(side="left")
         self.set_outdir = tk.StringVar(value=self._outdir_display())
-        ttk.Entry(row, textvariable=self.set_outdir, width=52).pack(side="left", padx=4)
-        ttk.Button(row, text="浏览", command=self._set_pick_outdir).pack(side="left")
-        ttk.Button(row, text="保存", command=self._save_settings).pack(side="left", padx=8)
+        ttk.Button(row, text="保存", command=self._save_settings).pack(side="right", padx=8)
+        ttk.Button(row, text="浏览", command=self._set_pick_outdir).pack(side="right")
+        ttk.Entry(row, textvariable=self.set_outdir, width=24).pack(
+            side="left", fill="x", expand=True, padx=4)
         ttk.Label(f, text="（默认：程序所在文件夹；清空/恢复为该目录即使用默认值）",
                   style="Sub.TLabel").pack(anchor="w", padx=(0, 0), pady=(0, 4))
 
-        wm_row = ttk.Frame(f)
+        wm_row = WrapFrame(f)
         wm_row.pack(fill="x", pady=6)
         ttk.Button(wm_row, text="水印设置…", command=self.open_wm_settings).pack(side="left")
         self.wm_summary = ttk.Label(wm_row, text="", style="Sub.TLabel")
@@ -1859,6 +2068,7 @@ class App:
                  % (self.store.data_dir,
                     "已迁移，保留为 lp_data.json.bak" if self.store.legacy_file.with_name(
                         "lp_data.json.bak").exists() else "无"))
+        _fit_labels(self._screens["settings"])
 
     def _set_pick_outdir(self):
         d = filedialog.askdirectory(title="默认输出目录")
@@ -1885,6 +2095,9 @@ class App:
 
     def _build_help(self, parent=None):
         f = parent if parent is not None else self._screens["help"]
+        viewport = ScrollFrame(f, stretch=True)
+        viewport.pack(fill="both", expand=True)
+        f = viewport.content
         ttk.Label(f, text="帮助", style="Head.TLabel").pack(anchor="w", pady=(0, 6))
         box = ttk.LabelFrame(f, text=" Word 占位符写法 ", style="Card.TLabelframe")
         box.pack(fill="x", pady=4)
@@ -1982,9 +2195,9 @@ class App:
         top = ttk.Frame(f)
         top.pack(fill="x", pady=(0, 4))
         self.wb_title = ttk.Label(top, text="", style="Head.TLabel")
-        self.wb_title.pack(side="left")
+        self.wb_title.pack(fill="x")
         self.wb_meta = ttk.Label(top, text="", style="Sub.TLabel")
-        self.wb_meta.pack(side="left", padx=12)
+        self.wb_meta.pack(anchor="w", pady=(0, 2))
 
         body = ttk.Frame(f)
         body.pack(fill="both", expand=True)
@@ -2003,19 +2216,25 @@ class App:
         # 右侧内容区
         self._wb_content = ttk.Frame(body)
         self._wb_content.pack(side="left", fill="both", expand=True)
+        self._wb_nav = nav
+        self._wb_nav_horizontal = None
+        body.bind("<Configure>", self._wb_layout_navigation, add=True)
 
         # 步骤推进条（右下角：上一步 / 下一步）
         foot = ttk.Frame(f)
         # 放在 body 之前 pack，保证底部推进条始终可见
         foot.pack(side="bottom", fill="x", pady=(6, 0), before=body)
         self._wb_step_hint = ttk.Label(foot, text="", style="Sub.TLabel")
-        self._wb_step_hint.pack(side="left", padx=4)
+        self._wb_step_hint._wrap_bound = True
         self._wb_next_btn = ttk.Button(foot, text="下一步 →", style="Accent.TButton",
                                        command=self._wb_next_step)
         self._wb_next_btn.pack(side="right")
         self._wb_prev_btn = ttk.Button(foot, text="← 上一步",
                                        command=self._wb_prev_step)
         self._wb_prev_btn.pack(side="right", padx=6)
+        self._wb_step_hint.pack(side="left", fill="x", expand=True, padx=4)
+        self._wb_step_hint.bind("<Configure>", lambda event: self._wb_step_hint.configure(
+            wraplength=max(40, event.width - 8)))
 
         self._wb_refresh_nav()
         self._wb_show_step(0)
@@ -2028,6 +2247,8 @@ class App:
                 "%d 条" % len(ev.get("pipeline", [])),
                 "已配置" if (ev.get("mail", {}) or {}).get("subject") else "未配置",
                 "%d 封" % len(lp_v3.draft_units(ev))]
+        if getattr(self, "_wb_nav_horizontal", False):
+            subs[0] = "%d 位" % len(ev.get("recipients", []))
         for i, (title, _k) in enumerate(WB_STEPS):
             self._wb_step_buttons[i].configure(
                 text="(%d) %s\n      %s" % (i + 1, title, subs[i]))
@@ -2073,9 +2294,53 @@ class App:
         builder = [self._wb_step_recipients, self._wb_step_pipeline,
                    self._wb_step_mail, self._wb_step_overview][idx]
         builder(self._wb_content)
+        _fit_labels(self._wb_content)
         self._set_crumb("事件 · %s · %s" % (self._wb_event.get("name", ""),
                                             WB_STEPS[idx][0]))
         self._wb_update_step_buttons()
+
+    def _wb_layout_navigation(self, event):
+        horizontal = event.width < 940
+        if horizontal == self._wb_nav_horizontal:
+            return
+        self._wb_nav_horizontal = horizontal
+        nav = self._wb_nav
+        nav.pack_forget()
+        for button in self._wb_step_buttons:
+            button.pack_forget()
+        if horizontal:
+            nav.configure(height=max(b.winfo_reqheight() for b in self._wb_step_buttons) + 8)
+            nav.pack(side="top", fill="x", before=self._wb_content, pady=(0, 6))
+            for button in self._wb_step_buttons:
+                button.configure(width=0)
+                button.pack(side="left", fill="x", expand=True, padx=2, pady=2)
+        else:
+            nav.configure(width=156)
+            nav.pack(side="left", fill="y", before=self._wb_content)
+            for button in self._wb_step_buttons:
+                button.configure(width=18)
+                button.pack(fill="x", padx=4, pady=2)
+        self._wb_refresh_nav()
+
+    def _fit_panes(self, panes, ratio):
+        """Keep both panes usable on resize while retaining a user's sash choice."""
+        panes._layout_width = None
+        panes._layout_ratio = ratio
+        def resize(event):
+            if event.width == panes._layout_width or event.width < 40:
+                return
+            panes._layout_width = event.width
+            try:
+                panes.sashpos(0, int(event.width * panes._layout_ratio))
+            except tk.TclError:
+                pass
+        def remember(_event):
+            try:
+                panes._layout_ratio = max(.3, min(.75, panes.sashpos(0) / panes.winfo_width()))
+            except (tk.TclError, ZeroDivisionError):
+                pass
+        panes.bind("<Configure>", resize, add=True)
+        panes.bind("<ButtonRelease-1>", remember, add=True)
 
     def _ask_unsaved(self, what):
         """返回 save / discard / cancel；有未保存修改时的强提醒。"""
@@ -2245,11 +2510,14 @@ class App:
         return cols
 
     def _wb_step_recipients(self, parent):
+        self._wb_recipients_view = ScrollFrame(parent, stretch=True)
+        self._wb_recipients_view.pack(fill="both", expand=True)
+        parent = self._wb_recipients_view.content
         ev = self._wb_event
         ttk.Label(parent, text="收件人", style="Head.TLabel").pack(anchor="w")
 
         # --- 发送模式（事件级开关：决定几封邮件 / 几份文档）---
-        mode_row = ttk.Frame(parent)
+        mode_row = WrapFrame(parent)
         mode_row.pack(fill="x", pady=(4, 2))
         ttk.Label(mode_row, text="发送模式：").pack(side="left")
         cur_mode = lp_v3.send_mode_of(ev)
@@ -2267,11 +2535,9 @@ class App:
             "只用于文档映射，不在收件人表里显示。"),
             style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
 
-        bar = ttk.Frame(parent)
+        bar = WrapFrame(parent)
         bar.pack(fill="x", pady=(0, 4))
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x", pady=(0, 4))
-        bar2 = ttk.Frame(parent)
+        bar2 = WrapFrame(parent)
         bar2.pack(fill="x", pady=(0, 8))
         primary = [
             ("导入 Excel/CSV", self._wb_import_recipients,
@@ -2311,16 +2577,20 @@ class App:
         # 结果它被排到了 frame 下面，表格被挤成右下角一小块。
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
-        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended", height=6)
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
             tree.column(c, width=150 if c in ("to", "cc", "bcc") else 100)
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
+        _grid_scrolled_tree(frame, tree, vsb, hsb)
+        def fit_recipients(_event=None):
+            rows = max(4, int((self._wb_recipients_view.canvas.winfo_height() - frame.winfo_y() - 64) / 28))
+            if int(tree.cget("height")) != rows:
+                tree.configure(height=rows)
+        self._wb_recipients_view.canvas.bind("<Configure>", fit_recipients, add=True)
+        parent.bind("<Configure>", fit_recipients, add=True)
         tree.bind("<Double-1>", lambda _e: self._wb_edit_recipient())
         self._wb_rec_tree = tree
 
@@ -3281,6 +3551,10 @@ class App:
         self._wb_run_mode = "process"
         self._cancel = threading.Event()
         self._wb_clear_log()
+        view = getattr(self, "_wb_right_view", None)
+        log_widget = getattr(self, "_wb_pipe_log", None)
+        if view is not None and log_widget is not None and log_widget.winfo_exists():
+            view.ensure_visible(log_widget)
         self.log("===== 处理开始：按当前参数全量生成 =====")
         self.log("输出目录：%s" % outdir)
 
@@ -3373,15 +3647,16 @@ class App:
         self._wb_save()
 
     def _wb_step_pipeline(self, parent):
+        self._wb_pipeline_view = ScrollFrame(parent, stretch=True)
+        self._wb_pipeline_view.pack(fill="both", expand=True)
+        parent = self._wb_pipeline_view.content
         ttk.Label(parent, text="文档流水线", style="Head.TLabel").pack(anchor="w")
         ttk.Label(parent, text=(
-            "每一行 = 一个要附上的东西，只有两种：\n"
-            "    ① Word-MailMerge —— 用 Word 模板给每位收件人生成内容各异的文档\n"
-            "    ② 附加文件 —— 把磁盘上已有的文件放进附件包\n"
-            "单击行 → 左侧参数区；按住行上下拖动 → 改顺序；Ctrl/Shift 多选 → 批量删除。"),
+            "Word-MailMerge 生成专属文档；附加文件使用已有文件。"
+            "单击配置参数，拖动排序，Ctrl/Shift 多选。"),
             style="Sub.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
 
-        bar = ttk.Frame(parent)
+        bar = WrapFrame(parent)
         bar.pack(fill="x", pady=(0, 4))
         ttk.Button(bar, text="＋ Word-MailMerge",
                    command=lambda: self._wb_add_item("generate")).pack(side="left")
@@ -3396,22 +3671,30 @@ class App:
         # ④ 左右分栏：v3.4.4 起所有控件**直接建在对应栏里**。
         # （v3.4.3 用 pack(in_=left_col) 只是把窗口塞进左栏的打包列表，父窗口
         #  仍是 parent，PanedWindow 又后创建、z 序在上，结果左栏内容被整个盖住。）
-        pw2 = ttk.PanedWindow(parent, orient="horizontal")
+        pw2 = ttk.PanedWindow(parent, orient="horizontal", height=420)
         pw2.pack(fill="both", expand=True, pady=(0, 4))
         # v3.4.5：给两栏显式初始宽度，避免默认窗口下左栏被右栏挤到按钮被裁掉
-        left_col = ttk.Frame(pw2, width=470)
+        left_col = ttk.Frame(pw2, width=490)
         pw2.add(left_col, weight=5)
-        right_col = ttk.Frame(pw2, width=360)
+        right_col = ttk.Frame(pw2, width=340)
         pw2.add(right_col, weight=3)
+        self._wb_pipeline_panes = pw2
+        self._fit_panes(pw2, 0.56)
+        def fit_height(_event=None):
+            height = max(400, self._wb_pipeline_view.canvas.winfo_height() - pw2.winfo_y() - 4)
+            if int(pw2.cget("height")) != height:
+                pw2.configure(height=height)
+        self._wb_pipeline_view.canvas.bind("<Configure>", fit_height, add=True)
+        parent.bind("<Configure>", fit_height, add=True)
 
         # ---------- 左栏：条目表 + 参数区 ----------
         frame = ttk.Frame(left_col)
-        frame.pack(fill="both", expand=True, pady=(0, 4))
+        frame.pack(fill="x", pady=(0, 4))
         # v3.5.0：去掉「产出颗粒度」，产出固定按分组（同组一份/未分组各一份）
         cols = ["no", "name", "kind", "source", "proc", "on"]
         heads = ["#", "条目名称", "类型", "来源 / 模板", "处理", "启用"]
         tree = ttk.Treeview(frame, columns=cols, show="headings",
-                            selectmode="extended", height=6)
+                            selectmode="extended", height=4)
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
         tree.column("no", width=36, stretch=False, anchor="center")
@@ -3424,11 +3707,14 @@ class App:
         # ⑥ v3.4.4：补上横向滚动条（列宽被窗口截断时可以拖）
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
+        _grid_scrolled_tree(frame, tree, vsb, hsb)
         self._wb_pipe_tree = tree
         self._wb_pipe_hsb = hsb
+        def fit_list(event):
+            rows = 2 if event.height < 450 else 4
+            if int(tree.cget("height")) != rows:
+                tree.configure(height=rows)
+        left_col.bind("<Configure>", fit_list, add=True)
 
         tree.bind("<<TreeviewSelect>>", self._wb_on_pipe_select)
         tree.bind("<Double-1>", self._wb_on_pipe_double)
@@ -3436,21 +3722,26 @@ class App:
         tree.bind("<B1-Motion>", self._wb_pipe_motion)
         tree.bind("<ButtonRelease-1>", self._wb_pipe_release)
 
-        self._wb_params_frame = ttk.Frame(left_col)
-        self._wb_params_frame.pack(fill="both", expand=True, pady=(0, 4))
+        self._wb_params_view = ScrollFrame(left_col)
+        self._wb_params_view.pack(fill="both", expand=True, pady=(0, 4))
+        self._wb_params_frame = self._wb_params_view.content
 
         # ---------- 右栏：统一附件（可折叠）+ 处理按钮 + 对应表 ----------
-        self._uni_btn_holder = ttk.Frame(right_col)
+        self._wb_right_view = ScrollFrame(right_col, stretch=True)
+        self._wb_right_view.pack(fill="both", expand=True)
+        right_col = self._wb_right_view.content
+        self._uni_btn_holder = WrapFrame(right_col)
         self._uni_btn_holder.pack(fill="x", pady=(0, 4))
-        ttk.Button(self._uni_btn_holder, text="📎 统一附件（所有人收同一份文件）…",
-                   command=self._toggle_uni).pack(side="left")
+        uni_toggle = ttk.Button(self._uni_btn_holder, text="📎 统一附件…", command=self._toggle_uni)
+        uni_toggle.pack(side="left")
+        ToolTip(uni_toggle, "所有人收同一份文件；点击展开或收起统一附件。")
 
-        proc = ttk.LabelFrame(right_col, text=" 处理与文件对应（收件人 → 将收到的文件） ",
+        proc = ttk.LabelFrame(right_col, text=" 处理与文件对应 ",
                               style="Card.TLabelframe")
         proc.pack(fill="both", expand=True)
         self._uni_anchor = proc      # 统一附件展开时排在处理区上方
 
-        uni = ttk.LabelFrame(right_col, text=" 统一附件（所有收件人都收到的同一份文件） ",
+        uni = ttk.LabelFrame(right_col, text=" 统一附件 ",
                              style="Card.TLabelframe")
         self._uni_frame = uni
         self._uni_shown = False
@@ -3458,11 +3749,10 @@ class App:
         uni_row.pack(fill="x", padx=8, pady=4)
         ttk.Label(uni_row, text="文件（每行一个，全部收件人共用）：").pack(anchor="w")
         # v3.5.0：文本框与按钮改上下两行，右栏较窄时「保存」按钮也不会被裁掉
-        self._wb_uni_text = tk.Text(uni_row, height=3, wrap="none")
-        self._wb_uni_text.pack(fill="x", pady=(2, 4))
+        self._wb_uni_text = _path_text(uni_row, 3)
         for _a in ((self._wb_event or {}).get("attachments") or []):
             self._wb_uni_text.insert("end", str(_a.get("path") or "") + "\n")
-        uni_btns = ttk.Frame(uni_row)
+        uni_btns = WrapFrame(uni_row)
         uni_btns.pack(fill="x")
         ttk.Button(uni_btns, text="添加文件…", width=10,
                    command=self._wb_uni_add_file).pack(side="left")
@@ -3473,9 +3763,9 @@ class App:
                        "这里只放所有人同一份的文件，会进入每位收件人的附件包。"
                   ).pack(anchor="w", padx=8, pady=(0, 4))
 
-        prow = ttk.Frame(proc)
+        prow = WrapFrame(proc)
         prow.pack(fill="x", padx=8, pady=4)
-        self._wb_process_btn = ttk.Button(prow, text="▶ 处理（按上方参数全量生成）",
+        self._wb_process_btn = ttk.Button(prow, text="▶ 处理",
                                           command=self._wb_process)
         self._wb_process_btn.pack(side="left")
         ttk.Label(proc, foreground=MORANDI_MUTED, wraplength=330, justify="left",
@@ -3501,7 +3791,7 @@ class App:
         mframe.rowconfigure(0, weight=1)
         mframe.columnconfigure(0, weight=1)
         self._wb_map_tree.bind("<Double-1>", self._wb_map_edit)
-        save_row = ttk.Frame(proc)
+        save_row = WrapFrame(proc)
         save_row.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Button(save_row, text="保存自定义编辑",
                    command=self._wb_map_save_edits).pack(side="left")
@@ -3511,10 +3801,15 @@ class App:
         logf = ttk.LabelFrame(proc, text=" 处理进度与日志（实时） ",
                               style="Card.TLabelframe")
         logf.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
-        self._wb_pipe_log = tk.Text(logf, height=8, state="disabled",
+        log_body = ttk.Frame(logf)
+        log_body.pack(fill="both", expand=True, padx=6, pady=4)
+        self._wb_pipe_log = tk.Text(log_body, height=6, state="disabled",
                                     font=("Consolas", 9), background=MORANDI_TOP,
                                     wrap="word")
-        self._wb_pipe_log.pack(fill="both", expand=True, padx=6, pady=4)
+        self._wb_pipe_log.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_body, orient="vertical", command=self._wb_pipe_log.yview)
+        log_scroll.pack(side="right", fill="y")
+        self._wb_pipe_log.configure(yscrollcommand=log_scroll.set)
         self._wb_pipe_log.tag_configure("dup", foreground="#c25e00")
         self._wb_pipe_log.tag_configure("err", foreground="#b00000")
         self._wb_log_text = self._wb_pipe_log
@@ -3539,6 +3834,8 @@ class App:
         f = getattr(self, "_wb_params_frame", None)
         if f is None:
             return
+        previous_id = getattr(self, "_wb_params_item_id", None)
+        self._wb_params_item_id = item.get("id") if item else None
         for c in f.winfo_children():
             c.destroy()
         # 重建前清掉上一批 tk 变量的保活列表
@@ -3546,6 +3843,9 @@ class App:
         if item is None:
             return
         self._wb_item_params(f, item)
+        _fit_labels(f)
+        if previous_id != self._wb_params_item_id:
+            self._wb_params_view.canvas.yview_moveto(0)
 
     def _wb_keep_var(self, var):
         """保住 tk 变量对象。
@@ -4032,22 +4332,23 @@ class App:
         r0.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Label(r0, text="名称：").pack(side="left")
         name_var = self._wb_keep_var(tk.StringVar(value=item.get("name") or ""))
-        name_entry = ttk.Entry(r0, textvariable=name_var, width=28)
-        name_entry.pack(side="left", padx=4)
+        name_entry = ttk.Entry(r0, textvariable=name_var, width=16)
+        name_entry.pack(side="left", fill="x", expand=True, padx=4)
         self._wb_item_name_entry = name_entry
         name_entry.bind("<Return>", lambda _e: self._wb_apply_item_name(item, name_var))
         ttk.Button(r0, text="改名", width=6,
                    command=lambda: self._wb_apply_item_name(item, name_var)).pack(side="left")
-        ttk.Label(r0, text="   类型：%s" % ITEM_KIND_LABELS.get(kind, ""),
-                  foreground="#666").pack(side="left", padx=(12, 0))
+        ttk.Label(box, text="类型：%s" % ITEM_KIND_LABELS.get(kind, ""),
+                  foreground="#666").pack(anchor="w", padx=8, pady=(0, 2))
         ToolTip(r0, ITEM_KIND_DESC.get(kind, ""))
 
         if kind == "generate":
             r1 = ttk.Frame(box)
             r1.pack(fill="x", padx=8, pady=4)
-            ttk.Label(r1, text="Word 模板：").pack(side="left")
+            ttk.Label(r1, text="Word 模板：").pack(anchor="w")
             tpl_var = self._wb_keep_var(tk.StringVar(value=params.get("template_path", "")))
-            ttk.Entry(r1, textvariable=tpl_var, width=32).pack(side="left", padx=4)
+            ttk.Entry(r1, textvariable=tpl_var, width=12).pack(
+                side="left", fill="x", expand=True, padx=(0, 4))
             ttk.Button(r1, text="选择…", width=6,
                        command=lambda: self._wb_pick_template(item, tpl_var)).pack(side="left")
             ttk.Button(r1, text="检测占位符", width=10,
@@ -4055,10 +4356,11 @@ class App:
             # v3.5.1：文件名模板从「设置」下沉到这一条生成任务
             frow = ttk.Frame(box)
             frow.pack(fill="x", padx=8, pady=(0, 2))
-            ttk.Label(frow, text="生成文件名模板：").pack(side="left")
+            ttk.Label(frow, text="生成文件名模板：").pack(anchor="w")
             _ftpl = (params.get("filename_tpl") or "").strip() or DEFAULT_FILENAME_TPL
             fname_var = self._wb_keep_var(tk.StringVar(value=_ftpl))
-            ttk.Entry(frow, textvariable=fname_var, width=30).pack(side="left", padx=4)
+            ttk.Entry(frow, textvariable=fname_var, width=16).pack(
+                side="left", fill="x", expand=True, padx=(0, 4))
             ttk.Button(frow, text="保存", width=6,
                        command=lambda: self._wb_save_item_filename(item, fname_var)
                        ).pack(side="left")
@@ -4070,7 +4372,7 @@ class App:
                            "处理顺序固定：转 PDF → 加水印 → 加密；"
                            "水印文字与各人打开口令在「收件人」处维护。"
                       ).pack(anchor="w", padx=8, pady=(2, 0))
-            hrow = ttk.Frame(box)
+            hrow = WrapFrame(box)
             hrow.pack(fill="x", padx=8, pady=(2, 4))
             ttk.Button(hrow, text="导出要素模板", width=12,
                        command=lambda: self._wb_export_field_template(item)
@@ -4086,11 +4388,10 @@ class App:
             r1.pack(fill="x", padx=8, pady=4)
             ttk.Label(r1, text="文件（每行一个路径）：").pack(anchor="w")
             # v3.4.5：文本框与按钮改为上下两行，默认窗口宽度下按钮不会被裁掉
-            files_text = tk.Text(r1, height=4, width=40, wrap="none")
-            files_text.pack(fill="x", padx=0, pady=(2, 4))
+            files_text = _path_text(r1, 4)
             for p in (params.get("files") or []):
                 files_text.insert("end", str(p) + "\n")
-            btns = ttk.Frame(r1)
+            btns = WrapFrame(r1)
             btns.pack(fill="x")
             b_add = ttk.Button(btns, text="添加文件…", width=12,
                                command=lambda: self._wb_add_attach_files(item, files_text))
@@ -4111,7 +4412,7 @@ class App:
                 anchor="w", padx=8, pady=(0, 4))
             # v3.5.0：显示当前路径来源（Excel 导入后会切成「按收件人附件路径」）
             _src = str(params.get("path_source") or lp_v3.PATH_SOURCE_MANUAL)
-            _src_row = ttk.Frame(box)
+            _src_row = WrapFrame(box)
             _src_row.pack(fill="x", padx=8, pady=(0, 4))
             if _src == lp_v3.PATH_SOURCE_MANUAL:
                 _src_txt = "当前：手填路径清单（所有收件人一样）"
@@ -4127,7 +4428,7 @@ class App:
                            ).pack(side="left", padx=6)
 
         # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
-        r2 = ttk.Frame(box)
+        r2 = WrapFrame(box)
         r2.pack(fill="x", padx=8, pady=4)
         ttk.Label(r2, text="处理：").pack(side="left")
         to_pdf_var = self._wb_keep_var(tk.BooleanVar(value=bool(params.get("to_pdf"))))
@@ -4174,19 +4475,21 @@ class App:
             # v3.4.4：输入口令时 StringVar 一变化就保存（真实键入 / 测试都可靠）
             gp_pw_var.trace_add("write", lambda *_a: _gp_changed())
 
-            ttk.Checkbutton(r_gp, text="发送人统一密码（所有文件同一口令，便于发送人核对）",
+            ttk.Checkbutton(r_gp, text="发送人统一密码",
                             variable=gp_mode_var,
                             command=_gp_changed).pack(side="left")
-            e_gp = ttk.Entry(r_gp, textvariable=gp_pw_var, width=20, show="*")
-            e_gp.pack(side="left", padx=6)
+            e_gp = ttk.Entry(r_gp, textvariable=gp_pw_var, width=16, show="*")
+            e_gp.pack(side="left", fill="x", expand=True, padx=6)
+            ttk.Label(box, text="所有文件使用同一权限口令，便于发送人核对；收件人仍使用各自打开口令。",
+                      foreground="#888").pack(anchor="w", padx=8, pady=(0, 4))
             for _seq in ("<KeyRelease>", "<Return>", "<FocusOut>"):
                 e_gp.bind(_seq, lambda _e: _gp_changed())
-            ToolTip(e_gp, "统一打开口令（收件人口令之外，发送人自己核对用）。"
+            ToolTip(e_gp, "统一权限口令（供发送人核对，不进入文档或邮件）。"
                           "不能与任何收件人的打开口令相同。留空则生成时自动创建。")
 
         # --- 权限位（仅加密时出现）---
         if params.get("encrypt"):
-            r3 = ttk.Frame(box)
+            r3 = WrapFrame(box)
             r3.pack(fill="x", padx=8, pady=(0, 4))
             ttk.Label(r3, text="权限：").pack(side="left")
             perms = params.get("permissions")
@@ -4292,7 +4595,7 @@ class App:
         tree.bind("<Double-1>", lambda e, it=item: self._wb_edit_mapping(
             it, (getattr(self, "_wb_map_iids", None) or {}).get(tree.identify_row(e.y))))
 
-        bar = ttk.Frame(parent)
+        bar = WrapFrame(parent)
         bar.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Button(bar, text="＋ 添加映射行",
                    command=lambda: self._wb_add_mapping(item)).pack(side="left")
@@ -4799,6 +5102,9 @@ class App:
     # ---------- 步骤 4：邮件模板 ----------
 
     def _wb_step_mail(self, parent):
+        viewport = ScrollFrame(parent, stretch=True)
+        viewport.pack(fill="both", expand=True)
+        parent = viewport.content
         ev = self._wb_event
         mail = ev.setdefault("mail", {})
         ttk.Label(parent, text="邮件模板", style="Head.TLabel").pack(anchor="w")
@@ -4810,21 +5116,27 @@ class App:
         top.pack(fill="x", pady=2)
         ttk.Label(top, text="主题：").pack(side="left")
         self.mail_subject_var = tk.StringVar(value=mail.get("subject", ""))
-        ttk.Entry(top, textvariable=self.mail_subject_var, width=70).pack(side="left", padx=4)
+        ttk.Entry(top, textvariable=self.mail_subject_var, width=24).pack(
+            side="left", fill="x", expand=True, padx=4)
 
         row2 = ttk.Frame(parent)
         row2.pack(fill="x", pady=2)
         ttk.Label(row2, text="代发地址：").pack(side="left")
         self.mail_from_var = tk.StringVar(value=mail.get("from_addr", ""))
-        ttk.Entry(row2, textvariable=self.mail_from_var, width=38).pack(side="left", padx=4)
+        ttk.Entry(row2, textvariable=self.mail_from_var, width=24).pack(
+            side="left", fill="x", expand=True, padx=4)
         row3 = ttk.Frame(parent)
         row3.pack(fill="x", pady=2)
         ttk.Label(row3, text="默认抄送：").pack(side="left")
         self.mail_cc_var = tk.StringVar(value=mail.get("cc_default", ""))
-        ttk.Entry(row3, textvariable=self.mail_cc_var, width=30).pack(side="left", padx=4)
-        ttk.Label(row3, text="默认密送：").pack(side="left", padx=(12, 0))
+        ttk.Entry(row3, textvariable=self.mail_cc_var, width=24).pack(
+            side="left", fill="x", expand=True, padx=4)
+        row4 = ttk.Frame(parent)
+        row4.pack(fill="x", pady=2)
+        ttk.Label(row4, text="默认密送：").pack(side="left")
         self.mail_bcc_var = tk.StringVar(value=mail.get("bcc_default", ""))
-        ttk.Entry(row3, textvariable=self.mail_bcc_var, width=30).pack(side="left", padx=4)
+        ttk.Entry(row4, textvariable=self.mail_bcc_var, width=24).pack(
+            side="left", fill="x", expand=True, padx=4)
         for _v in (self.mail_subject_var, self.mail_from_var,
                    self.mail_cc_var, self.mail_bcc_var):
             _v.trace_add("write", self._mark_active_dirty)
@@ -4833,7 +5145,7 @@ class App:
 
         editpane = ttk.Frame(parent)
         editpane.pack(fill="both", expand=True, pady=4)
-        t = tk.Text(editpane, undo=True, wrap="word", font=(SAAS_FONT, 11),
+        t = tk.Text(editpane, height=10, undo=True, wrap="word", font=(SAAS_FONT, 11),
                     spacing1=4, spacing3=4, padx=12, pady=10,
                     background=MORANDI_TOP, relief="solid", borderwidth=1)
         self.body_text = t
@@ -4844,7 +5156,7 @@ class App:
         t.bind("<<Paste>>", self._ed_rich_paste)
         t.bind("<KeyRelease>", self._ed_on_key)
 
-        bot = ttk.Frame(parent)
+        bot = WrapFrame(parent)
         bot.pack(side="bottom", fill="x", pady=4, before=editpane)
         ttk.Button(bot, text="保存模板", command=self._wb_save_mail).pack(side="left")
         ttk.Button(bot, text="预生成 →", command=self._wb_mail_preview_next
@@ -4930,6 +5242,9 @@ class App:
     # ---------- 步骤 4：总览（预生成核对 / 生成草稿） ----------
 
     def _wb_step_overview(self, parent):
+        viewport = ScrollFrame(parent, stretch=True)
+        viewport.pack(fill="both", expand=True)
+        parent = viewport.content
         ev = self._wb_event
         ttk.Label(parent, text="总览（预生成）", style="Head.TLabel").pack(anchor="w")
         ttk.Label(parent, text=(
@@ -4940,7 +5255,7 @@ class App:
         errors, warnings, info = lp_v3.preflight(ev, self.store)
 
         # 动作栏（原底栏移到这里）
-        act = ttk.Frame(parent)
+        act = WrapFrame(parent)
         act.pack(fill="x", pady=(0, 4))
         self.btn_preflight = ttk.Button(act, text="预检", command=self._wb_preflight)
         self.btn_preflight.pack(side="left")
@@ -4956,7 +5271,7 @@ class App:
         ttk.Label(act, foreground="#b00",
                   text="草稿只写入 Outlook 草稿箱，不会发送").pack(side="left", padx=12)
 
-        head = ttk.Frame(parent)
+        head = WrapFrame(parent)
         head.pack(fill="x", pady=(0, 4))
         for label, value in (("收件人", info["recipients"]),
                              ("发送模式", lp_v3.SEND_MODE_LABELS.get(
@@ -4978,16 +5293,19 @@ class App:
 
         pw = ttk.PanedWindow(parent, orient="horizontal")
         pw.pack(fill="both", expand=True, pady=(4, 0))
-        leftpane = ttk.Frame(pw)
+        leftpane = ttk.Frame(pw, width=280)
         pw.add(leftpane, weight=1)
-        rightpane = ttk.Frame(pw, width=640)
+        rightpane = ttk.Frame(pw, width=460)
         pw.add(rightpane, weight=2)
+        self._fit_panes(pw, 0.34)
 
         ttk.Label(leftpane, text="要发送的邮件清单（收件人 / 合并组）：",
                   style="Sub.TLabel").pack(anchor="w")
         cols = ["who", "files", "count", "pw"]
         heads = ["收件人 / 合并组", "附件包（文件名）", "件数", "打开口令"]
-        tree = ttk.Treeview(leftpane, columns=cols, show="headings", height=10,
+        ov_table = ttk.Frame(leftpane)
+        ov_table.pack(fill="both", expand=True, pady=(2, 0))
+        tree = ttk.Treeview(ov_table, columns=cols, show="headings", height=5,
                             selectmode="browse")
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
@@ -4995,7 +5313,10 @@ class App:
         tree.column("files", width=240)
         tree.column("count", width=40, stretch=False, anchor="center")
         tree.column("pw", width=90, stretch=False)
-        tree.pack(fill="both", expand=True, pady=(2, 0))
+        ov_vsb = ttk.Scrollbar(ov_table, orient="vertical", command=tree.yview)
+        ov_hsb = ttk.Scrollbar(ov_table, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ov_vsb.set, xscrollcommand=ov_hsb.set)
+        _grid_scrolled_tree(ov_table, tree, ov_vsb, ov_hsb)
 
         plan = lp_v3.preview_plan(ev)
         recips = dict((r.get("name", ""), r) for r in ev.get("recipients") or [])
@@ -5041,7 +5362,7 @@ class App:
         edframe = ttk.Frame(rightpane)
         edframe.pack(fill="both", expand=True, pady=(2, 2))
         self._ov_body_text = tk.Text(
-            edframe, undo=True, wrap="word", font=(SAAS_FONT, 10),
+            edframe, height=8, undo=True, wrap="word", font=(SAAS_FONT, 10),
             spacing1=3, spacing3=3, padx=10, pady=8,
             background=MORANDI_TOP, relief="solid", borderwidth=1)
         self.body_text = self._ov_body_text
@@ -5052,7 +5373,7 @@ class App:
         self._ov_body_text.bind("<<Paste>>", self._ed_rich_paste)
         self._ov_body_text.bind("<KeyRelease>", self._ed_on_key)
 
-        ovbtns = ttk.Frame(rightpane)
+        ovbtns = WrapFrame(rightpane)
         ovbtns.pack(fill="x", pady=(2, 2))
         ttk.Button(ovbtns, text="保存这封邮件", command=self._wb_ov_save).pack(side="left")
         ttk.Button(ovbtns, text="恢复统一模板", command=self._wb_ov_reset).pack(
@@ -5357,7 +5678,7 @@ class App:
                     "Arial", "Times New Roman", "Courier New")
 
     def _build_editor_toolbar(self, parent, compact=False):
-        bar = ttk.Frame(parent)
+        bar = WrapFrame(parent)
         bar.pack(fill="x", pady=(4, 2))
         for label, opt in [("B", "b"), ("I", "i"), ("U", "u")]:
             tk.Button(bar, text=label, width=3,
@@ -5390,7 +5711,7 @@ class App:
             ttk.Button(bar, text="背景色", width=7,
                        command=self._ed_pick_bg).pack(side="left", padx=2)
 
-        bar2 = ttk.Frame(parent)
+        bar2 = WrapFrame(parent)
         bar2.pack(fill="x", pady=(0, 2))
         if compact:
             ttk.Button(bar2, text="文字色", width=7,
@@ -5407,7 +5728,7 @@ class App:
         ttk.Button(bar2, text="右对齐", width=7,
                    command=lambda: self._ed_align("right")).pack(side="left", padx=2)
 
-        bar3 = ttk.Frame(parent)
+        bar3 = WrapFrame(parent)
         if compact or True:
             bar3.pack(fill="x", pady=(0, 3))
         ttk.Button(bar3, text="插入图片…", width=11,
