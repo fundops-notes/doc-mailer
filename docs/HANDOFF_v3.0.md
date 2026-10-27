@@ -1953,4 +1953,6 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - PDF、非 PDF、Excel 对应条目支持自定义文件名和插入原件名/水印名称/打开口令/收件人名称/日期；留空兼容旧设置；权限口令禁止进入附件名。防同名覆盖，并保护部分重跑时已有文件。
 - 两处版本字面量3.9.4，源码镜像一致；392 pytest passed；真实 Tk + Office 74 PASS/0 FAIL（Outlook fake Save）；标签界面27 PASS/0 FAIL，隔离更新15项通过。
 - exe 48,406,984 B / 签名Valid；隔离启动退出0。开发数据32文件、安装数据54文件前后哈希一致；用户数据未入包，WINWORD=0。证据与报告位于开发根目录验收_v3.9.4和修复与发布报告_v3.9.4.md。
-- 发布状态待 CI、Release 及下载校验后更新。
+- v3.9.4 已发布：tag/commit 356e95eafa64120cd6dba04af67bd97e156c652e；CI 40472005522 success；Release id 425179005。两个资产从 Release 重新下载，SHA256 与本地/GitHub 一致，ZIP 完整、无用户数据；下载 exe 签名 Valid，证书指纹 9106B492E4A041627FDA67A389BA23474475A26E。
+- 便携包 SHA256 5E0831EB5F6FC6B48C6CBEE8DE082C3C06E107D59184D035488E6EB981664964；win64 包 SHA256 7656CBAED395360CD956033726D1F4BA1969B6AB3193172F52BC8EAC83B0288F。
+
