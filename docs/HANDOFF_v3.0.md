@@ -1963,4 +1963,5 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - 修复新增与编辑共用回调导致选中时误编辑；新增始终空白，编辑仅处理一位，复制选中记录新建并提示核对地址、口令与专属文件。复制保留事件字段，Excel按名称的附件对应需另行配置；取消、重名、保存失败不覆盖原记录。
 - 两处版本字面量3.9.5；398 pytest passed；真实Tk+Office 78 PASS/0 FAIL（Outlook fake Save），标签27 PASS/0 FAIL、隔离更新15项通过。
 - exe 48,408,376 B 签名Valid、隔离启动退出0；开发数据32文件、安装数据54文件哈希未变，WINWORD=0。证据开发根验收_v3.9.5/及修复与发布报告_v3.9.5.md。
-- 发布状态待CI与资产校验后更新。
+- v3.9.5 已发布：tag/commit 054550fa1c4d7ed348fda3bf167b763bdcd9db78；CI 40474649260 success；Release id 425200405。两资产从 Release 重新下载，SHA256 与本地/GitHub 一致，ZIP 完整、无用户数据；下载 exe 签名 Valid，证书指纹 9106B492E4A041627FDA67A389BA23474475A26E。
+- 便携包 SHA256 F4152F940D6DE69BC54FF501D2987DEA568780B1BD851A3CD66E16D56760833E；win64 包 SHA256 77DEA9EEC4F149CA14686B1079CF8F3C553B8BC03FD0053D1308609EF27E6711。
