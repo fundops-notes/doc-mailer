@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.6"
+APP_VERSION = "3.9.7"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -95,7 +95,7 @@ SAAS_BORDER_STRONG = "#CBD5E1"
 SAAS_FONT = "Microsoft YaHei UI"
 
 # 邮件模板里永远可用的内置字段（**没有权限口令**，这是架构保证不是靠自觉）
-FIELDS = ["{{收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
+FIELDS = ["{{收件人名称}}", "{{合并组}}", "{{合并组或收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
 DEFAULT_SUBJECT = "机密文件（{{收件人名称}} 专属）"
 DEFAULT_BODY = """<div style="font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
@@ -978,15 +978,31 @@ def _grid_scrolled_tree(frame, tree, vertical, horizontal):
     frame.columnconfigure(0, weight=1)
 
 
-def _path_text(parent, height):
+def _path_text(parent, height, unified=False):
     frame = ttk.Frame(parent)
     frame.pack(fill="x", pady=(2, 4))
     text = tk.Text(frame, height=height, width=20, wrap="none")
-    vertical = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
     horizontal = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
-    text.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-    _grid_scrolled_tree(frame, text, vertical, horizontal)
+    if unified:
+        text.configure(xscrollcommand=horizontal.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        frame.columnconfigure(0, weight=1)
+        def resize_text(_event=None):
+            if text.edit_modified():
+                text.edit_modified(False)
+                _fit_path_text_height(text)
+        text.bind("<<Modified>>", resize_text)
+        text.edit_modified(False)
+    else:
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        _grid_scrolled_tree(frame, text, vertical, horizontal)
     return text
+
+
+def _fit_path_text_height(text):
+    text.configure(height=max(3, int(text.index("end-1c").split(".")[0])))
 
 
 class App:
@@ -3813,6 +3829,7 @@ class App:
         sel = keep_sel or getattr(self, "_wb_sel_item", None)
         tree.delete(*tree.get_children())
         items = self._wb_pipeline_items()
+        tree.configure(height=max(2, len(items)))
         for i, it in enumerate(items):
             iid = it.get("id") or ("it-%d" % i)
             it["id"] = iid
@@ -4067,6 +4084,8 @@ class App:
                 " / ".join(str(p) for p in files) if files else "—",
                 state])
 
+        tree.configure(height=max(3, len(ev.get("recipients") or [])))
+
         self._wb_map_dirty = False
 
     def _wb_uni_add_file(self):
@@ -4119,8 +4138,8 @@ class App:
         # ④ 左右分栏：v3.4.4 起所有控件**直接建在对应栏里**。
         # （v3.4.3 用 pack(in_=left_col) 只是把窗口塞进左栏的打包列表，父窗口
         #  仍是 parent，PanedWindow 又后创建、z 序在上，结果左栏内容被整个盖住。）
-        pw2 = ttk.PanedWindow(parent, orient="horizontal", height=420)
-        pw2.pack(fill="both", expand=True, pady=(0, 4))
+        pw2 = ttk.PanedWindow(parent, orient="horizontal")
+        pw2.pack(fill="x", pady=(0, 4))
         # v3.4.5：给两栏显式初始宽度，避免默认窗口下左栏被右栏挤到按钮被裁掉
         left_col = ttk.Frame(pw2, width=490)
         pw2.add(left_col, weight=5)
@@ -4128,13 +4147,6 @@ class App:
         pw2.add(right_col, weight=3)
         self._wb_pipeline_panes = pw2
         self._fit_panes(pw2, 0.56)
-        def fit_height(_event=None):
-            height = max(400, self._wb_pipeline_view.canvas.winfo_height() - pw2.winfo_y() - 4)
-            if int(pw2.cget("height")) != height:
-                pw2.configure(height=height)
-        self._wb_pipeline_view.canvas.bind("<Configure>", fit_height, add=True)
-        parent.bind("<Configure>", fit_height, add=True)
-
         # ---------- 左栏：条目表 + 参数区 ----------
         frame = ttk.Frame(left_col)
         frame.pack(fill="x", pady=(0, 4))
@@ -4151,33 +4163,25 @@ class App:
         tree.column("source", width=150)
         tree.column("proc", width=96, stretch=False)
         tree.column("on", width=44, stretch=False, anchor="center")
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        # ⑥ v3.4.4：补上横向滚动条（列宽被窗口截断时可以拖）
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        _grid_scrolled_tree(frame, tree, vsb, hsb)
+        tree.configure(xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.columnconfigure(0, weight=1)
         self._wb_pipe_tree = tree
         self._wb_pipe_hsb = hsb
-        def fit_list(event):
-            rows = 2 if event.height < 450 else 4
-            if int(tree.cget("height")) != rows:
-                tree.configure(height=rows)
-        left_col.bind("<Configure>", fit_list, add=True)
-
         tree.bind("<<TreeviewSelect>>", self._wb_on_pipe_select)
         tree.bind("<Double-1>", self._wb_on_pipe_double)
         tree.bind("<ButtonPress-1>", self._wb_pipe_press)
         tree.bind("<B1-Motion>", self._wb_pipe_motion)
         tree.bind("<ButtonRelease-1>", self._wb_pipe_release)
 
-        self._wb_params_view = ScrollFrame(left_col)
-        self._wb_params_view.pack(fill="both", expand=True, pady=(0, 4))
-        self._wb_params_frame = self._wb_params_view.content
+        self._wb_params_view = self._wb_pipeline_view
+        self._wb_params_frame = ttk.Frame(left_col)
+        self._wb_params_frame.pack(fill="x", pady=(0, 4))
 
         # ---------- 右栏：统一附件（可折叠）+ 处理按钮 + 对应表 ----------
-        self._wb_right_view = ScrollFrame(right_col, stretch=True)
-        self._wb_right_view.pack(fill="both", expand=True)
-        right_col = self._wb_right_view.content
+        self._wb_right_view = self._wb_pipeline_view
         proc = ttk.LabelFrame(right_col, text=" 文件对应与处理日志 ", style="Card.TLabelframe")
         proc.pack(fill="both", expand=True)
         self._wb_process_btn = None
@@ -4196,11 +4200,9 @@ class App:
             self._wb_map_tree.heading(c, text=h)
             self._wb_map_tree.column(
                 c, width=130 if c == "name" else (180 if c in ("files", "paths") else 64))
-        mvsb = ttk.Scrollbar(mframe, orient="vertical", command=self._wb_map_tree.yview)
         mhsb = ttk.Scrollbar(mframe, orient="horizontal", command=self._wb_map_tree.xview)
-        self._wb_map_tree.configure(yscrollcommand=mvsb.set, xscrollcommand=mhsb.set)
+        self._wb_map_tree.configure(xscrollcommand=mhsb.set)
         self._wb_map_tree.grid(row=0, column=0, sticky="nsew")
-        mvsb.grid(row=0, column=1, sticky="ns")
         mhsb.grid(row=1, column=0, sticky="ew")
         mframe.rowconfigure(0, weight=1)
         mframe.columnconfigure(0, weight=1)
@@ -4221,9 +4223,6 @@ class App:
                                     font=("Consolas", 9), background=MORANDI_TOP,
                                     wrap="word")
         self._wb_pipe_log.pack(side="left", fill="both", expand=True)
-        log_scroll = ttk.Scrollbar(log_body, orient="vertical", command=self._wb_pipe_log.yview)
-        log_scroll.pack(side="right", fill="y")
-        self._wb_pipe_log.configure(yscrollcommand=log_scroll.set)
         self._wb_pipe_log.tag_configure("dup", foreground="#c25e00")
         self._wb_pipe_log.tag_configure("err", foreground="#b00000")
         self._wb_log_text = self._wb_pipe_log
@@ -4261,7 +4260,7 @@ class App:
         self._wb_item_params(f, item)
         _fit_labels(f)
         if previous_id != self._wb_params_item_id:
-            self._wb_params_view.canvas.yview_moveto(0)
+            self._wb_pipeline_view.ensure_visible(f)
 
     def _wb_flush_item_editor(self, save=False):
         editor = getattr(self, "_wb_param_editor", None)
@@ -4832,15 +4831,17 @@ class App:
                        command=lambda: self._wb_export_attach_path_template(item)).pack(side="left")
             table_frame = ttk.Frame(box)
             table_frame.pack(fill="x", padx=8, pady=4)
-            table = ttk.Treeview(table_frame, columns=("name", "paths"), show="headings", height=4)
+            table = ttk.Treeview(table_frame, columns=("name", "paths"), show="headings",
+                                 height=max(3, len((self._wb_event or {}).get("recipients") or [])))
             table.heading("name", text="收件人 / LP")
             table.heading("paths", text="对应文件路径")
             table.column("name", width=130)
             table.column("paths", width=360)
-            vbar=ttk.Scrollbar(table_frame,orient="vertical",command=table.yview)
             hbar=ttk.Scrollbar(table_frame,orient="horizontal",command=table.xview)
-            table.configure(yscrollcommand=vbar.set,xscrollcommand=hbar.set)
-            _grid_scrolled_tree(table_frame,table,vbar,hbar)
+            table.configure(xscrollcommand=hbar.set)
+            table.grid(row=0,column=0,sticky="nsew")
+            hbar.grid(row=1,column=0,sticky="ew")
+            table_frame.columnconfigure(0,weight=1)
             for recipient in (self._wb_event or {}).get("recipients") or []:
                 paths, _ = lp_v3.resolve_item_paths(item,{"rep":recipient},self._wb_event)
                 table.insert("","end",values=(recipient.get("name",""), "; ".join(paths)))
@@ -4849,8 +4850,9 @@ class App:
             row = ttk.Frame(box)
             row.pack(fill="x",padx=8,pady=4)
             ttk.Label(row,text="PDF文件：" if variant=="pdf" else "文件（不转PDF时按原格式附加）：").pack(anchor="w")
-            files_text=_path_text(row,4)
+            files_text=_path_text(row,3,unified=True)
             for path in params.get("files") or []: files_text.insert("end",str(path)+"\n")
+            _fit_path_text_height(files_text)
             self._wb_param_editor["files"]=files_text
             buttons=WrapFrame(row)
             buttons.pack(fill="x")
@@ -5029,18 +5031,16 @@ class App:
                  "预览值（以「%s」为例）" % (rec0.get("name") or "第一位收件人")]
         tframe = ttk.Frame(parent)
         tframe.pack(fill="both", expand=True, padx=8, pady=4)
-        tree = ttk.Treeview(tframe, columns=cols, show="headings", height=7,
+        tree = ttk.Treeview(tframe, columns=cols, show="headings", height=max(3, len(rows)),
                             selectmode="extended")
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
         tree.column("ph", width=170)
         tree.column("src", width=190)
         tree.column("val", width=180)
-        tvsb = ttk.Scrollbar(tframe, orient="vertical", command=tree.yview)
         thsb = ttk.Scrollbar(tframe, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=tvsb.set, xscrollcommand=thsb.set)
+        tree.configure(xscrollcommand=thsb.set)
         tree.grid(row=0, column=0, sticky="nsew")
-        tvsb.grid(row=0, column=1, sticky="ns")
         thsb.grid(row=1, column=0, sticky="ew")
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
@@ -5270,6 +5270,7 @@ class App:
         tw.delete("1.0", "end")
         for p in files:
             tw.insert("end", p + "\n")
+        _fit_path_text_height(tw)
         self._wb_fill_pipe_table(keep_sel=item.get("id"))
 
     def _wb_add_attach_files(self, item, tw):
@@ -5567,6 +5568,19 @@ class App:
 
     # ---------- 步骤 4：邮件模板 ----------
 
+    def _subject_field_menu(self, parent, entry):
+        button = ttk.Menubutton(parent, text="字段 ▾")
+        menu = tk.Menu(button, tearoff=False)
+        for field in FIELDS:
+            menu.add_command(label=field, command=lambda value=field: entry.insert("insert", value))
+        for name in self._wb_field_columns():
+            value = "{{%s}}" % name
+            if value not in FIELDS:
+                menu.add_command(label=value, command=lambda v=value: entry.insert("insert", v))
+        button.configure(menu=menu)
+        button.pack(side="left")
+        return button
+
     def _wb_step_mail(self, parent):
         viewport = ScrollFrame(parent, stretch=True)
         viewport.pack(fill="both", expand=True)
@@ -5582,8 +5596,9 @@ class App:
         top.pack(fill="x", pady=2)
         ttk.Label(top, text="主题：").pack(side="left")
         self.mail_subject_var = tk.StringVar(value=mail.get("subject", ""))
-        ttk.Entry(top, textvariable=self.mail_subject_var, width=24).pack(
-            side="left", fill="x", expand=True, padx=4)
+        subject_entry = ttk.Entry(top, textvariable=self.mail_subject_var, width=24)
+        subject_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self._subject_field_menu(top, subject_entry)
 
         row2 = ttk.Frame(parent)
         row2.pack(fill="x", pady=2)
@@ -5628,7 +5643,7 @@ class App:
         ttk.Button(bot, text="导入HTML文件…", command=self._wb_import_html).pack(side="left", padx=6)
         ttk.Button(bot, text="恢复默认", command=self._wb_reset_mail).pack(side="left")
         ttk.Label(bot, foreground="#888", text=(
-            "可用字段：收件人名称 / 水印名称 / 打开口令 / 日期"
+            "可用字段：收件人名称 / 合并组 / 水印名称 / 打开口令 / 日期"
             " + 收件人自定义字段 + 事件常量（无权限口令字段）")).pack(side="left", padx=8)
 
         self._suppress_dirty = True
@@ -5817,8 +5832,9 @@ class App:
         ttk.Label(subj, text="主题：").pack(side="left")
         self._ov_subject_var = tk.StringVar(value="")
         self._ov_subject_var.trace_add("write", self._mark_active_dirty)
-        ttk.Entry(subj, textvariable=self._ov_subject_var, width=46).pack(
-            side="left", fill="x", expand=True, padx=4)
+        subject_entry = ttk.Entry(subj, textvariable=self._ov_subject_var, width=10)
+        subject_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self._subject_field_menu(subj, subject_entry)
 
         self._build_editor_toolbar(rightpane, compact=True)
 
@@ -5898,7 +5914,7 @@ class App:
         ev = self._wb_event
         mail = ev.get("mail") or {}
         rep = unit.get("rep") or {}
-        fmap = lp_v3.build_field_map(rep, ev)
+        fmap = lp_v3.build_mail_field_map(unit, ev)
         owner_pw = rep.get("owner_pw", "")
         base_subject = mail.get("subject") or DEFAULT_SUBJECT
         base_body = mail.get("body") or DEFAULT_BODY
@@ -5949,7 +5965,7 @@ class App:
             _k, unit, names = rows[idx]
             mail = ev.get("mail") or {}
             rep = unit.get("rep") or {}
-            fmap = lp_v3.build_field_map(rep, ev)
+            fmap = lp_v3.build_mail_field_map(unit, ev)
             owner_pw = rep.get("owner_pw", "")
             self._ov_subject_var.set(lp_v3.render_with_fields(
                 mail.get("subject") or DEFAULT_SUBJECT, fmap, owner_pw))
@@ -6889,6 +6905,8 @@ class App:
                     "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
                 box.configure(state="normal")
                 box.insert("end", line + "\n", tag)
+                if box is getattr(self, "_wb_pipe_log", None):
+                    box.configure(height=max(6, int(box.index("end-1c").split(".")[0])))
                 box.see("end")
                 box.configure(state="disabled")
             except Exception:

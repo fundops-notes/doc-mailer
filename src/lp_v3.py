@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.6"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.7"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -1902,6 +1902,23 @@ def build_field_map(recipient, event=None, sheet_row=None):
     return out
 
 
+def build_mail_field_map(unit, event=None):
+    """邮件字段按实际发送单元解析，未分组时可回退收件人名称。"""
+    unit = unit or {}
+    rec = unit.get("rep") or {}
+    fields = build_field_map(rec, event)
+    group = str(unit.get("group") or "").strip()
+    fallback = group or str(rec.get("name") or "")
+    secrets = [((event or {}).get("options") or {}).get("gp_owner_pw", "")]
+    secrets += [r.get("owner_pw", "") for r in (event or {}).get("recipients") or []]
+    for secret in secrets:
+        group = scrub_owner_password(group, secret)
+        fallback = scrub_owner_password(fallback, secret)
+    fields["{{合并组}}"] = group
+    fields["{{合并组或收件人名称}}"] = fallback
+    return fields
+
+
 def scrub_owner_password(text, owner_pw):
     """兜底：把权限口令明文从任何将进入邮件/文档的文本里抹掉。"""
     if not owner_pw:
@@ -3304,7 +3321,7 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
                 try:
                     for path in files:
                         _check_attachment_name(Path(path).name, event)
-                    fmap = build_field_map(rep, event)
+                    fmap = build_mail_field_map(unit, event)
                     rec = dict(rep)
                     rec["to"] = ";".join(_merge_addresses(unit["recipients"], "to"))
                     rec["cc"] = ";".join(_merge_addresses(unit["recipients"], "cc",

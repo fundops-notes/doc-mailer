@@ -1975,3 +1975,10 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - exe 48,409,096 B 签名Valid，单文件隔离启动退出0；开发数据32文件、Linear客户端385文件哈希未变；WINWORD=0。证据开发根验收_v3.9.6/及修复与发布报告_v3.9.6.md。
 - v3.9.6 已发布：tag/commit df1a4f1cfef35bb1b148fd4f9d5192fac72ccb0d；CI 40508202395 success；Release id 425466458。两资产重新下载SHA256与本地/GitHub一致、ZIP完整且无用户数据；下载exe签名Valid，证书指纹9106B492E4A041627FDA67A389BA23474475A26E。
 - 便携包 SHA256 CC4F185DDCE883F4F67955BD6E0D1F8C591CF5BC5D89A2EA35A1A2A3F3D95F4C；win64包 SHA256 21AF4A6EA4C5BC2B0AC6532369EFEBCD4DAB36595D025E2F6E5468D536F791C6。
+
+
+§49 v3.9.7 合并组字段与流水线布局（2026-10-28）
+邮件主题和正文支持合并组及合并组或收件人名称字段；流水线两栏共享纵向滚动。
+本地验证：pytest 407 passed；真实 Tk/Office E2E 79 PASS / 0 FAIL，标签界面 27 PASS，隔离更新 16 项通过；fake Outlook 仅保存草稿。签名 Valid，隔离 exe 启动通过。
+LCCP I 用户事件先备份后仅更新流水线，15 人 PCAP 对应；9 封模拟草稿附件哈希匹配。共享盘本机不可访问、正式管理人信缺失；地址、分组与模板未改。
+发布状态以 Release 和后续记录为准。

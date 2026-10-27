@@ -90,7 +90,7 @@ def test_all_parameter_controls_reachable(layout_app, size, kind):
     assert view.canvas.yview()[1] == pytest.approx(1)
 
 
-def test_switching_item_rebuilds_scroll_region_and_resets_top(layout_app):
+def test_switching_item_rebuilds_scroll_region_and_reveals_params(layout_app):
     a, attach, generate = layout_app
     a.root.geometry('960x620')
     a._wb_show_step(1)
@@ -99,7 +99,7 @@ def test_switching_item_rebuilds_scroll_region_and_resets_top(layout_app):
     assert view.content.winfo_height() >= view.content.winfo_reqheight() - 1
     view.canvas.yview_moveto(1)
     choose(a, attach)
-    assert view.canvas.yview()[0] == pytest.approx(0)
+    assert view.canvas.winfo_rooty() <= a._wb_params_frame.winfo_rooty() < view.canvas.winfo_rooty() + view.canvas.winfo_height()
     choose(a, generate)
     assert view.content.winfo_height() >= view.content.winfo_reqheight() - 1
     assert view.content.winfo_height() > view.canvas.winfo_height()
@@ -137,20 +137,21 @@ def test_scroll_bindings_are_removed_on_destroy(layout_app):
     assert active(a.root.bind('<MouseWheel>')) == active(before)
 
 
-def test_path_text_wheel_does_not_scroll_both_text_and_form(layout_app):
+def test_path_text_wheel_scrolls_shared_form(layout_app):
     a, attach, _ = layout_app
     a.root.geometry('960x620')
     a._wb_show_step(1)
     choose(a, attach)
     text=next(w for w in _walk(a._wb_params_frame) if w.winfo_class()=='Text')
     text.insert('end','\n'.join('C:/test/file%d.pdf'%i for i in range(50)))
+    settle(a)
     a._wb_params_view.ensure_visible(text)
     settle(a)
     before=a._wb_params_view.canvas.yview()
     text.event_generate('<MouseWheel>',delta=-120)
     settle(a)
-    assert text.yview()[0]>0
-    assert a._wb_params_view.canvas.yview()==before
+    assert text.yview()[0]==pytest.approx(0)
+    assert a._wb_params_view.canvas.yview()[0]>before[0]
 
 
 def test_path_box_has_working_horizontal_scroll_and_full_width_tree_bar(layout_app):
@@ -219,5 +220,5 @@ def test_process_reveals_progress_log_on_current_page(layout_app, monkeypatch, t
     settle(a)
     assert a._wb_step==1
     assert visible(a._wb_pipe_log)
-    assert str(a._wb_pipe_log.cget('yscrollcommand'))
+    assert not str(a._wb_pipe_log.cget('yscrollcommand'))
     a.running=False
