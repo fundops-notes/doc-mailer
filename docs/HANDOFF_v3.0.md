@@ -1984,3 +1984,7 @@ LCCP I 用户事件先备份后仅更新流水线，15 人 PCAP 对应；9 封�
 发布状态以 Release 和后续记录为准。
 
 CI 40539347577 success；Release 425703843。两资产重新下载与本地 SHA256 一致：便携包 AD54978B03CC0DF331CB4415E40BF3C84E6BE3DB770DACB6F5FFA2FB609362E2，win64 包 4C97AC15D439EE33CEBD22A53B4DA0CCE953CD28D35023D0059217E25211042C；下载 exe 签名 Valid。
+
+
+§50 v3.9.8 Excel LP 对应表（2026-10-28）
+切换条目仅在参数顶部不可见时定位顶部；对应表可导出当前路径，横向滚动条移至表格上方。全量测试 408 passed，真实 Tk/Office E2E 79 PASS / 0 FAIL，模拟 Outlook。签名 Valid。发布状态以 CI 和资产校验为准。

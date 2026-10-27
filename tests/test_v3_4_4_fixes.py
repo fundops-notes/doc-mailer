@@ -167,8 +167,8 @@ def _save_event(app, name, recips, pipeline=None):
 
 
 def test_version_is_381():
-    assert lp_tool.APP_VERSION == "3.9.7"
-    assert lp_v3.APP_VERSION == "3.9.7"
+    assert lp_tool.APP_VERSION == "3.9.8"
+    assert lp_v3.APP_VERSION == "3.9.8"
 
 
 def test_recipient_table_values_match_columns_and_mask(app, tmp_path):
@@ -330,7 +330,7 @@ def test_attach_item_has_path_template_export(app, tmp_path):
     tree = a._wb_pipe_tree
     tree.selection_set(tree.get_children()[0])
     a.root.update()
-    assert any("导出对应模板" in t for t, _b in _buttons(a._wb_content))
+    assert any("导出当前对应表" in t for t, _b in _buttons(a._wb_content))
     out = tmp_path / "路径模板.xlsx"
     fd.save_path = str(out)
     a._wb_export_attach_path_template(a._wb_event["pipeline"][0])

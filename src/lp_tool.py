@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.7"
+APP_VERSION = "3.9.8"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -4260,7 +4260,17 @@ class App:
         self._wb_item_params(f, item)
         _fit_labels(f)
         if previous_id != self._wb_params_item_id:
-            self._wb_pipeline_view.ensure_visible(f)
+            def reveal_header():
+                if not f.winfo_exists():
+                    return
+                view = self._wb_pipeline_view
+                view.update_idletasks()
+                view._resize()
+                y = f.winfo_rooty() - view.content.winfo_rooty()
+                top = view.canvas.canvasy(0)
+                if y < top or y >= top + view.canvas.winfo_height():
+                    view.canvas.yview_moveto(max(0, y - 4) / max(1, view.content.winfo_height()))
+            f.after_idle(reveal_header)
 
     def _wb_flush_item_editor(self, save=False):
         editor = getattr(self, "_wb_param_editor", None)
@@ -4741,15 +4751,12 @@ class App:
             unit = {"rep": rec, "recipients": [rec],
                     "lp_name": rec.get("name", ""), "group_key": rec.get("name", ""),
                     "group": (rec.get("group") or "").strip()}
-            try:
-                paths, _label = lp_v3.resolve_item_paths(item, unit, ev)
-            except Exception:
-                paths = []
+            paths, _label = lp_v3.resolve_item_paths(item, unit, ev)
             rows.append([rec.get("name", ""), ";".join(str(p) for p in paths)])
         self._write_xlsx_sheets(
-            "附件路径模板_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 30),
+            "附件对应表_%s.xlsx" % sanitize_filename(ev.get("name", "事件"), 30),
             [("附件路径", rows, [30, 80])],
-            "路径模板已导出",
+            "对应表已导出",
             "已导出 %d 位收件人的附件路径。\n"
             "手填路径条目所有人相同；按「收件人附件/字段/外部表」取值的会逐人不同。"
             % (len(rows) - 1))
@@ -4827,7 +4834,7 @@ class App:
             buttons.pack(fill="x", padx=8, pady=4)
             ttk.Button(buttons, text="导入对应清单…",
                        command=lambda: self._wb_import_attach_paths(item, None)).pack(side="left")
-            ttk.Button(buttons, text="导出对应模板",
+            ttk.Button(buttons, text="导出当前对应表",
                        command=lambda: self._wb_export_attach_path_template(item)).pack(side="left")
             table_frame = ttk.Frame(box)
             table_frame.pack(fill="x", padx=8, pady=4)
@@ -4835,12 +4842,12 @@ class App:
                                  height=max(3, len((self._wb_event or {}).get("recipients") or [])))
             table.heading("name", text="收件人 / LP")
             table.heading("paths", text="对应文件路径")
-            table.column("name", width=130)
-            table.column("paths", width=360)
+            table.column("name", width=260, stretch=False)
+            table.column("paths", width=900, stretch=False)
             hbar=ttk.Scrollbar(table_frame,orient="horizontal",command=table.xview)
             table.configure(xscrollcommand=hbar.set)
-            table.grid(row=0,column=0,sticky="nsew")
-            hbar.grid(row=1,column=0,sticky="ew")
+            hbar.grid(row=0,column=0,sticky="ew")
+            table.grid(row=1,column=0,sticky="nsew")
             table_frame.columnconfigure(0,weight=1)
             for recipient in (self._wb_event or {}).get("recipients") or []:
                 paths, _ = lp_v3.resolve_item_paths(item,{"rep":recipient},self._wb_event)

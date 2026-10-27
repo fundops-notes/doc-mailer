@@ -92,3 +92,30 @@ def test_subject_and_body_field_menus_insert_group(app):
     i=next(i for i in range(menu.index('end')+1) if menu.entrycget(i,'label')=='{{合并组}}')
     menu.invoke(i)
     assert '{{合并组}}' in app.body_text.get('1.0','end')
+
+
+def test_excel_mapping_export_scroll_and_selection_position(app, monkeypatch):
+    app._wb_show_step(1)
+    for _ in range(5): app.root.update()
+    item=app._wb_event['pipeline'][0]
+    item['params']['path_source']='item.paths'
+    item['params']['path_map']={'R0':['C:/reports/a.pdf','C:/reports/b.pdf']}
+    app._wb_render_params(item)
+    for _ in range(5): app.root.update()
+    table=app._wb_excel_table
+    assert table.xview()[1] < 1
+    bar=next(w for w in table.master.winfo_children() if isinstance(w,ttk.Scrollbar))
+    assert int(bar.grid_info()['row']) < int(table.grid_info()['row'])
+    table.xview_moveto(1); app.root.update()
+    assert table.xview()[0] > 0
+    exported=[]
+    monkeypatch.setattr(app,'_write_xlsx_sheets',lambda *args:exported.append(args))
+    button=next(w for w in walk(app._wb_content) if isinstance(w,ttk.Button) and w.cget('text')=='导出当前对应表')
+    button.invoke()
+    rows=exported[0][1][0][1]
+    assert rows[0]==['收件人名称','附件路径'] and rows[1]==['R0','C:/reports/a.pdf;C:/reports/b.pdf']
+    view=app._wb_pipeline_view.canvas
+    view.yview_moveto(0);app.root.update()
+    app._wb_params_item_id='other';app._wb_render_params(item)
+    for _ in range(6):app.root.update()
+    assert view.yview()[0] < 0.1
