@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.4"
+APP_VERSION = "3.9.5"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -2838,8 +2838,9 @@ class App:
              "导出一份带表头、示例行和「填写说明」页的 Excel。"),
             ("导出本事件收件人", self._wb_export_recipients,
              "把当前事件的收件人清单导出成 Excel。"),
-            ("新增", self._wb_edit_recipient, "手工添加一位收件人。"),
+            ("新增", self._wb_add_recipient, "手工添加一位收件人。"),
             ("编辑", self._wb_edit_recipient, "编辑选中的收件人（也可直接双击行）。"),
+            ("复制", self._wb_copy_recipient, "复制选中的一位收件人，核对后新增。"),
             ("删除", self._wb_delete_recipients, "删除选中的收件人（可多选）。"),
         ]
         secondary = [
@@ -3354,7 +3355,7 @@ class App:
             field_entries = {}
             ttk.Label(win, text=(no_field_hint or
                                  "自定义字段由 Excel/要素模板导入，这里不显示、不修改。"),
-                      foreground="#888").grid(row=r0, column=1, sticky="w", padx=6)
+                      foreground="#888", wraplength=420, justify="left").grid(row=r0, column=1, sticky="w", padx=6)
 
         def ok():
             out = {k: e.get().strip() for k, e in entries.items()}
@@ -3379,28 +3380,60 @@ class App:
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
         return win
 
+    def _wb_add_recipient(self):
+        self._wb_recipient_action("add")
+
     def _wb_edit_recipient(self):
+        self._wb_recipient_action("edit")
+
+    def _wb_copy_recipient(self):
+        self._wb_recipient_action("copy")
+
+    def _wb_recipient_action(self, action):
         tree = getattr(self, "_wb_rec_tree", None)
         ev = self._wb_event
         sel = tree.selection() if tree else ()
-        rec = dict(ev["recipients"][tree.index(sel[0])]) if sel else {
-            "name": "", "wm": "", "to": "", "cc": "", "bcc": "",
-            "open_pw": gen_pw(), "owner_pw": gen_pw(), "fields": {},
-            "attachments": [], "group": ""}
+        if action != "add" and len(sel) != 1:
+            messagebox.showinfo("请选择收件人", "请先选择一位收件人，再%s。" % ("编辑" if action == "edit" else "复制"))
+            return
+        index = tree.index(sel[0]) if action != "add" else None
+        if action == "add":
+            rec = {"name": "", "wm": "", "to": "", "cc": "", "bcc": "",
+                   "open_pw": gen_pw(), "owner_pw": gen_pw(), "fields": {},
+                   "attachments": [], "group": ""}
+        else:
+            rec = dict(ev["recipients"][index])
+            if action == "copy":
+                existing = {r.get("name", "").strip() for r in ev["recipients"]}
+                base = (rec.get("name") or "收件人") + "（副本）"
+                name, number = base, 2
+                while name in existing:
+                    name = "%s%d" % (base, number)
+                    number += 1
+                rec["name"] = name
 
         def save(out):
-            if sel:
-                ev["recipients"][tree.index(sel[0])] = out
+            if action != "edit" and any(r.get("name", "").strip() == out["name"] for r in ev["recipients"]):
+                messagebox.showwarning("名称重复", "事件中已有该收件人名称，请使用不同名称。")
+                return False
+            if action == "edit":
+                previous = ev["recipients"][index]
+                ev["recipients"][index] = out
             else:
                 ev["recipients"].append(out)
-            self._wb_save()
+            if not self._wb_save():
+                if action == "edit":
+                    ev["recipients"][index] = previous
+                else:
+                    ev["recipients"].pop()
+                return False
             self._wb_show_step(self._wb_step)
             return True
 
         self._recipient_dialog(
-            rec, [],
-            "编辑收件人" if sel else "新增收件人", save,
-            "自定义字段由 Excel/要素模板导入，这里不显示、不修改。")
+            rec, [], {"add": "新增收件人", "edit": "编辑收件人", "copy": "复制收件人"}[action], save,
+            ("复制会带入原地址、口令和事件字段；请核对地址、口令及专属文件对应。" if action == "copy"
+             else "自定义字段由 Excel/要素模板导入，这里不显示、不修改。"))
 
     def _wb_add_from_pool(self):
         """从收件人库挑人加进当前事件。"""
