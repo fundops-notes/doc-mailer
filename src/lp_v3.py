@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.5"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.6"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -2844,7 +2844,7 @@ def preflight(event, store=None):
             seen_pw.setdefault(r["open_pw"], []).append(tag)
     for _pw, names in seen_pw.items():
         if len(names) > 1:
-            errors.append("打开口令重复（%s）：同一口令可打开对方文件" % "、".join(names))
+            warnings.append("打开口令重复（%s）：同一口令可打开对方文件" % "、".join(names))
 
     # --- GP 统一口令冲突 ---
     gp = opts.get("gp_owner_pw") if opts.get("gp_owner_mode") else ""

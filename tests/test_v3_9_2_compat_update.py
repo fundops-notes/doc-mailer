@@ -271,6 +271,9 @@ def test_native_installer_backup_copy_and_failure_restore(tmp_path, fail_install
     (source/'a.py').write_bytes(b'new program')
     data=base/'lp_data'/'events';data.mkdir(parents=True)
     (data/'event.json').write_bytes(b'private original')
+    history=base/'lp_data'/'backups';history.mkdir();(history/'historic.json').write_bytes(b'old backup')
+    old_update=base/'.update_backups'/'old';old_update.mkdir(parents=True);(old_update/'keep.txt').write_bytes(b'previous backup')
+    (base/'lp_data.json.bak').write_bytes(b'legacy backup')
     seed=base/'lp_data.example.json';seed.write_bytes(b'user seed')
     (source/'lp_data.example.json').write_bytes(b'new seed must not overwrite')
     if fail_install:
@@ -283,8 +286,51 @@ def test_native_installer_backup_copy_and_failure_restore(tmp_path, fail_install
     assert result['success'] is not fail_install, (run.stdout,run.stderr)
     assert (data/'event.json').read_bytes()==b'private original' and seed.read_bytes()==b'user seed'
     assert current.read_bytes()==(b'old program' if fail_install else b'new program')
-    assert (Path(result['backup'])/'program'/'a.py').read_bytes()==b'old program'
+    program_backup=Path(result['backup'])/'program'/'a.py'
+    if fail_install:
+        assert program_backup.read_bytes()==b'old program'
+    else:
+        assert not program_backup.exists() and result['program_backup_removed']
     assert (Path(result['backup'])/'lp_data'/'events'/'event.json').read_bytes()==b'private original'
+    assert (Path(result['backup'])/'legacy'/'lp_data.json.bak').read_bytes()==b'legacy backup'
+    assert (history/'historic.json').read_bytes()==b'old backup'
+    assert not (Path(result['backup'])/'lp_data'/'backups').exists()
+    assert (old_update/'keep.txt').read_bytes()==b'previous backup'
+
+
+def test_installer_hash_mismatch_rolls_back_and_retains_backup(tmp_path):
+    base=tmp_path/'app';base.mkdir()
+    source=base/'.update_staging'/'app';source.mkdir(parents=True)
+    (base/'a.py').write_bytes(b'old program');(source/'a.py').write_bytes(b'new program')
+    data=base/'lp_data'/'events';data.mkdir(parents=True);(data/'event.json').write_bytes(b'unchanged')
+    helper=lp_tool._write_update_helper(base,source)
+    script=helper.read_text(encoding='utf-8-sig')
+    needle="    $index=0\n    foreach ($file in $files) {\n        $relative=$file.FullName.Substring($source.Length+1);$target=Destination $relative\n        if ((FileHash"
+    assert needle in script
+    helper.write_text(script.replace(needle,"    Set-Content -LiteralPath (Join-Path $root 'a.py') -Value 'tampered'\n"+needle,1),encoding='utf-8-sig')
+    run=subprocess.run(['powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',str(helper),
+                        '-WaitProcessId','0','-NoUi','-NoRestart'],capture_output=True,text=True,timeout=30)
+    receipt=json.loads((base/'.update_result.json').read_text(encoding='utf-8-sig'))
+    assert run.returncode != 0 and not receipt['success']
+    assert (base/'a.py').read_bytes()==b'old program'
+    assert (Path(receipt['backup'])/'program'/'a.py').read_bytes()==b'old program'
+    assert (data/'event.json').read_bytes()==b'unchanged'
+
+
+def test_installer_dependency_check_failure_rolls_back(tmp_path):
+    base=tmp_path/'app';base.mkdir()
+    source=base/'.update_staging'/'app';source.mkdir(parents=True)
+    (base/'lp_tool.py').write_bytes(b'old program')
+    (source/'lp_tool.py').write_bytes(b'new program')
+    data=base/'lp_data'/'events';data.mkdir(parents=True);(data/'event.json').write_bytes(b'unchanged')
+    helper=lp_tool._write_update_helper(base,source)
+    run=subprocess.run(['powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',str(helper),
+                        '-WaitProcessId','0','-NoUi','-NoRestart'],capture_output=True,text=True,timeout=30)
+    receipt=json.loads((base/'.update_result.json').read_text(encoding='utf-8-sig'))
+    assert run.returncode != 0 and not receipt['success']
+    assert (base/'lp_tool.py').read_bytes()==b'old program'
+    assert (Path(receipt['backup'])/'program'/'lp_tool.py').read_bytes()==b'old program'
+    assert (data/'event.json').read_bytes()==b'unchanged'
 
 
 @pytest.mark.parametrize('extension', ['.xlsx', '.pptx'])

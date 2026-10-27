@@ -46,17 +46,18 @@ def test_preflight_blocks_on_empty_recipients():
     assert info["recipients"] == 0
 
 
-def test_preflight_blocks_missing_and_duplicate_passwords():
+def test_preflight_blocks_missing_and_matching_owner_but_warns_duplicate_open():
     ev = _event(recips=[
         {"name": "甲", "to": "a@x.com", "open_pw": "", "owner_pw": "ow1"},
         {"name": "乙", "to": "b@x.com", "open_pw": "same", "owner_pw": "same"},
         {"name": "丙", "to": "c@x.com", "open_pw": "dup", "owner_pw": "ow3"},
         {"name": "丁", "to": "d@x.com", "open_pw": "dup", "owner_pw": "ow4"},
     ])
-    errors, _w, _i = preflight(ev)
+    errors, warnings, _i = preflight(ev)
     assert any("打开口令为空" in e for e in errors)
     assert any("相同" in e for e in errors)
-    assert any("重复" in e for e in errors)
+    assert any("打开口令重复" in w for w in warnings)
+    assert not any("打开口令重复" in e for e in errors)
 
 
 def test_preflight_gp_password_conflict():

@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.5"
+APP_VERSION = "3.9.6"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -128,7 +128,8 @@ $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath($PSScriptRoot)
 $staging=Join-Path $root '.update_staging'
 $source=Join-Path $root '__SOURCE__'
-$backup=Join-Path $root ('.update_backups\'+(Get-Date -Format 'yyyyMMdd_HHmmss_ffff'))
+$backupRoot=Join-Path $root '.update_backups'
+$backup=Join-Path $backupRoot (Get-Date -Format 'yyyyMMdd_HHmmss_ffff')
 $form=$null
 $restored=New-Object 'System.Collections.Generic.List[string]'
 $created=New-Object 'System.Collections.Generic.List[string]'
@@ -141,6 +142,12 @@ function Destination([string]$relative) {
     $target=[IO.Path]::GetFullPath((Join-Path $root $relative))
     if (-not $target.StartsWith($root+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw '更新文件路径越界' }
     return $target
+}
+function FileHash([string]$path) {
+    $sha=[Security.Cryptography.SHA256]::Create()
+    $stream=[IO.File]::OpenRead($path)
+    try { return [Convert]::ToBase64String($sha.ComputeHash($stream)) }
+    finally { $stream.Dispose(); $sha.Dispose() }
 }
 function Progress([string]$stage,[int]$value) {
     if ($script:lastProgress -ne $value) {
@@ -185,12 +192,37 @@ try {
     }
     while ($WaitProcessId -gt 0 -and (Get-Process -Id $WaitProcessId -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 150; Progress '等待程序退出…' 0 }
     $source=[IO.Path]::GetFullPath($source)
-    if (-not $source.StartsWith($staging,[StringComparison]::OrdinalIgnoreCase)) { throw '更新来源目录越界' }
+    if (-not $source.StartsWith($staging+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw '更新来源目录越界' }
     $files=@(Get-ChildItem -LiteralPath $source -Recurse -File | Where-Object { -not (Protected $_.FullName.Substring($source.Length+1)) })
     if (-not $files.Count) { throw '更新包没有程序文件' }
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
     $data=Join-Path $root 'lp_data'
-    if (Test-Path -LiteralPath $data) { Copy-Item -LiteralPath $data -Destination (Join-Path $backup 'lp_data') -Recurse -Force }
+    $dataFiles=New-Object 'System.Collections.Generic.List[object]'
+    if (Test-Path -LiteralPath $data) {
+        $dataFull=[IO.Path]::GetFullPath($data)
+        foreach ($child in @(Get-ChildItem -LiteralPath $data -Force)) {
+            if ($child.Name -eq 'backups') { continue } # 原有历史备份保留在原位置，不重复嵌套复制
+            $entries=if ($child.PSIsContainer) { @(Get-ChildItem -LiteralPath $child.FullName -Recurse -File -Force) } else { @($child) }
+            foreach ($entry in $entries) {
+                $relative=$entry.FullName.Substring($dataFull.Length+1)
+                $saved=Join-Path (Join-Path $backup 'lp_data') $relative
+                New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($saved)) -Force | Out-Null
+                Copy-Item -LiteralPath $entry.FullName -Destination $saved -Force
+                if ((FileHash $entry.FullName) -ne (FileHash $saved)) { throw '核心数据备份校验失败' }
+                $dataFiles.Add(@{original=$entry.FullName;copy=$saved})
+            }
+        }
+    }
+    foreach ($name in @('lp_data.json','lp_data.json.bak','lp_data.json.tmp','lp_run_log.csv')) {
+        $original=Join-Path $root $name
+        if (Test-Path -LiteralPath $original -PathType Leaf) {
+            $saved=Join-Path (Join-Path $backup 'legacy') $name
+            New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($saved)) -Force | Out-Null
+            Copy-Item -LiteralPath $original -Destination $saved -Force
+            if ((FileHash $original) -ne (FileHash $saved)) { throw '旧数据备份校验失败' }
+            $dataFiles.Add(@{original=$original;copy=$saved})
+        }
+    }
     $index=0
     foreach ($file in $files) {
         $relative=$file.FullName.Substring($source.Length+1); $target=Destination $relative
@@ -210,14 +242,48 @@ try {
         New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force | Out-Null
         Copy-Item -LiteralPath $file.FullName -Destination $target -Force
         if (-not $existed) { $created.Add($relative) }
-        $index++; Progress ('正在安装 '+$index+'/'+$files.Count) (30+[int](70*$index/$files.Count))
+        $index++; Progress ('正在安装 '+$index+'/'+$files.Count) (30+[int](55*$index/$files.Count))
     }
-    @{success=$true;backup=$backup;files=$files.Count} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root '.update_result.json') -Encoding UTF8
+    $index=0
+    foreach ($file in $files) {
+        $relative=$file.FullName.Substring($source.Length+1);$target=Destination $relative
+        if ((FileHash $file.FullName) -ne (FileHash $target)) { throw '安装文件校验失败' }
+        $index++; Progress ('校验安装文件 '+$index+'/'+$files.Count) (85+[int](13*$index/$files.Count))
+    }
+    foreach ($entry in $dataFiles) {
+        if (-not (Test-Path -LiteralPath $entry.original -PathType Leaf) -or
+            (FileHash $entry.original) -ne (FileHash $entry.copy)) { throw '用户数据在安装期间发生变化，已停止更新' }
+    }
+    if (Test-Path -LiteralPath (Join-Path $root 'lp_tool.py') -PathType Leaf) {
+        Progress '正在检查新版程序依赖…' 99
+        $python=Join-Path $root 'runtime\python.exe'
+        if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw '新版运行库缺少 Python，已停止更新' }
+        $check=Start-Process -FilePath $python -ArgumentList @('-E','-s','-B','-c','"import lp_tool,lp_v3; assert lp_tool.APP_VERSION==lp_v3.APP_VERSION"') -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
+        if ($check.ExitCode -ne 0) { throw '新版程序依赖检查失败，已停止更新' }
+    }
     # Only the explicitly named staging directory may be removed.
     if ([IO.Path]::GetFullPath($staging) -ne (Join-Path $root '.update_staging')) { throw '清理目录校验失败' }
     Remove-Item -LiteralPath $staging -Recurse -Force
+    $receipt=@{success=$true;backup=$backup;files=$files.Count;core_data_files=$dataFiles.Count;program_backup_removed=$false;cleanup_error=''}
+    $receipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root '.update_result.json') -Encoding UTF8
+    # 安装与数据均已核验；只清理本次备份内的 program，保留核心数据和所有旧备份。
+    try {
+        $programBackup=[IO.Path]::GetFullPath((Join-Path $backup 'program'))
+        $backupFull=[IO.Path]::GetFullPath($backup);$backupRootFull=[IO.Path]::GetFullPath($backupRoot)
+        if (-not $backupFull.StartsWith($backupRootFull+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase) -or
+            $programBackup -ne (Join-Path $backupFull 'program')) { throw '程序备份路径校验失败' }
+        if (((Get-Item -LiteralPath $backupRootFull -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            ((Get-Item -LiteralPath $backupFull -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw '备份目录包含重解析点' }
+        if (Test-Path -LiteralPath $programBackup) {
+            $links=@(Get-Item -LiteralPath $programBackup -Force; Get-ChildItem -LiteralPath $programBackup -Recurse -Force) | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+            if ($links) { throw '程序备份包含重解析点' }
+            Remove-Item -LiteralPath $programBackup -Recurse -Force
+        }
+        $receipt.program_backup_removed=$true
+    } catch { $receipt.cleanup_error=$_.Exception.Message }
+    try { $receipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root '.update_result.json') -Encoding UTF8 } catch { }
     Progress '更新完成，正在重新启动…' 100
-    if (-not $NoRestart) { Start-Process -FilePath (Join-Path $root 'start.bat') -WorkingDirectory $root -WindowStyle Hidden }
+    if (-not $NoRestart) { try { Start-Process -FilePath (Join-Path $root 'start.bat') -WorkingDirectory $root -WindowStyle Hidden } catch { } }
 } catch {
     $failure=$_.Exception.Message
     foreach ($relative in $restored) { Copy-Item -LiteralPath (Join-Path (Join-Path $backup 'program') $relative) -Destination (Destination $relative) -Force -ErrorAction SilentlyContinue }
@@ -1037,13 +1103,13 @@ class App:
                         font=(SAAS_FONT, 18, "bold"))
         style.configure("Sub.TLabel", background=MORANDI_BG, foreground=MORANDI_MUTED,
                         font=(SAAS_FONT, 9))
-        style.configure("TButton", padding=(12, 7), background=MORANDI_TOP,
+        style.configure("TButton", padding=(7, 4), background=MORANDI_TOP,
                         foreground=MORANDI_TEXT, borderwidth=1, relief="solid")
         style.map("TButton",
                   background=[("active", SAAS_SUBTLE), ("disabled", SAAS_SUBTLE)],
                   foreground=[("disabled", "#94A3B8")])
         style.configure("Accent.TButton", background=SAAS_ACCENT,
-                        foreground="#FFFFFF", borderwidth=0, padding=(14, 8),
+                        foreground="#FFFFFF", borderwidth=0, padding=(9, 5),
                         font=(SAAS_FONT, 10, "bold"))
         style.map("Accent.TButton",
                   background=[("active", SAAS_ACCENT_HOVER),
@@ -1051,12 +1117,12 @@ class App:
                               ("disabled", "#93C5FD")])
         style.configure("Danger.TButton", foreground=SAAS_ERROR)
         style.configure("Nav.TButton", background=MORANDI_TOP, foreground=MORANDI_MUTED,
-                        padding=(16, 10), anchor="w", borderwidth=0, relief="flat",
+                        padding=(12, 7), anchor="w", borderwidth=0, relief="flat",
                         font=(SAAS_FONT, 10))
         style.map("Nav.TButton", background=[("active", SAAS_SUBTLE)],
                   foreground=[("active", MORANDI_TEXT)])
         style.configure("NavOn.TButton", background=MORANDI_HOME,
-                        foreground=SAAS_ACCENT, padding=(16, 10), anchor="w",
+                        foreground=SAAS_ACCENT, padding=(12, 7), anchor="w",
                         borderwidth=0, relief="flat",
                         font=(SAAS_FONT, 10, "bold"))
         style.map("NavOn.TButton", background=[("active", MORANDI_HOME_ON)])
@@ -1091,11 +1157,11 @@ class App:
                         bordercolor=MORANDI_LINE)
         style.configure("TCombobox", padding=(8, 5), fieldbackground=MORANDI_TOP)
         style.configure("Step.TButton", background=MORANDI_TOP,
-                        foreground=MORANDI_TEXT, padding=(10, 9), anchor="w",
+                        foreground=MORANDI_TEXT, padding=(8, 6), anchor="w",
                         borderwidth=0, relief="flat", font=(SAAS_FONT, 9))
         style.map("Step.TButton", background=[("active", SAAS_SUBTLE)])
         style.configure("StepOn.TButton", background=MORANDI_HOME,
-                        foreground=SAAS_ACCENT, padding=(10, 9), anchor="w",
+                        foreground=SAAS_ACCENT, padding=(8, 6), anchor="w",
                         borderwidth=0, relief="flat",
                         font=(SAAS_FONT, 9, "bold"))
         style.map("StepOn.TButton", background=[("active", MORANDI_HOME_ON)])
@@ -3910,6 +3976,7 @@ class App:
                                  "以下问题必须先修正：\n\n"
                                  + "\n".join("· " + e for e in errs[:15]))
             return False
+        self._show_duplicate_password_warning(_warns)
         # v3.6.0：统一以「设置 → 默认输出目录」为准（未设置 = 程序所在文件夹）
         outdir = self._default_outdir()
         outdir.mkdir(parents=True, exist_ok=True)
@@ -5968,6 +6035,13 @@ class App:
             msg += "\n\n提醒：\n" + "\n".join("· " + w for w in warnings[:8])
         messagebox.showinfo("预检结果", msg)
 
+    def _show_duplicate_password_warning(self, warnings):
+        matches = [w for w in warnings if w.startswith("打开口令重复（")]
+        if matches:
+            messagebox.showwarning("打开口令重复", "以下收件人使用了相同的打开口令：\n\n" +
+                                   "\n".join(matches[:8]) +
+                                   "\n\n可以继续处理，请在发送前确认。")
+
     def _wb_generate(self):
         self._wb_run(None)
 
@@ -6001,6 +6075,7 @@ class App:
                                  "以下问题必须先修正：\n\n"
                                  + "\n".join("· " + e for e in errors[:15]))
             return
+        self._show_duplicate_password_warning(_warnings)
         if not messagebox.askyesno(
                 "确认生成",
                 "即将为「%s」生成全部文件与 Outlook 草稿。\n\n"
