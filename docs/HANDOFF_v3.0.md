@@ -1982,3 +1982,5 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 本地验证：pytest 407 passed；真实 Tk/Office E2E 79 PASS / 0 FAIL，标签界面 27 PASS，隔离更新 16 项通过；fake Outlook 仅保存草稿。签名 Valid，隔离 exe 启动通过。
 LCCP I 用户事件先备份后仅更新流水线，15 人 PCAP 对应；9 封模拟草稿附件哈希匹配。共享盘本机不可访问、正式管理人信缺失；地址、分组与模板未改。
 发布状态以 Release 和后续记录为准。
+
+CI 40539347577 success；Release 425703843。两资产重新下载与本地 SHA256 一致：便携包 AD54978B03CC0DF331CB4415E40BF3C84E6BE3DB770DACB6F5FFA2FB609362E2，win64 包 4C97AC15D439EE33CEBD22A53B4DA0CCE953CD28D35023D0059217E25211042C；下载 exe 签名 Valid。
