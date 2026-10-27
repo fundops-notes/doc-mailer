@@ -1973,4 +1973,5 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - 新更新器备份核心数据、跳过已有历史备份的嵌套复制，校验程序/数据SHA256及程序依赖；成功仅清理本次程序备份、保留数据快照和历史备份；失败回滚并保留程序备份。旧版升到本版时仍用旧更新器。
 - 403 pytest passed；真实Tk+Office 79 PASS/0 FAIL（Outlook fake），标签27 PASS、真实下载升级16项通过。一次下载SSL中断后重试通过。
 - exe 48,409,096 B 签名Valid，单文件隔离启动退出0；开发数据32文件、Linear客户端385文件哈希未变；WINWORD=0。证据开发根验收_v3.9.6/及修复与发布报告_v3.9.6.md。
-- 发布状态待CI及资产校验后更新。
+- v3.9.6 已发布：tag/commit df1a4f1cfef35bb1b148fd4f9d5192fac72ccb0d；CI 40508202395 success；Release id 425466458。两资产重新下载SHA256与本地/GitHub一致、ZIP完整且无用户数据；下载exe签名Valid，证书指纹9106B492E4A041627FDA67A389BA23474475A26E。
+- 便携包 SHA256 CC4F185DDCE883F4F67955BD6E0D1F8C591CF5BC5D89A2EA35A1A2A3F3D95F4C；win64包 SHA256 21AF4A6EA4C5BC2B0AC6532369EFEBCD4DAB36595D025E2F6E5468D536F791C6。
