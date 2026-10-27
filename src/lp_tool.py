@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.3"
+APP_VERSION = "3.9.4"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -1566,7 +1566,8 @@ class App:
         primary = (
             ("＋ 新增", self._pool_new, "在收件人库里新增一条"),
             ("编辑", self._pool_edit, "编辑选中的收件人"),
-            ("标签…", self._pool_tags, "给选中收件人批量加/移除标签"),
+            ("标签…", self._pool_tags, "给选中收件人批量添加、移除或替换标签"),
+            ("管理标签…", self._pool_rename_tag, "重命名整个收件人库里的标签"),
             ("删除", self._pool_delete, "从库里删除选中的收件人"),
             ("从事件导入…", self._pool_from_event, "把某个事件的收件人整个收进库"),
             ("添加到事件…", self._pool_to_event, "把选中的收件人并进某个事件"),
@@ -1584,6 +1585,23 @@ class App:
             b = ttk.Button(bar2, text=text, command=cmd)
             b.pack(side="left", padx=(0, 4))
             ToolTip(b, tip)
+
+        filter_bar = WrapFrame(f)
+        filter_bar.pack(fill="x", pady=(0, 6))
+        ttk.Label(filter_bar, text="标签筛选：").pack(side="left", padx=(0, 4))
+        self._pool_filter_vars = {}
+        self._pool_filter_mode = tk.StringVar(value="匹配任一")
+        self._pool_filter_button = ttk.Menubutton(filter_bar, text="全部标签 ▾")
+        self._pool_filter_menu = tk.Menu(self._pool_filter_button, tearoff=False)
+        self._pool_filter_button.configure(menu=self._pool_filter_menu)
+        self._pool_filter_button.pack(side="left", padx=(0, 4))
+        mode = ttk.Combobox(filter_bar, textvariable=self._pool_filter_mode,
+                            values=("匹配任一", "匹配全部"), state="readonly", width=9)
+        mode.pack(side="left", padx=(0, 4))
+        mode.bind("<<ComboboxSelected>>", lambda _event: self._refresh_pool_tab())
+        ttk.Button(filter_bar, text="清除筛选", command=self._pool_clear_filter).pack(side="left")
+        self._pool_filter_count = ttk.Label(filter_bar, foreground=MORANDI_MUTED)
+        self._pool_filter_count.pack(side="left", padx=(8, 0))
 
         frame = ttk.Frame(f)
         frame.pack(fill="both", expand=True)
@@ -1606,7 +1624,31 @@ class App:
         tree = getattr(self, "_pool_tree", None)
         if tree is None:
             return
+        previously_selected = set(self._pool_selected())
         pool = self.store.list_pool()
+        old_vars = getattr(self, "_pool_filter_vars", {})
+        selected_tags = {tag for tag, var in old_vars.items() if var.get()}
+        available = sorted({tag for rec in pool for tag in (rec.get("tags") or [])},
+                           key=lambda text: (text.casefold(), text))
+        selected_tags.intersection_update(available)
+        menu = self._pool_filter_menu
+        menu.delete(0, "end")
+        self._pool_filter_vars = {}
+        for tag in available:
+            var = tk.BooleanVar(value=tag in selected_tags)
+            self._pool_filter_vars[tag] = var
+            menu.add_checkbutton(label=tag, variable=var, command=self._refresh_pool_tab)
+        if not available:
+            menu.add_command(label="暂无标签", state="disabled")
+        self._pool_filter_button.configure(text=("已选 %d 个标签 ▾" % len(selected_tags)
+                                                  if selected_tags else "全部标签 ▾"))
+        mode = self._pool_filter_mode.get()
+        def visible(rec):
+            tags = set(rec.get("tags") or [])
+            return not selected_tags or (selected_tags <= tags if mode == "匹配全部"
+                                         else bool(selected_tags & tags))
+        displayed = [rec for rec in pool if visible(rec)]
+        self._pool_filter_count.configure(text="显示 %d / %d 位" % (len(displayed), len(pool)))
         cols = ["name", "to", "cc", "bcc", "wm", "group", "tags",
                 "open_pw", "owner_pw"]
         heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "标签",
@@ -1624,7 +1666,8 @@ class App:
                     150 if c in ("to", "cc", "bcc") else 110))
             except Exception:
                 pass
-        for i, r in enumerate(pool):
+        restored_selection = []
+        for i, r in enumerate(displayed):
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
                     r.get("bcc", ""), r.get("wm", ""), r.get("group", ""),
                     "、".join(r.get("tags") or []),
@@ -1633,6 +1676,15 @@ class App:
             iid = "p%d" % i
             self._pool_iids[iid] = r.get("id", "")
             tree.insert("", "end", iid=iid, values=vals)
+            if r.get("id") in previously_selected:
+                restored_selection.append(iid)
+        if restored_selection:
+            tree.selection_set(restored_selection)
+
+    def _pool_clear_filter(self):
+        for var in getattr(self, "_pool_filter_vars", {}).values():
+            var.set(False)
+        self._refresh_pool_tab()
 
     def _pool_selected(self):
         tree = getattr(self, "_pool_tree", None)
@@ -1700,7 +1752,7 @@ class App:
         self._pool_tag_dialog(ids, "批量修改标签（%d 位）" % len(ids))
 
     def _pool_tag_dialog(self, ids, title="收件人标签"):
-        """标签编辑：添加全量加；移除只能移除所有选中记录共有的标签。"""
+        """对选中收件人添加、移除共有标签或替换勾选标签。"""
         pool = {r.get("id"): r for r in self.store.list_pool()}
         recs = [pool[i] for i in ids if i in pool]
         if not recs:
@@ -1720,10 +1772,15 @@ class App:
         ttk.Label(win, justify="left", text=(
             "勾选已有标签可批量添加；移除只能移除选中记录都有的（共有）标签，\n"
             "只属于部分记录的标签不会被批量移除，避免误删。\n"
-            "也可以在下方输入新标签（逗号或分号分隔）。")).pack(
+            "替换只影响选中收件人中拥有勾选标签的记录；其它标签保留。\n"
+            "也可以在下方输入新标签（添加时可用逗号或分号分隔）。")).pack(
             anchor="w", padx=12, pady=(10, 6))
-        cb_frame = ttk.Frame(win)
-        cb_frame.pack(fill="both", expand=True, padx=12)
+        tag_view = ScrollFrame(win)
+        tag_view.canvas.configure(width=500, height=min(200, max(56, ((len(union)+1)//2)*28)))
+        tag_view.pack(fill="both", expand=True, padx=12)
+        cb_frame = tag_view.content
+        cb_frame.columnconfigure(0, weight=1)
+        cb_frame.columnconfigure(1, weight=1)
         vars_ = {}
         for j, t in enumerate(union):
             v = tk.BooleanVar(value=False)
@@ -1795,12 +1852,90 @@ class App:
             messagebox.showinfo("标签", msg, parent=win)
             win.destroy()
 
+        def apply_replace():
+            picked = checked()
+            targets = [t.strip() for t in re.split(r"[,，;；]", new_var.get()) if t.strip()]
+            if not picked or len(targets) != 1:
+                messagebox.showinfo("标签", "请勾选要替换的标签，并输入一个新标签。", parent=win)
+                return
+            ok, error, result = self.store.replace_pool_tags(picked, targets[0], ids=ids)
+            if not ok:
+                messagebox.showerror("替换失败", error, parent=win)
+                return
+            self._refresh_pool_tab()
+            messagebox.showinfo("标签", "已替换 %d 位收件人的标签。" % result["changed"], parent=win)
+            win.destroy()
+
         btns = ttk.Frame(win)
         btns.pack(pady=10)
         ttk.Button(btns, text="添加勾选标签", command=apply_add).pack(side="left", padx=6)
         ttk.Button(btns, text="移除勾选（仅共有）", command=apply_remove).pack(
             side="left", padx=6)
+        ttk.Button(btns, text="替换勾选标签", command=apply_replace).pack(side="left", padx=6)
         ttk.Button(btns, text="关闭", command=win.destroy).pack(side="left", padx=6)
+
+    def _pool_rename_tag(self):
+        """全库重命名标签；与当前筛选及选中行无关。"""
+        pool = self.store.list_pool()
+        tags = sorted({t for rec in pool for t in (rec.get("tags") or [])},
+                      key=lambda text: (text.casefold(), text))
+        if not tags:
+            messagebox.showinfo("管理标签", "收件人库还没有标签。")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("管理标签")
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text="重命名将更新整个收件人库中使用该标签的记录；筛选不会限制范围。",
+                  wraplength=490).pack(anchor="w", padx=12, pady=(12, 6))
+        line = ttk.Frame(win)
+        line.pack(fill="x", padx=12, pady=4)
+        ttk.Label(line, text="原标签：").pack(side="left")
+        old_var = tk.StringVar()
+        combo = ttk.Combobox(line, textvariable=old_var, values=tags, state="readonly", width=25)
+        combo.pack(side="left", padx=(0, 6))
+        ttk.Label(line, text="新标签：").pack(side="left")
+        new_var = tk.StringVar()
+        ttk.Entry(line, textvariable=new_var, width=25).pack(side="left")
+        affected = tk.StringVar(value="请选择原标签")
+        ttk.Label(win, textvariable=affected, foreground=MORANDI_MUTED).pack(anchor="w", padx=12, pady=6)
+        def update_count(_event=None):
+            affected.set("将影响 %d 位收件人；目标标签已存在时会合并。" %
+                         sum(old_var.get() in (rec.get("tags") or []) for rec in pool))
+        combo.bind("<<ComboboxSelected>>", update_count)
+        def rename():
+            old, new = old_var.get().strip(), new_var.get().strip()
+            if old not in tags or not new:
+                messagebox.showinfo("管理标签", "请选择原标签并输入新标签。", parent=win)
+                return
+            if old == new:
+                messagebox.showinfo("管理标签", "新标签与原标签相同，无需修改。", parent=win)
+                return
+            current = self.store.list_pool()
+            count = sum(old in (rec.get("tags") or []) for rec in current)
+            if not count:
+                messagebox.showinfo("管理标签", "原标签已不存在，请刷新后重试。", parent=win)
+                return
+            if not messagebox.askyesno("重命名标签", "将整个收件人库中 %d 位收件人的「%s」改为「%s」。\n"
+                                       "已有目标标签会合并，修改前将备份原记录。" % (count, old, new), parent=win):
+                return
+            ok, error, result = self.store.replace_pool_tags([old], new)
+            if not ok:
+                messagebox.showerror("重命名失败", error, parent=win)
+                return
+            selected = {tag for tag, var in self._pool_filter_vars.items() if var.get()}
+            if old in selected:
+                selected.remove(old)
+                selected.add(new)
+            # 在刷新前保留改名后的筛选选择。
+            self._pool_filter_vars = {tag: tk.BooleanVar(value=True) for tag in selected}
+            self._refresh_pool_tab()
+            messagebox.showinfo("管理标签", "已更新 %d 位收件人的标签。" % result["changed"], parent=win)
+            win.destroy()
+        buttons = ttk.Frame(win)
+        buttons.pack(pady=10)
+        ttk.Button(buttons, text="重命名全部", command=rename).pack(side="left", padx=6)
+        ttk.Button(buttons, text="取消", command=win.destroy).pack(side="left", padx=6)
 
     def _pool_delete(self):
         ids = self._pool_selected()
@@ -2168,7 +2303,7 @@ class App:
         ttk.Checkbutton(wm_row, text="启动时检查更新（连接 GitHub）",
                         variable=self.set_auto, command=self._save_settings).pack(side="left")
 
-        ttk.Label(f, text="文件名模板已移到「文档流水线 → Word-MailMerge」参数区，"
+        ttk.Label(f, text="文件名模板在「文档流水线」各条目的参数区，"
                           "可对每一条生成任务单独设置。",
                   style="Sub.TLabel", wraplength=760, justify="left").pack(
             anchor="w", pady=(2, 4))
@@ -2254,8 +2389,9 @@ class App:
             "         下方附件可点文件名直接打开；确认后生成全部 Outlook 草稿\n"
             "         （生成时会使用保存的单封修改）。\n\n"
             "收件人库：\n"
-            "    · 可给收件人打标签；「标签…」支持批量添加、批量移除共有标签；\n"
-            "    · 只属于部分收件人的特异标签不会被批量移除；\n"
+            "    · 标签筛选可多选，并选择匹配任一标签或全部标签；\n"
+            "    · 「标签…」可给选中收件人批量添加、替换或移除共有标签；\n"
+            "    · 「管理标签…」可重命名整个收件人库里的标签，修改前备份；\n"
             "    · 「从事件导入…」收进库后会提示给这批收件人打标签；\n"
             "    · 自定义字段只属于事件，收件人库/收件人信息都不显示字段；\n"
             "      字段由 Excel/要素模板导入，只用于文档映射；\n"
@@ -4624,6 +4760,28 @@ class App:
             ttk.Label(box,text="这份清单适用于所有收件人；每个LP文件不同时，请使用上方Excel按LP匹配入口。",
                       foreground=MORANDI_MUTED).pack(fill="x",padx=8,pady=4)
 
+        if kind != "generate":
+            frow = ttk.Frame(box)
+            frow.pack(fill="x", padx=8, pady=(2, 2))
+            ttk.Label(frow, text="附件文件名模板：").pack(anchor="w")
+            fname_var = self._wb_keep_var(tk.StringVar(value=params.get("filename_tpl") or ""))
+            self._wb_param_editor["filename_tpl"] = fname_var
+            fname_entry = ttk.Entry(frow, textvariable=fname_var, width=16)
+            fname_entry.pack(fill="x")
+            fbuttons = WrapFrame(box)
+            fbuttons.pack(fill="x", padx=8, pady=(2, 0))
+            insert_btn = ttk.Menubutton(fbuttons, text="插入字段")
+            insert_menu = tk.Menu(insert_btn, tearoff=False)
+            for label in ("原件名", "水印名称", "打开口令", "收件人名称", "日期"):
+                insert_menu.add_command(label=label,
+                    command=lambda field=label: fname_entry.insert("insert", "{{%s}}" % field))
+            insert_btn.configure(menu=insert_menu)
+            insert_btn.pack(side="left")
+            ttk.Button(fbuttons, text="保存", width=6,
+                       command=lambda: self._wb_save_item_filename(item, fname_var)).pack(side="left")
+            ttk.Label(box, text="留空沿用原有命名；可插入打开口令，不能使用权限口令。扩展名自动保留。",
+                      foreground="#888", wraplength=490, justify="left").pack(anchor="w", padx=8)
+
         # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
         r2 = WrapFrame(box)
         r2.pack(fill="x", padx=8, pady=4)
@@ -4982,10 +5140,10 @@ class App:
     # ---------- 模板 / 文件选择 ----------
 
     def _wb_save_item_filename(self, item, var):
-        """保存这一条 Word-MailMerge 的产物文件名模板。"""
+        """保存当前条目的产物文件名模板。"""
         params = item.setdefault("params", {})
         val = var.get().strip()
-        params["filename_tpl"] = "" if val == DEFAULT_FILENAME_TPL else val
+        params["filename_tpl"] = "" if item.get("kind") == "generate" and val == DEFAULT_FILENAME_TPL else val
         self._wb_save()
         self._wb_render_params(item)
 

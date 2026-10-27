@@ -1945,3 +1945,12 @@ v3.7.2 把日期列的数字统一转成了 YYYY-MM-DD，但不同场合需要�
 - Release id=424599468：https://github.com/fundops-notes/doc-mailer/releases/tag/v3.9.3 。发布正文普通文本；两个签名发行包均重新下载，SHA256与本地及GitHub digest一致；大小、ZIP完整性、源码版本、用户数据排除全部通过。
 - 下载exe签名Valid，证书指纹9106B492E4A041627FDA67A389BA23474475A26E，与本地一致。证据release_upload.log、release_verify.log、release_verify_current.json、downloaded_signature.json。
 - 便携包46,449,451 B / SHA256 0ADB72ACAC76BF236FAFD18AB285899A2603BE5D2E58EA55EA652720D624FE41；win64包47,948,633 B / SHA256 E3E892DB31002FC13C4C18375C4CF679591B4E99BBBC962D760DEF792417C6DF。
+
+
+## 46. v3.9.4：标签筛选管理与附件自定义命名（2026-10-27）
+
+- 收件人库支持多选标签筛选、选中收件人批量替换、全库标签重命名；受影响记录先备份，写入失败/并发变化中止并尝试回滚。
+- PDF、非 PDF、Excel 对应条目支持自定义文件名和插入原件名/水印名称/打开口令/收件人名称/日期；留空兼容旧设置；权限口令禁止进入附件名。防同名覆盖，并保护部分重跑时已有文件。
+- 两处版本字面量3.9.4，源码镜像一致；392 pytest passed；真实 Tk + Office 74 PASS/0 FAIL（Outlook fake Save）；标签界面27 PASS/0 FAIL，隔离更新15项通过。
+- exe 48,406,984 B / 签名Valid；隔离启动退出0。开发数据32文件、安装数据54文件前后哈希一致；用户数据未入包，WINWORD=0。证据与报告位于开发根目录验收_v3.9.4和修复与发布报告_v3.9.4.md。
+- 发布状态待 CI、Release 及下载校验后更新。

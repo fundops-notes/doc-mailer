@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.3"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.4"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -1515,6 +1515,105 @@ class Store:
         ok, err = write_json_file(self.pool_path(rec["id"]), rec)
         return ok, err, rec
 
+    def replace_pool_tags(self, old_tags, new_tag, ids=None):
+        """替换库标签：先备份原始字节；异常时仅回滚本次写入的记录。"""
+        old = {str(t).strip() for t in old_tags if str(t).strip()}
+        new_tag = str(new_tag or "").strip()
+        if not old or not new_tag:
+            return False, "请选择原标签并输入新标签。", {"changed": 0}
+        if ids is not None and not ids:
+            return False, "请先选择收件人。", {"changed": 0}
+        paths = (sorted(self.recipients_dir.glob("*.json")) if ids is None else
+                 [self.pool_path(rid) for rid in dict.fromkeys(ids)])
+        plan = []
+        stats = {"changed": 0, "backup": None, "rollback_incomplete": []}
+        try:
+            for path in paths:
+                raw = path.read_bytes()
+                data = json.loads(raw.decode("utf-8-sig"))
+                if not isinstance(data, dict) or not isinstance(data.get("tags", []), list):
+                    raise ValueError("收件人文件格式无法安全修改：%s" % path.name)
+                if not isinstance(data.get("id"), str) or self.pool_path(data["id"]) != path:
+                    raise ValueError("收件人标识不匹配：%s" % path.name)
+                tags = data.get("tags", [])
+                if not all(isinstance(t, str) for t in tags):
+                    raise ValueError("收件人标签格式无法安全修改：%s" % path.name)
+                if not any(t.strip() in old for t in tags):
+                    continue
+                # 如果目标标签已存在，保留其原位置；其它标签和未知字段原样保留。
+                target_exists = any(t.strip() == new_tag for t in tags) and new_tag not in old
+                inserted = False
+                replacement = []
+                for tag in tags:
+                    if tag.strip() in old:
+                        if not target_exists and not inserted:
+                            replacement.append(new_tag)
+                            inserted = True
+                    else:
+                        replacement.append(tag)
+                if replacement == tags:
+                    continue
+                data["tags"] = replacement
+                data["updated_at"] = _now_str()
+                after = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+                plan.append((path, raw, after))
+            if not plan:
+                return True, None, stats
+            backup = self.data_dir / "backups" / ("pool_tags_" + _stamp() + "_" + secrets.token_hex(4))
+            backup.mkdir(parents=True, exist_ok=False)
+            stats["backup"] = str(backup)
+            for path, raw, _after in plan:
+                with (backup / path.name).open("xb") as f:
+                    f.write(raw)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if (backup / path.name).read_bytes() != raw:
+                    raise OSError("备份校验失败：%s" % path.name)
+            # 先检查全部文件，再逐个检查，发现外部修改立即停止。
+            for path, raw, _after in plan:
+                if path.read_bytes() != raw:
+                    raise OSError("收件人已被其他操作修改：%s" % path.name)
+            written = []
+            temp = None
+            try:
+                for path, raw, after in plan:
+                    if path.read_bytes() != raw:
+                        raise OSError("收件人已被其他操作修改：%s" % path.name)
+                    temp = path.with_name(".%s.%s.tags.tmp" % (path.name, secrets.token_hex(8)))
+                    with temp.open("xb") as f:
+                        f.write(after)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temp, path)
+                    temp = None
+                    written.append((path, after))
+            except Exception:
+                if temp is not None and temp.exists():
+                    try:
+                        temp.unlink()
+                    except OSError:
+                        pass  # 临时文件清理失败不能阻止恢复已修改的记录。
+                for path, after in reversed(written):
+                    try:
+                        if path.read_bytes() != after:
+                            raise OSError("文件已被其他操作修改")
+                        recovery = path.with_name(".%s.%s.restore.tmp" % (path.name, secrets.token_hex(8)))
+                        with recovery.open("xb") as f:
+                            f.write((backup / path.name).read_bytes())
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(recovery, path)
+                    except OSError:
+                        stats["rollback_incomplete"].append(path.name)
+                raise
+            stats["changed"] = len(plan)
+            return True, None, stats
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            suffix = ("；部分文件未自动恢复，请从备份核对：%s；备份目录：%s" %
+                      ("、".join(stats["rollback_incomplete"]), stats["backup"])
+                      if stats["rollback_incomplete"] else "；未保留本次标签修改")
+            return False, str(error) + suffix, stats
+
     def delete_pool_recipient(self, rid):
         p = self.pool_path(rid)
         if p.exists():
@@ -2083,6 +2182,18 @@ def item_output_name(event, unit, source_path, orig_name=None, filename_tpl=None
     return out or "output"
 
 
+def _check_attachment_name(name, event):
+    """拒绝可能泄露权限口令的文件名；错误信息不包含口令或文件名。"""
+    import re
+    for match in re.finditer(r"\{\{\s*([^{}]+?)\s*\}\}", name):
+        if _is_forbidden_key(match.group(1).split(".")[-1]):
+            raise ValueError("文件名不能使用权限口令字段，请修改文件名模板。")
+    secrets = [(event.get("options") or {}).get("gp_owner_pw", "")]
+    secrets.extend(r.get("owner_pw", "") for r in event.get("recipients") or [])
+    if any(str(secret) and str(secret).casefold() in str(name).casefold() for secret in secrets):
+        raise ValueError("文件名包含权限口令，请修改模板或原文件名后重试。")
+
+
 def load_sheet_data(path, key_col=""):
     """读外部 Excel 数据表。返回 (sheet_map, warnings)。
 
@@ -2141,7 +2252,25 @@ class RunContext:
         self.outdir = Path(outdir)
         self.word = word
         self._sheet_cache = {}
+        self._output_names = set()
         self.warnings = []
+
+    def reserve_output(self, directory, base, suffix, to_pdf=False):
+        """为本轮处理预留输入和最终 PDF 名，防止跨收件人覆盖。"""
+        index = 1
+        while True:
+            stem = base if index == 1 else "%s_%d" % (base, index)
+            candidate = directory / (stem + suffix)
+            paths = [candidate]
+            if to_pdf:
+                paths.append(directory / (stem + ".pdf"))
+            keys = {str(p).casefold() for p in paths}
+            if not (keys & self._output_names):
+                for path in paths:
+                    _check_attachment_name(path.name, self.event)
+                self._output_names.update(keys)
+                return candidate
+            index += 1
     def sheet_for(self, item, recipient):
         """收件人对应的外部数据行。
 
@@ -2248,7 +2377,7 @@ def execute_item(item, unit, event, ctx):
             event, unit, tpl,
             orig_name=(item.get("name") or "").strip() or None,
             filename_tpl=(params.get("filename_tpl") or ""))
-        docx = outdir / (base + ".docx")
+        docx = ctx.reserve_output(outdir, base, ".docx", bool(params.get("to_pdf")))
         wm.generate_notice_docx(tpl, str(docx), fmap, batch=ctx.word)
         cur = docx
     else:
@@ -2274,14 +2403,12 @@ def execute_item(item, unit, event, ctx):
                     warnings.append("文件不存在，已跳过：%s" % sp)
                     continue
                 raise RuntimeError("文件不存在：%s" % sp)
-            base = item_output_name(event, unit, sp)
-            if params.get("preserve_name"):
+            filename_tpl = (params.get("filename_tpl") or "").strip()
+            base = item_output_name(event, unit, sp, filename_tpl=filename_tpl)
+            if params.get("preserve_name") and not filename_tpl:
                 base = Path(sp).stem
-            dst = outdir / (base + Path(sp).suffix)
-            suffix_index = 2
-            while any(str(existing).lower() == str(dst).lower() for existing in cur):
-                dst = outdir / (base + "_%d" % suffix_index + Path(sp).suffix)
-                suffix_index += 1
+            dst = ctx.reserve_output(outdir, base, Path(sp).suffix,
+                                     bool(params.get("to_pdf")))
             shutil.copy2(sp, str(dst))
             cur.append(dst)
         if not cur:
@@ -2373,6 +2500,12 @@ def run_items(event, outdir, word=None, only_recips=None, log=None, progress=Non
         return outputs, warnings, [("", "", "流水线为空，没有任何启用的条目")]
 
     ctx = RunContext(event, outdir, word=word)
+    if only_recips is not None:
+        # 重跑部分收件人时，既有结果仍供其他人使用，不得覆盖。
+        for entries in (event.get("process_results") or {}, event.get("process_overrides") or {}):
+            for paths in entries.values():
+                for path in (split_paths(paths) if isinstance(paths, str) else (paths or [])):
+                    ctx._output_names.add(str(Path(path)).casefold())
     total = len(items)
     for si, it in enumerate(items):
         iid = it.get("id") or ("item%d" % si)
@@ -2607,6 +2740,9 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None
 
     铁律：正文/标题里的权限口令会被 scrub 掉（架构 + 兜底双保险）。
     """
+    for attachment in attachments:
+        _check_attachment_name(Path(attachment).name,
+                               {"recipients": [{"owner_pw": owner_pw}]})
     import win32com.client as win32
     ol = win32.Dispatch("Outlook.Application")
     mail = ol.CreateItem(0)  # 0 = olMailItem
@@ -3166,6 +3302,8 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
                 run["stats"]["ok"] += 1
             else:
                 try:
+                    for path in files:
+                        _check_attachment_name(Path(path).name, event)
                     fmap = build_field_map(rep, event)
                     rec = dict(rep)
                     rec["to"] = ";".join(_merge_addresses(unit["recipients"], "to"))
