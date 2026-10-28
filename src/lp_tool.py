@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.8"
+APP_VERSION = "3.9.9"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -1404,6 +1404,14 @@ class App:
         self.ev_tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         hsb.pack(side="bottom", fill="x")
+        self._event_context_menu = tk.Menu(self.ev_tree, tearoff=False)
+        for label, command in (("打开", self._open_selected_event),
+                               ("编辑", self._edit_event_dialog),
+                               ("复制", self._dup_event),
+                               ("删除", self._del_event),
+                               ("导出", self._lib_export_event)):
+            self._event_context_menu.add_command(label=label, command=command)
+        self.ev_tree.bind("<Button-3>", self._show_event_context_menu)
         self.ev_tree.bind("<Double-1>", lambda _e: self._open_selected_event())
         self.ev_tree.bind("<<TreeviewSelect>>", lambda _e: self._draw_selected_flow())
 
@@ -1583,6 +1591,18 @@ class App:
             return
         self._refresh_home()
         self.open_event(ev["id"])
+
+    def _show_event_context_menu(self, event):
+        row = self.ev_tree.identify_row(event.y)
+        if not row:
+            return "break"
+        self.ev_tree.selection_set(row)
+        self.ev_tree.focus(row)
+        try:
+            self._event_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._event_context_menu.grab_release()
+        return "break"
 
     def _selected_event_id(self):
         sel = self.ev_tree.selection()

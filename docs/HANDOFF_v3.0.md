@@ -1990,3 +1990,7 @@ CI 40539347577 success；Release 425703843。两资产重新下载与本地 SHA2
 切换条目仅在参数顶部不可见时定位顶部；对应表可导出当前路径，横向滚动条移至表格上方。全量测试 408 passed，真实 Tk/Office E2E 79 PASS / 0 FAIL，模拟 Outlook。签名 Valid。发布状态以 CI 和资产校验为准。
 
 CI 40542682995 success；Release 425725726。重新下载两资产与本地 SHA256 一致：便携包 EA5B80C075C83272382FF18948B865CEE97883B183FF44D538FE3BA73DCB4622，win64 包 43FB806CA5B6A9013FFDB669BCEBAC72C47FC66437FF2DD2C71443C3080FB6BC；下载程序签名 Valid。
+
+
+§51 v3.9.9 事件右键菜单（2026-10-28）
+事件表右键选择目标行，提供打开、编辑、复制、删除、导出；空白处右键不弹出。全量 pytest 409 passed，菜单专项 2 passed，真实 Tk/Office E2E 79 PASS / 0 FAIL。Linear 名称差异只读核对报告位于共享工作区 outputs，不进入仓库。发布状态以 CI 和资产校验为准。
