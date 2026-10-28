@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.11"
+APP_VERSION = "3.9.12"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -964,7 +964,8 @@ def _fit_labels(parent):
             widget._wrap_bound = True
             def fit(_event=None, label=widget, container=widget.master):
                 if label.winfo_exists() and container.winfo_width() > 40:
-                    label.configure(wraplength=max(40, container.winfo_width() - 24))
+                    # Account for labelframe borders and the label's horizontal padding.
+                    label.configure(wraplength=max(40, container.winfo_width() - 48))
             widget.master.bind("<Configure>", fit, add=True)
             fit()
         _fit_labels(widget)
@@ -1119,13 +1120,14 @@ class App:
                         font=(SAAS_FONT, 18, "bold"))
         style.configure("Sub.TLabel", background=MORANDI_BG, foreground=MORANDI_MUTED,
                         font=(SAAS_FONT, 9))
-        style.configure("TButton", padding=(7, 4), background=MORANDI_TOP,
+        style.configure("TButton", padding=(7, 2), background=MORANDI_TOP,
                         foreground=MORANDI_TEXT, borderwidth=1, relief="solid")
         style.map("TButton",
                   background=[("active", SAAS_SUBTLE), ("disabled", SAAS_SUBTLE)],
-                  foreground=[("disabled", "#94A3B8")])
+                  bordercolor=[("focus", SAAS_ACCENT)],
+                  foreground=[("disabled", "#64748B")])
         style.configure("Accent.TButton", background=SAAS_ACCENT,
-                        foreground="#FFFFFF", borderwidth=0, padding=(9, 5),
+                        foreground="#FFFFFF", borderwidth=0, padding=(9, 3),
                         font=(SAAS_FONT, 10, "bold"))
         style.map("Accent.TButton",
                   background=[("active", SAAS_ACCENT_HOVER),
@@ -1133,12 +1135,12 @@ class App:
                               ("disabled", "#93C5FD")])
         style.configure("Danger.TButton", foreground=SAAS_ERROR)
         style.configure("Nav.TButton", background=MORANDI_TOP, foreground=MORANDI_MUTED,
-                        padding=(12, 7), anchor="w", borderwidth=0, relief="flat",
+                        padding=(12, 5), anchor="w", borderwidth=0, relief="flat",
                         font=(SAAS_FONT, 10))
         style.map("Nav.TButton", background=[("active", SAAS_SUBTLE)],
                   foreground=[("active", MORANDI_TEXT)])
         style.configure("NavOn.TButton", background=MORANDI_HOME,
-                        foreground=SAAS_ACCENT, padding=(12, 7), anchor="w",
+                        foreground=SAAS_ACCENT, padding=(12, 5), anchor="w",
                         borderwidth=0, relief="flat",
                         font=(SAAS_FONT, 10, "bold"))
         style.map("NavOn.TButton", background=[("active", MORANDI_HOME_ON)])
@@ -1173,11 +1175,11 @@ class App:
                         bordercolor=MORANDI_LINE)
         style.configure("TCombobox", padding=(8, 5), fieldbackground=MORANDI_TOP)
         style.configure("Step.TButton", background=MORANDI_TOP,
-                        foreground=MORANDI_TEXT, padding=(8, 6), anchor="w",
+                        foreground=MORANDI_TEXT, padding=(8, 4), anchor="w",
                         borderwidth=0, relief="flat", font=(SAAS_FONT, 9))
         style.map("Step.TButton", background=[("active", SAAS_SUBTLE)])
         style.configure("StepOn.TButton", background=MORANDI_HOME,
-                        foreground=SAAS_ACCENT, padding=(8, 6), anchor="w",
+                        foreground=SAAS_ACCENT, padding=(8, 4), anchor="w",
                         borderwidth=0, relief="flat",
                         font=(SAAS_FONT, 9, "bold"))
         style.map("StepOn.TButton", background=[("active", MORANDI_HOME_ON)])
@@ -1524,7 +1526,7 @@ class App:
         canvas.delete("all")
         if event is None:
             canvas.create_text(
-                16, 16, anchor="nw", fill="#888888", justify="left",
+                16, 16, anchor="nw", fill=MORANDI_MUTED, justify="left",
                 text="还没有选中事件。\n\n"
                      "流程图按「收件人 → 流水线条目 → 附件包 → Outlook 草稿」画出来，\n"
                      "条目可以在「文档流水线」里自由增删和排序。")
@@ -1895,7 +1897,7 @@ class App:
         ttk.Label(row, text="新标签：").pack(side="left")
         new_var = tk.StringVar()
         ttk.Entry(row, textvariable=new_var, width=40).pack(side="left", padx=4)
-        ttk.Label(row, foreground="#888", text="多个用 , 或 ; 分隔").pack(side="left")
+        ttk.Label(row, foreground=MORANDI_MUTED, text="多个用 , 或 ; 分隔").pack(side="left")
 
         def checked():
             return [t for t, v in vars_.items() if v.get()]
@@ -2396,13 +2398,10 @@ class App:
         ttk.Label(f, text="（默认：程序所在文件夹；清空/恢复为该目录即使用默认值）",
                   style="Sub.TLabel").pack(anchor="w", padx=(0, 0), pady=(0, 4))
 
-        wm_row = WrapFrame(f)
-        wm_row.pack(fill="x", pady=6)
-        ttk.Button(wm_row, text="水印设置…", command=self.open_wm_settings).pack(side="left")
-        self.wm_summary = ttk.Label(wm_row, text="", style="Sub.TLabel")
-        self.wm_summary.pack(side="left", padx=10)
+        update_row = WrapFrame(f)
+        update_row.pack(fill="x", pady=6)
         self.set_auto = tk.BooleanVar(value=bool(self.settings.get("auto_update", True)))
-        ttk.Checkbutton(wm_row, text="启动时检查更新（连接 GitHub）",
+        ttk.Checkbutton(update_row, text="启动时检查更新（连接 GitHub）",
                         variable=self.set_auto, command=self._save_settings).pack(side="left")
 
         ttk.Label(f, text="文件名模板在「文档流水线」各条目的参数区，"
@@ -2418,7 +2417,6 @@ class App:
     def _refresh_settings(self):
         self.set_outdir.set(self._outdir_display())
         self.set_auto.set(bool(self.settings.get("auto_update", True)))
-        self._update_wm_summary()
         self.store_info.configure(
             text="位置：%s\n结构：settings.json · events/ · recipients/ · runs/\n"
                  "旧版数据：%s"
@@ -2446,7 +2444,6 @@ class App:
         if not ok:
             messagebox.showerror("保存失败", err)
             return
-        self._update_wm_summary()
 
     # ================= 帮助 =================
 
@@ -3459,7 +3456,7 @@ class App:
             field_entries = {}
             ttk.Label(win, text=(no_field_hint or
                                  "自定义字段由 Excel/要素模板导入，这里不显示、不修改。"),
-                      foreground="#888", wraplength=420, justify="left").grid(row=r0, column=1, sticky="w", padx=6)
+                      foreground=MORANDI_MUTED, wraplength=420, justify="left").grid(row=r0, column=1, sticky="w", padx=6)
 
         def ok():
             out = {k: e.get().strip() for k, e in entries.items()}
@@ -4154,7 +4151,7 @@ class App:
         ttk.Button(bar, text="删除选中",
                    command=self._wb_del_selected_items).pack(side="left")
         ttk.Button(bar, text="清空", command=self._wb_clear_items).pack(side="left")
-        self._wb_pipe_count = ttk.Label(bar, foreground="#888", text="")
+        self._wb_pipe_count = ttk.Label(bar, foreground=MORANDI_MUTED, text="")
         self._wb_pipe_count.pack(side="left", padx=10)
 
         # ④ 左右分栏：v3.4.4 起所有控件**直接建在对应栏里**。
@@ -4832,9 +4829,9 @@ class App:
                        command=lambda: self._wb_save_item_filename(item, fname_var)
                        ).pack(side="left")
             ttk.Label(box, text="可用字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}",
-                      foreground="#888").pack(anchor="w", padx=8, pady=(0, 2))
+                      foreground=MORANDI_MUTED).pack(anchor="w", padx=8, pady=(0, 2))
             # v3.4.6：不再弹「说明」窗口，关键信息直接内联在参数区
-            ttk.Label(box, justify="left", foreground="#888", wraplength=490,
+            ttk.Label(box, justify="left", foreground=MORANDI_MUTED, wraplength=490,
                       text="占位符写法：{{字段}} 或 ?字段?（写在 Word 模板里）。\n"
                            "处理顺序固定：转 PDF → 加水印 → 加密；"
                            "水印文字与各人打开口令在「收件人」处维护。"
@@ -4911,7 +4908,7 @@ class App:
             ttk.Button(fbuttons, text="保存", width=6,
                        command=lambda: self._wb_save_item_filename(item, fname_var)).pack(side="left")
             ttk.Label(box, text="留空沿用原有命名；可插入打开口令，不能使用权限口令。扩展名自动保留。",
-                      foreground="#888", wraplength=490, justify="left").pack(anchor="w", padx=8)
+                      foreground=MORANDI_MUTED, wraplength=490, justify="left").pack(anchor="w", padx=8)
 
         # --- 处理勾选（顺序固定：转 PDF → 加水印 → 加密）---
         r2 = WrapFrame(box)
@@ -4924,16 +4921,20 @@ class App:
             ttk.Checkbutton(r2, text="转成 PDF", variable=to_pdf_var,
                             command=lambda: self._wb_item_flag(item, "to_pdf", to_pdf_var)
                             ).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(r2, text="加水印", variable=wm_var,
-                        command=lambda: self._wb_item_flag(item, "watermark", wm_var)
-                        ).pack(side="left", padx=(0, 10))
+        self._wb_watermark_check = ttk.Checkbutton(
+            r2, text="加水印", variable=wm_var,
+            command=lambda: self._wb_item_flag(item, "watermark", wm_var))
+        self._wb_watermark_check.pack(side="left", padx=(0, 4))
+        if params.get("watermark"):
+            ttk.Button(r2, text="水印设置…", command=lambda: self.open_wm_settings(item)
+                       ).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(r2, text="加密（AES-256）", variable=enc_var,
                         command=lambda: self._wb_item_flag(item, "encrypt", enc_var)
                         ).pack(side="left")
         ToolTip(r2, "处理顺序固定，你不用排：转 PDF → 加水印 → 加密。\n"
                    "加密只对 PDF 生效；打开口令取该收件人的打开口令。")
-        ttk.Label(box, foreground="#888",
-                  text="水印文字与各人打开口令在「收件人」处维护",
+        ttk.Label(box, foreground=MORANDI_MUTED,
+                  text="水印样式按条目保存；水印文字与打开口令在「收件人」处维护",
                   wraplength=500, justify="left").pack(anchor="w", padx=8, pady=(0, 2))
 
         if variant in ("file", "excel"):
@@ -4971,7 +4972,7 @@ class App:
             e_gp = ttk.Entry(r_gp, textvariable=gp_pw_var, width=16, show="*")
             e_gp.pack(side="left", fill="x", expand=True, padx=6)
             ttk.Label(box, text="所有文件使用同一权限口令，便于发送人核对；收件人仍使用各自打开口令。",
-                      foreground="#888").pack(anchor="w", padx=8, pady=(0, 4))
+                      foreground=MORANDI_MUTED).pack(anchor="w", padx=8, pady=(0, 4))
             for _seq in ("<KeyRelease>", "<Return>", "<FocusOut>"):
                 e_gp.bind(_seq, lambda _e: _gp_changed())
             ToolTip(e_gp, "统一权限口令（供发送人核对，不进入文档或邮件）。"
@@ -4990,13 +4991,13 @@ class App:
                                 variable=pv,
                                 command=lambda k=pk, v=pv: self._wb_item_perm(item, k, v)
                                 ).pack(side="left", padx=(0, 10))
-            ttk.Label(box, foreground="#888", text=(
+            ttk.Label(box, foreground=MORANDI_MUTED, text=(
                 "默认只允许打印。全部取消 = 收件人只能打开查看，不能打印/编辑/复制。"),
                 wraplength=500, justify="left").pack(anchor="w", padx=8, pady=(0, 2))
 
 
         # --- v3.5.0：产出固定按分组（不再提供「产出颗粒度」设置）---
-        ttk.Label(box, foreground="#888", wraplength=500, justify="left",
+        ttk.Label(box, foreground=MORANDI_MUTED, wraplength=500, justify="left",
                   text="产出方式：按分组自动 —— 同一合并组共用一份文件；"
                        "未分组的收件人各自一份。邮件分组在「收件人」页的「组」列维护。"
                   ).pack(anchor="w", padx=8, pady=(0, 4))
@@ -5089,7 +5090,7 @@ class App:
                    command=lambda: self._wb_add_mapping(item)).pack(side="left")
         ttk.Button(bar, text="删除选中",
                    command=lambda: self._wb_del_mapping(item, tree)).pack(side="left", padx=4)
-        ttk.Label(bar, foreground="#888", text=(
+        ttk.Label(bar, foreground=MORANDI_MUTED, text=(
             "权限口令不是可映射的字段（架构上无法写进文档或邮件）。")
         ).pack(side="left", padx=8)
 
@@ -5118,7 +5119,7 @@ class App:
         ttk.Label(s1, text="   收件人匹配字段：").pack(side="left", padx=(10, 0))
         match_var = self._wb_keep_var(tk.StringVar(value=sh.get("match_col", "name")))
         ttk.Entry(s1, textvariable=match_var, width=16).pack(side="left", padx=4)
-        ttk.Label(s1, foreground="#888", text="（默认 name = 收件人名称）").pack(side="left", padx=6)
+        ttk.Label(s1, foreground=MORANDI_MUTED, text="（默认 name = 收件人名称）").pack(side="left", padx=6)
         s2 = ttk.Frame(sbox)
         s2.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Button(s2, text="保存数据表配置", width=14, command=lambda: self._wb_save_sheet_cfg(
@@ -5580,6 +5581,12 @@ class App:
         self._wb_save()
         self._wb_fill_pipe_table(keep_sel=item.get("id"))
         self._wb_render_params(item)
+        if key == "watermark":
+            def restore_watermark_focus():
+                widget = getattr(self, "_wb_watermark_check", None)
+                if widget is not None and widget.winfo_exists():
+                    widget.focus_set()
+            self.root.after_idle(restore_watermark_focus)
 
     def _wb_item_perm(self, item, pk, var):
         params = item.setdefault("params", {})
@@ -5671,7 +5678,7 @@ class App:
         ttk.Button(bot, text="保存模板", command=self._wb_save_mail).pack(side="left")
         ttk.Button(bot, text="导入HTML文件…", command=self._wb_import_html).pack(side="left", padx=6)
         ttk.Button(bot, text="恢复默认", command=self._wb_reset_mail).pack(side="left")
-        ttk.Label(bot, foreground="#888", text=(
+        ttk.Label(bot, foreground=MORANDI_MUTED, text=(
             "可用字段：收件人名称 / 合并组 / 水印名称 / 打开口令 / 日期"
             " + 收件人自定义字段 + 事件常量（无权限口令字段）")).pack(side="left", padx=8)
 
@@ -6046,9 +6053,9 @@ class App:
                 tk.Label(frame, text="· " + nm, anchor="w", justify="left",
                          fg="#666", bg=MORANDI_CARD).pack(anchor="w", padx=4)
             tk.Label(frame, text="（文件尚未生成，处理后可点击打开）",
-                     fg="#888", bg=MORANDI_CARD).pack(anchor="w", padx=4)
+                     fg=MORANDI_MUTED, bg=MORANDI_CARD).pack(anchor="w", padx=4)
         else:
-            tk.Label(frame, text="（这位收件人没有附件）", fg="#888",
+            tk.Label(frame, text="（这位收件人没有附件）", fg=MORANDI_MUTED,
                      bg=MORANDI_CARD).pack(anchor="w", padx=4)
 
     def _wb_open_file(self, path):
@@ -6374,13 +6381,26 @@ class App:
             text="%s · %s · 字号上限%s · %s · %s · 浓度%.2f"
                  % (layout, font, fs, ang, rep, float(c.get("opacity", 0.25))))
 
-    def open_wm_settings(self):
-        cur = dict(wm.WM_DEFAULTS, **(self.settings.get("wm_settings") or {}))
+    def open_wm_settings(self, item):
+        # 条目覆盖优先，旧事件继续沿用事件参数；不改写旧全局设置。
+        item_cfg = (item.get("params") or {}).get("wm_settings")
+        fallback = (((self._wb_event or {}).get("options") or {}).get("wm_settings")
+                    or self.settings.get("wm_settings") or {})
+        cur = dict(wm.WM_DEFAULTS, **(item_cfg if isinstance(item_cfg, dict) else fallback))
         win = tk.Toplevel(self.root)
-        win.title("水印设置")
+        win.title("水印设置 · " + (item.get("name") or "当前条目"))
+        win.transient(self.root)
+        self.root.update_idletasks()
+        x = max(0, min(self.root.winfo_rootx() + (self.root.winfo_width() - 820) // 2,
+                       self.root.winfo_screenwidth() - 820))
+        y = max(0, min(self.root.winfo_rooty() + (self.root.winfo_height() - 540) // 2,
+                       self.root.winfo_screenheight() - 570))
+        win.geometry("820x540+%d+%d" % (x, y))
         win.grab_set()
-        frm = ttk.Frame(win)
-        frm.pack(padx=10, pady=8, fill="x")
+        content = ttk.Frame(win)
+        content.pack(fill="both", expand=True, padx=10, pady=8)
+        frm = ttk.Frame(content)
+        frm.pack(side="left", fill="y", anchor="n")
         self._wm_vars = {}
         _row = [0]
 
@@ -6390,7 +6410,7 @@ class App:
             ttk.Label(frm, text=label).grid(row=r, column=0, sticky="e", padx=6, pady=3)
             widget.grid(row=r, column=1, sticky="w", padx=6, pady=3)
             if hint:
-                ttk.Label(frm, foreground="#888", text=hint).grid(
+                ttk.Label(frm, foreground=MORANDI_MUTED, text=hint).grid(
                     row=r, column=2, sticky="w")
 
         lay = ttk.Combobox(frm, state="readonly", width=18,
@@ -6469,9 +6489,8 @@ class App:
                 "opacity": float(opv.get()),
             }
 
-        ttk.Separator(win).pack(fill="x", padx=10)
-        pf = ttk.Frame(win)
-        pf.pack(padx=10, pady=6, fill="both", expand=True)
+        pf = ttk.Frame(content)
+        pf.pack(side="right", padx=10, fill="both", expand=True)
         self._wm_preview_label = tk.Label(pf, anchor="nw", background="#ffffff")
         self._wm_preview_label.pack(side="left", fill="both", expand=True)
 
@@ -6486,20 +6505,25 @@ class App:
                 png = page.get_pixmap(dpi=72).tobytes("png")
                 doc.close()
                 img = Image.open(io.BytesIO(png))
-                w = 340
+                w = 260
                 img = img.resize((w, int(img.height * w / img.width)))
                 self._wm_preview_img = ImageTk.PhotoImage(img)
                 self._wm_preview_label.configure(image=self._wm_preview_img, text="")
             except Exception as e:
                 self._wm_preview_label.configure(image="", text="预览失败：%s" % e)
 
-        ttk.Button(pf, text="刷新预览", command=refresh_preview).pack(side="left", padx=8, anchor="n")
         btns = ttk.Frame(win)
-        btns.pack(pady=8)
-        ttk.Button(btns, text="保存", command=lambda: save_and_close()).pack(side="left", padx=8)
+        btns.pack(side="bottom", fill="x", padx=10, pady=8)
+        ttk.Button(btns, text="刷新预览", command=refresh_preview).pack(side="left", padx=4)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="保存", command=lambda: save_and_close()).pack(side="right", padx=4)
 
         def save_and_close():
-            cfg_now = collect()
+            try:
+                cfg_now = collect()
+            except (ValueError, tk.TclError):
+                messagebox.showwarning("水印设置", "请输入有效的字号和不透明度。", parent=win)
+                return
             if not re.fullmatch(r"#[0-9a-fA-F]{6}", cfg_now.get("color", "")):
                 messagebox.showwarning("颜色", "颜色须为 #RRGGBB 六位十六进制（如 #737373）",
                                        parent=win)
@@ -6507,10 +6531,20 @@ class App:
             if not (0.03 <= cfg_now["opacity"] <= 0.60):
                 messagebox.showwarning("不透明度", "不透明度须在 0.03 ~ 0.60 之间", parent=win)
                 return
-            self.settings["wm_settings"] = cfg_now
-            self.store.save_settings(self.settings)
-            self._update_wm_summary()
+            if not self._wb_flush_item_editor():
+                return
+            params = item.setdefault("params", {})
+            previous = params.get("wm_settings")
+            existed = "wm_settings" in params
+            params["wm_settings"] = cfg_now
+            if not self._wb_save():
+                if existed:
+                    params["wm_settings"] = previous
+                else:
+                    params.pop("wm_settings", None)
+                return
             win.destroy()
+            self._wb_render_params(item)
 
         refresh_preview()
 

@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.11"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.12"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -691,6 +691,8 @@ def normalize_item(it):
         p["path_map"] = {str(k): split_paths(v) if isinstance(v, str) else
                          [str(x) for x in v] for k, v in path_map.items()
                          if isinstance(v, (str, list))}
+    if isinstance(params.get("wm_settings"), dict):
+        p["wm_settings"] = dict(params["wm_settings"])
     if params.get("preserve_name"):
         p["preserve_name"] = True
     if isinstance(params.get("target_scope"), dict):
@@ -2483,7 +2485,9 @@ def execute_item(item, unit, event, ctx):
             if not (text or "").strip():
                 raise RuntimeError("水印文字为空（收件人的水印名称与名称都为空）")
             out = outdir / (Path(src).stem + ".pdf")
-            info = wm.watermark_pdf(str(src), str(out), text, opts.get("wm_settings"))
+            item_wm = params.get("wm_settings")
+            effective_wm = item_wm if isinstance(item_wm, dict) else opts.get("wm_settings")
+            info = wm.watermark_pdf(str(src), str(out), text, effective_wm)
             warnings += info.get("warnings", [])
             new_targets.append(out)
         cur = new_targets[0] if len(new_targets) == 1 else new_targets
