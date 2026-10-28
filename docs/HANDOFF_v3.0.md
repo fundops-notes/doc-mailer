@@ -1994,3 +1994,5 @@ CI 40542682995 success；Release 425725726。重新下载两资产与本地 SHA2
 
 §51 v3.9.9 事件右键菜单（2026-10-28）
 事件表右键选择目标行，提供打开、编辑、复制、删除、导出；空白处右键不弹出。全量 pytest 409 passed，菜单专项 2 passed，真实 Tk/Office E2E 79 PASS / 0 FAIL。Linear 名称差异只读核对报告位于共享工作区 outputs，不进入仓库。发布状态以 CI 和资产校验为准。
+
+CI 40617306555 success；Release 426178867；两资产重下载哈希与本地一致，下载 exe 签名 Valid。便携包 SHA256 5D257EEE853710B3D32F98705B0E31E8193BDCFD6ADF557205E3250FC6EDB1CE；win64 包 BFEF244C9ECDC1002DCF3E2A7787FCEBD7F39371E7833D3ED82E695FF2FFFB08。
