@@ -2000,3 +2000,5 @@ CI 40617306555 success；Release 426178867；两资产重下载哈希与本地�
 
 §52 v3.9.10 事件合并组隔离（2026-10-28）
 收件人库的界面、联系人Excel与事件互导不再传递合并组；既有库历史值保留在磁盘且不会进入事件，事件分组行为不变。全量pytest 414 passed，Tk/Office E2E 79 PASS / 0 FAIL。用户Linear七个事件统一CC/BCC并已备份，145个模拟草稿逐封校验，SX事件不变。发布状态以CI及资产核验为准。
+
+CI 40627086538 success；Release 426233139；两资产重下载哈希与本地一致，下载 exe 签名 Valid。便携包 SHA256 A3D067CE56C022D1D1855ED9446DCB4BD9F928B1D5C32FAA24FACBE142FD1B0A；win64 包 B95E390AEAE1134D6DC9F27A1487B20A28E33DF6B93453779CA369B9C71EC31D。
