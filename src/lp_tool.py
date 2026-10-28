@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.12"
+APP_VERSION = "3.9.13"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -98,7 +98,7 @@ SAAS_FONT = "Microsoft YaHei UI"
 FIELDS = ["{{收件人名称}}", "{{合并组}}", "{{合并组或收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
 DEFAULT_SUBJECT = "机密文件（{{收件人名称}} 专属）"
-DEFAULT_BODY = """<div style="font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
+DEFAULT_BODY = """<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
 <p><b>{{收件人名称}}</b> 您好：</p>
 <p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>
 <p style="padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;">
@@ -377,25 +377,26 @@ def _style_key(st):
 
 def _ensure_tag(tw, st):
     name = _style_key(st)
-    if name not in _TAG_STYLE:
-        fam = st.get("f") or "Microsoft YaHei"
-        size = st.get("s") or 12
-        styles = []
-        if st.get("b"):
-            styles.append("bold")
-        if st.get("i"):
-            styles.append("italic")
-        if st.get("u"):
-            styles.append("underline")
-        cfg = {"font": tuple([fam, size] + styles)}
-        if st.get("c"):
-            cfg["foreground"] = st["c"]
-        if st.get("bg"):
-            cfg["background"] = st["bg"]
-        if st.get("al") in ("center", "right"):
-            cfg["justify"] = st["al"]
-        tw.tag_configure(name, **cfg)
-        _TAG_STYLE[name] = st
+    # Tags belong to each Text widget; configure them even when the style
+    # has already been seen in the other mail editor.
+    fam = st.get("f") or "Aptos"
+    size = st.get("s") or 14
+    styles = []
+    if st.get("b"):
+        styles.append("bold")
+    if st.get("i"):
+        styles.append("italic")
+    if st.get("u"):
+        styles.append("underline")
+    cfg = {"font": tuple([fam, size] + styles)}
+    if st.get("c"):
+        cfg["foreground"] = st["c"]
+    if st.get("bg"):
+        cfg["background"] = st["bg"]
+    if st.get("al") in ("center", "right"):
+        cfg["justify"] = st["al"]
+    tw.tag_configure(name, **cfg)
+    _TAG_STYLE[name] = st
     return name
 
 
@@ -637,7 +638,7 @@ def text_to_html(tw, base=(14, "#333333")):
                     style += f"color:{st['c']};"
                 if st.get("s") and st["s"] != base[0]:
                     style += f"font-size:{st['s']}px;"
-                if st.get("f") and st["f"] != "Microsoft YaHei":
+                if st.get("f") and st["f"] != "Aptos":
                     style += f"font-family:{st['f']};"
                 if st.get("bg"):
                     style += f"background:{st['bg']};"
@@ -657,7 +658,7 @@ def text_to_html(tw, base=(14, "#333333")):
         seg += _render_text(raw[pos:], pos)
         alattr = f' align="{align}"' if align else ""
         out.append(f"<p{alattr}>{seg}</p>" if seg else "<p><br></p>")
-    return ('<div style="font-family:微软雅黑,Segoe UI,Arial;'
+    return ('<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;'
             f'font-size:{base[0]}px;color:{base[1]};line-height:1.8">'
             + "".join(out) + "</div>")
 
@@ -5662,7 +5663,7 @@ class App:
 
         editpane = ttk.Frame(parent)
         editpane.pack(fill="both", expand=True, pady=4)
-        t = tk.Text(editpane, height=10, undo=True, wrap="word", font=(SAAS_FONT, 11),
+        t = tk.Text(editpane, height=10, undo=True, wrap="word", font=("Aptos", 14),
                     spacing1=4, spacing3=4, padx=12, pady=10,
                     background=MORANDI_TOP, relief="solid", borderwidth=1)
         self.body_text = t
@@ -5884,7 +5885,7 @@ class App:
         edframe = ttk.Frame(rightpane)
         edframe.pack(fill="both", expand=True, pady=(2, 2))
         self._ov_body_text = tk.Text(
-            edframe, height=8, undo=True, wrap="word", font=(SAAS_FONT, 10),
+            edframe, height=8, undo=True, wrap="word", font=("Aptos", 14),
             spacing1=3, spacing3=3, padx=10, pady=8,
             background=MORANDI_TOP, relief="solid", borderwidth=1)
         self.body_text = self._ov_body_text
@@ -6203,10 +6204,7 @@ class App:
 
     # ================= 富文本编辑器（复用 v2 实现） =================
 
-    EDITOR_FONTS = ("微软雅黑", "宋体", "黑体", "楷体", "仿宋",
-                    "Arial", "Times New Roman", "Courier New")
-
-    EDITOR_FONTS = ("微软雅黑", "宋体", "黑体", "楷体", "仿宋",
+    EDITOR_FONTS = ("Aptos", "微软雅黑", "宋体", "黑体", "楷体", "仿宋",
                     "Arial", "Times New Roman", "Courier New")
 
     def _build_editor_toolbar(self, parent, compact=False):
@@ -6227,7 +6225,7 @@ class App:
             tk.Frame(toolbar,width=1,height=20,bg=MORANDI_LINE).pack(side="left",padx=3)
         ttk.Label(toolbar,text="字体",font=(SAAS_FONT,8)).pack(side="left")
         self._ed_font=ttk.Combobox(toolbar,width=10,state="readonly",values=list(self.EDITOR_FONTS),font=(SAAS_FONT,9))
-        self._ed_font.set("微软雅黑")
+        self._ed_font.set("Aptos")
         self._ed_font.pack(side="left")
         self._ed_font.bind("<<ComboboxSelected>>",lambda _e:self._ed_restyle(f=self._ed_font.get()))
         ttk.Label(toolbar,text="字号",font=(SAAS_FONT,8)).pack(side="left")

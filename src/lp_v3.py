@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.12"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.13"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -414,7 +414,7 @@ MOCK_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密�
 
 # v3 默认邮件模板（与 v2 保持一致的措辞）
 DEFAULT_SUBJECT_V3 = "机密文件（{{收件人名称}} 专属）"
-DEFAULT_BODY_V3 = """<div style="font-family:微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
+DEFAULT_BODY_V3 = """<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
 <p><b>{{收件人名称}}</b> 您好：</p>
 <p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>
 <p style="padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;">
