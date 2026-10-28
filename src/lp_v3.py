@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.9"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.10"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -1172,6 +1172,8 @@ def pool_merge_recipient(pool, rec):
     """
     pool = pool if isinstance(pool, list) else []
     src = normalize_pool_recipient(rec)
+    # 分组只属于事件；收件人库不接收来源事件的分组。
+    src["group"] = ""
     name = src.get("name", "")
     if not name:
         return pool, None, False
@@ -1198,7 +1200,11 @@ def merge_recipients_into_event(event, records):
     ev = normalize_event(event)
     added = updated = 0
     for rec in records or []:
-        ev["recipients"], a, u = merge_recipient_into_list(ev["recipients"], rec)
+        # 老版本库中可能留有 group；加入事件时必须忽略，不能改变现有分组。
+        source = dict(rec or {})
+        source["group"] = ""
+        source.pop("merge_group", None)
+        ev["recipients"], a, u = merge_recipient_into_list(ev["recipients"], source)
         added += a
         updated += u
     ev["updated_at"] = _now_str()
@@ -1512,7 +1518,19 @@ class Store:
             rec["id"] = _new_id("rcp")
         rec["updated_at"] = _now_str()
         self.ensure_dirs()
-        ok, err = write_json_file(self.pool_path(rec["id"]), rec)
+        # 新记录不存事件分组；旧库记录的历史值原样保留在磁盘，
+        # 仅供备份恢复，界面不显示，且不会带入事件。
+        path = self.pool_path(rec["id"])
+        if path.exists():
+            previous, error = read_json_file(path)
+            if error:
+                return False, error, rec
+            if not isinstance(previous, dict):
+                return False, "原收件人数据格式无效，未覆盖", rec
+            rec["group"] = previous.get("group") or previous.get("merge_group") or ""
+        else:
+            rec["group"] = ""
+        ok, err = write_json_file(path, rec)
         return ok, err, rec
 
     def replace_pool_tags(self, old_tags, new_tag, ids=None):
@@ -3669,6 +3687,7 @@ def validate_pool_recipient_rows(rows, existing_names=None, check_files=True):
         rec["tags"] = parse_pool_tags([tag for col in tag_cols
                                        for tag in parse_pool_tags(fields.get(col, ""))])
         rec["fields"] = {}
+        rec["group"] = ""  # 合并组属于事件，不导入收件人库
         for i, warning in enumerate(item["warnings"]):
             if "与已有收件人同名" in warning:
                 item["warnings"][i] = "与已有联系人同名，按名称补空合并；已有口令保留，标签合并"
@@ -3731,6 +3750,9 @@ def pool_recipients_to_rows(recipients, include_passwords=True):
     """库 Excel：基础资料加标签，排除历史事件字段；标签可无损往返。"""
     recs = [dict(r, fields={}) for r in recipients]
     rows = recipients_to_rows(recs, include_passwords)
+    group_col = rows[0].index("合并组")
+    for row in rows:
+        row.pop(group_col)
     rows[0].append("标签")
     for row, rec in zip(rows[1:], recs):
         tags = parse_pool_tags(rec.get("tags") or [])

@@ -1996,3 +1996,7 @@ CI 40542682995 success；Release 425725726。重新下载两资产与本地 SHA2
 事件表右键选择目标行，提供打开、编辑、复制、删除、导出；空白处右键不弹出。全量 pytest 409 passed，菜单专项 2 passed，真实 Tk/Office E2E 79 PASS / 0 FAIL。Linear 名称差异只读核对报告位于共享工作区 outputs，不进入仓库。发布状态以 CI 和资产校验为准。
 
 CI 40617306555 success；Release 426178867；两资产重下载哈希与本地一致，下载 exe 签名 Valid。便携包 SHA256 5D257EEE853710B3D32F98705B0E31E8193BDCFD6ADF557205E3250FC6EDB1CE；win64 包 BFEF244C9ECDC1002DCF3E2A7787FCEBD7F39371E7833D3ED82E695FF2FFFB08。
+
+
+§52 v3.9.10 事件合并组隔离（2026-10-28）
+收件人库的界面、联系人Excel与事件互导不再传递合并组；既有库历史值保留在磁盘且不会进入事件，事件分组行为不变。全量pytest 414 passed，Tk/Office E2E 79 PASS / 0 FAIL。用户Linear七个事件统一CC/BCC并已备份，145个模拟草稿逐封校验，SX事件不变。发布状态以CI及资产核验为准。

@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.9"
+APP_VERSION = "3.9.10"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -1751,9 +1751,9 @@ class App:
                                          else bool(selected_tags & tags))
         displayed = [rec for rec in pool if visible(rec)]
         self._pool_filter_count.configure(text="显示 %d / %d 位" % (len(displayed), len(pool)))
-        cols = ["name", "to", "cc", "bcc", "wm", "group", "tags",
+        cols = ["name", "to", "cc", "bcc", "wm", "tags",
                 "open_pw", "owner_pw"]
-        heads = ["收件人名称", "To", "CC", "BCC", "水印", "组", "标签",
+        heads = ["收件人名称", "To", "CC", "BCC", "水印", "标签",
                  "打开口令", "权限口令(勿发)"]
         tree.delete(*tree.get_children())
         self._pool_iids = {}
@@ -1771,7 +1771,7 @@ class App:
         restored_selection = []
         for i, r in enumerate(displayed):
             vals = [r.get("name", ""), r.get("to", ""), r.get("cc", ""),
-                    r.get("bcc", ""), r.get("wm", ""), r.get("group", ""),
+                    r.get("bcc", ""), r.get("wm", ""),
                     "、".join(r.get("tags") or []),
                     r.get("open_pw", ""),
                     "••••" if r.get("owner_pw") else ""]
@@ -1812,7 +1812,7 @@ class App:
 
         self._recipient_dialog(rec, self._pool_field_cols(),
                                "新增收件人（收件人库）", save,
-                               "（收件人库不保存自定义字段；字段在事件里维护）")
+                               "（自定义字段和合并组在事件里维护）", allow_group=False)
 
     def _pool_field_cols(self):
         """v3.7.1：收件人库不保存/显示自定义字段（字段属于事件，避免跨事件累积）。"""
@@ -1844,7 +1844,7 @@ class App:
 
         self._recipient_dialog(rec, self._pool_field_cols(),
                                "编辑收件人（收件人库）", save,
-                               "（收件人库不保存自定义字段；字段在事件里维护）")
+                               "（自定义字段和合并组在事件里维护）", allow_group=False)
 
     def _pool_tags(self):
         ids = self._pool_selected()
@@ -2195,7 +2195,7 @@ class App:
 
     def _pool_export_template(self):
         """联系人专用模板：基础资料和标签，不混入本次业务字段。"""
-        headers = lp_v3.import_template_headers(["标签"])
+        headers = [h for h in lp_v3.import_template_headers(["标签"]) if h != "合并组"]
         sample = {"收件人名称": "示例：某某公司", "收件人": "contact@example.com", "标签": "重点；华东"}
         guide = [["列名", "说明"],
                  ["收件人名称 / 收件人", "必填：联系人名称和邮箱；多邮箱用分号分隔"],
@@ -3419,7 +3419,7 @@ class App:
         idxs = sorted((tree.index(i) for i in tree.selection()), reverse=True)
         return [ev["recipients"][i] for i in idxs]
 
-    def _recipient_dialog(self, rec, field_cols, title, on_save, no_field_hint=""):
+    def _recipient_dialog(self, rec, field_cols, title, on_save, no_field_hint="", allow_group=True):
         """收件人编辑对话框（事件/收件人库共用）。
 
         v3.7.2：自定义字段属于事件，不在收件人信息里展示/编辑；保存时保留原字段。
@@ -3433,6 +3433,8 @@ class App:
                 ("合并发送组（同名=一封邮件，可空）", "group"),
                 ("邮件标题（空=用模板）", "subject"),
                 ("打开口令（发LP）", "open_pw"), ("权限口令（勿发LP）", "owner_pw")]
+        if not allow_group:
+            rows = [(label, key) for label, key in rows if key != "group"]
         entries = {}
         for i, (label, key) in enumerate(rows):
             ttk.Label(win, text=label).grid(row=i, column=0, sticky="e", padx=6, pady=4)
