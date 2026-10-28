@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.10"
+APP_VERSION = "3.9.11"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -1391,8 +1391,8 @@ class App:
 
         # 左：事件表
         left = ttk.Frame(paned)
-        cols = ["name", "mode", "recips", "steps", "atts", "status", "last"]
-        heads = ["事件名称", "发送模式", "收件人", "流水线", "附件", "状态", "最近执行"]
+        cols = ["name", "mode", "recips", "mail_count", "steps", "atts", "status", "last"]
+        heads = ["事件名称", "发送模式", "收件人", "预计邮件数", "流水线", "附件", "状态", "最近执行"]
         self.ev_tree = ttk.Treeview(left, columns=cols, show="headings",
                                     selectmode="browse")
         for c, h in zip(cols, heads):
@@ -1495,8 +1495,8 @@ class App:
             self.ev_tree.insert("", "end", iid=e["id"], values=[
                 e.get("name", ""),
                 lp_v3.SEND_MODE_LABELS.get(mode, mode),
-                len(e.get("recipients", [])), len(e.get("pipeline", [])),
-                len(e.get("attachments", [])), st or "草稿", last or "—"])
+                len(e.get("recipients", [])), len(lp_v3.draft_units(e)),
+                len(e.get("pipeline", [])), len(e.get("attachments", [])), st or "草稿", last or "—"])
         self.home_status.configure(text="共 %d 个事件" % len(events))
         self._draw_selected_flow()
 
