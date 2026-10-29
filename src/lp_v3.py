@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.13"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.14"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -414,12 +414,12 @@ MOCK_HEADERS = ["收件人名称", "水印名称", "收件人", "抄送", "密�
 
 # v3 默认邮件模板（与 v2 保持一致的措辞）
 DEFAULT_SUBJECT_V3 = "机密文件（{{收件人名称}} 专属）"
-DEFAULT_BODY_V3 = """<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
+DEFAULT_BODY_V3 = """<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;font-size:14pt;color:#333;line-height:1.8;">
 <p><b>{{收件人名称}}</b> 您好：</p>
 <p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>
 <p style="padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;">
 <b>打开口令：{{打开口令}}</b></p>
-<p style="color:#888;font-size:12px;">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>
+<p style="color:#888;font-size:12pt;">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>
 <p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>
 </div>"""
 
@@ -3387,6 +3387,94 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
         _log("执行记录保存失败：%s" % save_err)
     return run
 
+
+
+def run_batch_events(store, events, outdir, word, progress=None):
+    """Process selected event snapshots serially; never send and never discard overrides.
+
+    Each event is checked against its on-disk hash both before processing and before
+    creating drafts. Processing results are backed up before being saved.
+    """
+    import copy
+    import hashlib
+
+    results = []
+    total = len(events)
+    for number, (event, expected_hash) in enumerate(events, 1):
+        name = event.get("name") or event.get("id") or "未命名事件"
+        try:
+            path = store.event_path(event["id"])
+            def unchanged():
+                return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash
+            if not unchanged():
+                results.append({"name": name, "status": "跳过", "detail": "事件在确认后发生变化，请重新选择并预检"})
+                continue
+            errors, warnings, _info = preflight(event, store)
+            missing = [w for w in warnings if "附件不存在" in w or "取路径失败" in w]
+            if errors or missing:
+                results.append({"name": name, "status": "跳过", "detail": "；".join(errors + missing)})
+                continue
+            working = copy.deepcopy(event)
+            working.setdefault("options", {})["outdir"] = str(outdir)
+            working["process_results"] = {}
+            working.pop("process_signature", None)
+            stage = run_event(store, working, outdir=outdir, word=word,
+                              create_drafts=False, reuse_processed=False)
+            bad = stage.get("errors") or []
+            unsafe = [item for item in stage.get("items", [])
+                      if item.get("error") or item.get("missing")
+                      or str(item.get("draft", "")).startswith("跳过(附件缺失)")
+                      or str(item.get("draft", "")).startswith("跳过(无附件)")]
+            missing_warnings = [w for w in stage.get("warnings") or []
+                                if "文件不存在" in w or "附件不存在" in w or "取路径失败" in w]
+            if bad or unsafe or missing_warnings or (stage.get("stats") or {}).get("fail"):
+                results.append({"name": name, "status": "处理失败", "detail": "；".join(bad + missing_warnings) or "存在失败或缺失附件，未生成草稿"})
+                continue
+            if not unchanged():
+                results.append({"name": name, "status": "跳过", "detail": "事件在处理期间发生变化，未生成草稿"})
+                continue
+            processed = {}
+            for item in stage.get("items") or []:
+                for member in item.get("members") or []:
+                    processed.setdefault(member, []).extend(item.get("files") or [])
+            working["process_results"] = {key: list(dict.fromkeys(vals)) for key, vals in processed.items()}
+            working["process_signature"] = stage.get("process_signature", "")
+            if not prepared_files_current(working):
+                results.append({"name": name, "status": "跳过", "detail": "处理结果已失效或文件缺失，未生成草稿"})
+                continue
+            # Save the output mapping so that reopening the event cannot show stale
+            # attachments. Back up before writing and recheck concurrent edits.
+            try:
+                backup = store._backup_event(path, "before_batch")
+            except Exception as error:
+                results.append({"name": name, "status": "跳过", "detail": "备份事件失败，未生成草稿：%s" % error})
+                continue
+            if not unchanged():
+                results.append({"name": name, "status": "跳过", "detail": "事件在备份期间发生变化，未生成草稿"})
+                continue
+            ok, error = store.save_event(working)
+            if not ok:
+                results.append({"name": name, "status": "跳过", "detail": "保存处理结果失败，未生成草稿：%s" % error})
+                continue
+            saved_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            saved, error = store.load_event(working["id"])
+            if error or not saved or saved.get("mail_overrides") != event.get("mail_overrides") or not prepared_files_current(saved):
+                results.append({"name": name, "status": "跳过", "detail": "保存结果复核失败，未生成草稿；备份：%s" % backup})
+                continue
+            if hashlib.sha256(path.read_bytes()).hexdigest() != saved_hash:
+                results.append({"name": name, "status": "跳过", "detail": "事件发生变化，未生成草稿"})
+                continue
+            draft = run_event(store, saved, outdir=outdir, word=word,
+                              create_drafts=True, reuse_processed=True)
+            stats = draft.get("stats") or {}
+            detail = "成功 %d，失败 %d，跳过 %d" % (stats.get("ok", 0), stats.get("fail", 0), stats.get("skip", 0))
+            results.append({"name": name, "status": "完成" if draft.get("status") == "ok" else "部分完成", "detail": detail})
+        except Exception as error:
+            results.append({"name": name, "status": "失败", "detail": str(error)})
+        finally:
+            if progress:
+                progress(number, total, name)
+    return results
 
 def failed_recipients(run):
     """从执行记录里取出需要重跑的收件人名。"""

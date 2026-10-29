@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.13"
+APP_VERSION = "3.9.14"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -98,12 +98,12 @@ SAAS_FONT = "Microsoft YaHei UI"
 FIELDS = ["{{收件人名称}}", "{{合并组}}", "{{合并组或收件人名称}}", "{{水印名称}}", "{{打开口令}}", "{{日期}}"]
 
 DEFAULT_SUBJECT = "机密文件（{{收件人名称}} 专属）"
-DEFAULT_BODY = """<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;font-size:14px;color:#333;line-height:1.8;">
+DEFAULT_BODY = """<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;font-size:14pt;color:#333;line-height:1.8;">
 <p><b>{{收件人名称}}</b> 您好：</p>
 <p>附件为贵司专属的加密文件（已加盖专属水印），请使用以下打开口令查阅：</p>
 <p style="padding:10px 16px;background:#f5f6f8;border-left:3px solid #4a6fa5;border-radius:4px;">
 <b>打开口令：{{打开口令}}</b></p>
-<p style="color:#888;font-size:12px;">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>
+<p style="color:#888;font-size:12pt;">本文件带有贵司专属水印标识，仅供贵司内部使用，请妥善保管、请勿转发。</p>
 <p>如有任何疑问，请随时与我们联系。<br><br>此致<br>【公司/团队名称】<br>{{日期}}</p>
 </div>"""
 
@@ -381,6 +381,9 @@ def _ensure_tag(tw, st):
     # has already been seen in the other mail editor.
     fam = st.get("f") or "Aptos"
     size = st.get("s") or 14
+    size = max(1, round(size))
+    if st.get("size_unit") == "px":
+        size = -size  # Tk negative font sizes are pixels; positive sizes are points.
     styles = []
     if st.get("b"):
         styles.append("bold")
@@ -429,12 +432,11 @@ class _HTML2Runs(_HTMLParser):
                 elif k in ("background", "background-color") and v.startswith("#"):
                     st["bg"] = v
                 elif k == "font-size":
-                    num = v.replace("px", "").replace("pt", "").strip()
-                    try:
-                        if float(num) > 0:
-                            st["s"] = int(float(num))
-                    except ValueError:
-                        pass
+                    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(px|pt)?\s*", v, re.I)
+                    if match and float(match.group(1)) > 0:
+                        value = float(match.group(1))
+                        st["s"] = int(value) if value.is_integer() else value
+                        st["size_unit"] = (match.group(2) or "px").lower()
                 elif k == "font-family":
                     f = v.split(",")[0].strip().strip('"').strip("'")
                     if f:
@@ -636,8 +638,8 @@ def text_to_html(tw, base=(14, "#333333")):
                 style = ""
                 if st.get("c") and st["c"].lower() != base[1].lower():
                     style += f"color:{st['c']};"
-                if st.get("s") and st["s"] != base[0]:
-                    style += f"font-size:{st['s']}px;"
+                if st.get("s") and (st["s"] != base[0] or st.get("size_unit") == "px"):
+                    style += f"font-size:{st['s']}{st.get('size_unit') or 'pt'};"
                 if st.get("f") and st["f"] != "Aptos":
                     style += f"font-family:{st['f']};"
                 if st.get("bg"):
@@ -659,7 +661,7 @@ def text_to_html(tw, base=(14, "#333333")):
         alattr = f' align="{align}"' if align else ""
         out.append(f"<p{alattr}>{seg}</p>" if seg else "<p><br></p>")
     return ('<div style="font-family:Aptos,微软雅黑,Segoe UI,Arial;'
-            f'font-size:{base[0]}px;color:{base[1]};line-height:1.8">'
+            f'font-size:{base[0]}pt;color:{base[1]};line-height:1.8">'
             + "".join(out) + "</div>")
 
 
@@ -1367,6 +1369,8 @@ class App:
         bar.pack(fill="x", pady=(0, 4))
         ttk.Button(bar, text="＋ 新建事件", style="Accent.TButton",
                    command=self._new_event).pack(side="left", padx=(0, 6))
+        self._batch_button = ttk.Button(bar, text="批量生成草稿…", command=self._batch_generate_events)
+        self._batch_button.pack(side="left", padx=(0, 6))
         for text, cmd in (("打开工作台", self._open_selected_event),
                           ("编辑事件…", self._edit_event_dialog),
                           ("复制", self._dup_event),
@@ -1397,7 +1401,7 @@ class App:
         cols = ["name", "mode", "recips", "mail_count", "steps", "atts", "status", "last"]
         heads = ["事件名称", "发送模式", "收件人", "预计邮件数", "流水线", "附件", "状态", "最近执行"]
         self.ev_tree = ttk.Treeview(left, columns=cols, show="headings",
-                                    selectmode="browse")
+                                    selectmode="extended")
         for c, h in zip(cols, heads):
             self.ev_tree.heading(c, text=h)
             self.ev_tree.column(c, width=190 if c == "name" else 86)
@@ -1609,7 +1613,94 @@ class App:
 
     def _selected_event_id(self):
         sel = self.ev_tree.selection()
-        return sel[0] if sel else None
+        return sel[0] if len(sel) == 1 else None
+
+    def _batch_generate_events(self):
+        """Confirm all selected events, then prepare files and save drafts serially."""
+        import hashlib
+        if self.running:
+            messagebox.showinfo("正在处理", "请等待当前任务完成。")
+            return
+        ids = list(self.ev_tree.selection())
+        if not ids:
+            messagebox.showinfo("批量生成", "请选择一个或多个事件；可按 Ctrl 或 Shift 多选。")
+            return
+        ready, skipped, warnings = [], [], []
+        for eid in ids:
+            path = self.store.event_path(eid)
+            try:
+                raw = path.read_bytes()
+                original = json.loads(raw.decode("utf-8-sig"))
+                plan = lp_v3.event_upgrade_plan(original)
+                if plan.get("blocking") or plan.get("needs_confirmation"):
+                    skipped.append("%s：旧设置需要先在事件内检查并升级" % (original.get("name") or eid))
+                    continue
+                event, err = self.store.load_event(eid)
+                if err or not event:
+                    skipped.append("%s：%s" % (eid, err or "事件不存在"))
+                    continue
+                errors, warn, info = lp_v3.preflight(event, self.store)
+                missing = [w for w in warn if "附件不存在" in w or "取路径失败" in w]
+                if errors or missing:
+                    skipped.append("%s：%s" % (event.get("name", eid), "；".join(errors + missing)))
+                    continue
+                ready.append((event, hashlib.sha256(raw).hexdigest()))
+                warnings.extend("%s：%s" % (event.get("name", eid), w) for w in warn)
+            except Exception as ex:
+                skipped.append("%s：读取或预检失败：%s" % (eid, ex))
+        if not ready:
+            messagebox.showwarning("没有可执行的事件", "\n".join(skipped) or "没有可执行的事件")
+            return
+        folders = [lp_v3.sanitize_filename(e.get("name", "事件"), 60).casefold() for e, _ in ready]
+        selected_ids = {event.get("id") for event, _ in ready}
+        for iid in self.ev_tree.get_children():
+            if iid not in selected_ids:
+                values = self.ev_tree.item(iid, "values")
+                if values and lp_v3.sanitize_filename(str(values[0]), 60).casefold() in folders:
+                    messagebox.showerror("输出目录冲突", "所选事件与其他事件的输出目录重名，请先调整事件名称，避免覆盖其他事件文件。")
+                    return
+        if len(folders) != len(set(folders)):
+            messagebox.showerror("输出目录冲突", "所选事件的输出目录重名，请先调整事件名称，避免覆盖其他事件文件。")
+            return
+        detail = ["将按顺序重新处理 %d 个事件，预计 %d 封草稿；只保存草稿，不发送。" %
+                  (len(ready), sum(len(lp_v3.draft_units(e)) for e, _ in ready)),
+                  "已保存的单封邮件修改会保留。每个事件处理成功后才会生成草稿。\n重新处理会覆盖输出目录内同名的生成文件。"]
+        if skipped:
+            detail.append("以下事件将跳过：\n" + "\n".join(skipped))
+        if warnings:
+            detail.append("预检提醒：\n" + "\n".join(warnings))
+        detail.append("如果部分草稿已存在，重复执行可能产生重复草稿。\n\n继续？")
+        if not messagebox.askyesno("批量预检与确认", "\n\n".join(detail)):
+            return
+        outdir = self._default_outdir()
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            messagebox.showerror("输出目录不可用", str(error))
+            return
+        self.running = True
+        self._batch_mode = True
+        self._batch_locked = []
+        def lock(widget):
+            if widget.winfo_class() in ("TButton", "TCheckbutton", "TCombobox", "TEntry", "TMenubutton", "Treeview"):
+                self._batch_locked.append((widget, "disabled" in widget.state()))
+                widget.state(["disabled"])
+            for child in widget.winfo_children():
+                lock(child)
+        lock(self.home_tab_ev)
+        for button in getattr(self, "_nav_buttons", {}).values():
+            self._batch_locked.append((button, "disabled" in button.state()))
+            button.state(["disabled"])
+        self.home_status.configure(text="批量处理中：0/%d" % len(ready))
+        def job(get_word):
+            try:
+                def progress(done, total, name):
+                    self._q.put(("batch_progress", (done, total, name)))
+                result = lp_v3.run_batch_events(self.store, ready, str(outdir), get_word(), progress)
+                self._q.put(("batch_done", (result, skipped)))
+            except Exception as error:
+                self._q.put(("batch_done", ([{"name": "批量任务", "status": "失败", "detail": str(error)}], skipped)))
+        self._submit_job(job)
 
     def _dup_event(self):
         eid = self._selected_event_id()
@@ -6228,7 +6319,7 @@ class App:
         self._ed_font.set("Aptos")
         self._ed_font.pack(side="left")
         self._ed_font.bind("<<ComboboxSelected>>",lambda _e:self._ed_restyle(f=self._ed_font.get()))
-        ttk.Label(toolbar,text="字号",font=(SAAS_FONT,8)).pack(side="left")
+        ttk.Label(toolbar,text="字号(pt)",font=(SAAS_FONT,8)).pack(side="left")
         self._ed_size=ttk.Combobox(toolbar,width=3,state="readonly",values=[str(x) for x in (10,12,14,16,18,20,24,28)],font=(SAAS_FONT,9))
         self._ed_size.set("14")
         self._ed_size.pack(side="left")
@@ -6301,6 +6392,8 @@ class App:
         for k in list(_TAG_STYLE):
             t.tag_remove(k, a, b)
         st.update(changes)
+        if "s" in changes:
+            st["size_unit"] = "pt" if changes["s"] else None
         st = {k: v for k, v in st.items() if v}
         t.tag_add(_ensure_tag(t, st), a, b)
 
@@ -6876,6 +6969,22 @@ class App:
                     pass
                 elif kind == "run_done":
                     self._wb_finish_run(payload)
+                elif kind == "batch_progress":
+                    done, total, name = payload
+                    self.home_status.configure(text="批量处理中：%d/%d · %s" % (done, total, name))
+                elif kind == "batch_done":
+                    self.running = False
+                    for widget, was_disabled in getattr(self, "_batch_locked", []):
+                        if widget.winfo_exists() and not was_disabled:
+                            widget.state(["!disabled"])
+                    self._batch_locked = []
+                    results, skipped = payload
+                    self._refresh_home()
+                    lines = ["%s：%s%s" % (r["name"], r["status"],
+                             (" · " + r["detail"]) if r.get("detail") else "") for r in results]
+                    if skipped:
+                        lines.extend("预检跳过：" + item for item in skipped)
+                    messagebox.showinfo("批量生成结果", "\n".join(lines))
                 elif kind == "summary":
                     self._wb_log(payload)
                     self.root.after(300, lambda p=payload: messagebox.showinfo("批量结束", p))
@@ -6917,7 +7026,10 @@ class App:
                         self._close_update_progress()
                 elif kind == "done":
                     self.running = False
-                    self._wb_set_running(False)
+                    if getattr(self, "_batch_mode", False):
+                        self._batch_mode = False
+                    else:
+                        self._wb_set_running(False)
         except Exception:
             pass
         self._poll_id = self.root.after(120, self._poll_queue)

@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
 import lp_tool, lp_v3
-from test_v3_pool_gui import app,_event,_walk
+from test_v3_pool_gui import app,no_messagebox,_event,_walk
 
 def test_default_templates_and_roundtrip_keep_aptos_and_legacy_styles(tk_root):
     assert "font-family:Aptos," in lp_tool.DEFAULT_BODY
