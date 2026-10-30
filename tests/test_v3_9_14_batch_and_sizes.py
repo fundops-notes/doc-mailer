@@ -46,8 +46,12 @@ def test_batch_real_engine_fake_outlook_stops_incomplete_event(tmp_path,monkeypa
     saved=[]
     class Attachments:
         def Add(self,p):assert Path(p).is_file()
+    class Accessor:
+        def __init__(self): self.values={}
+        def SetProperty(self,key,value): self.values[key]=value
+        def GetProperty(self,key): return self.values[key]
     class Mail:
-        def __init__(self):self.Attachments=Attachments();self.Subject='';self.HTMLBody=''
+        def __init__(self):self.Attachments=Attachments();self.PropertyAccessor=Accessor();self.Subject='';self.HTMLBody=''
         def Save(self):saved.append((self.Subject,self.HTMLBody))
     class Outlook:
         def CreateItem(self,n):assert n==0;return Mail()

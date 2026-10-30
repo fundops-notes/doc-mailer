@@ -2789,11 +2789,7 @@ def _merge_addresses(members, key, extra=""):
     return out
 
 
-# v3.9.17 编码加固（2026-10-30 NAV乱码事件）：显式声明代码页，杜绝草稿在导出
-# .msg / 跨区域(中英文系统)打开与发送时的码制回退歧义。背景：事发草稿缺失
-# PR_MESSAGE_CODEPAGE / PR_INTERNET_CPID，中文系统(CP_ACP=936)回退解码 RTF 的
-# cp1252 转义字节（\'93/\'94 弯引号→"窶…"），并疑似触发云端签名改写的 UTF-16
-# 误解码，导致整封正文乱码。显式声明后不再依赖机器区域设置。
+# v3.9.17：显式设置代码页并在保存后读回；特定环境的乱码仍需端到端验证。
 _CODEPAGE_HARDENING_PROPS = (
     ("http://schemas.microsoft.com/mapi/proptag/0x3FFD0003", 1252,
      "message_codepage"),   # PR_MESSAGE_CODEPAGE = 1252（与RTF \ansicpg1252 一致）
@@ -2805,7 +2801,11 @@ _CODEPAGE_HARDENING_PROPS = (
 def _apply_codepage_hardening(mail):
     """逐项写入代码页属性，返回逐项结果；单项失败不影响其余项，也绝不抛出。"""
     result = {"items": [], "ok": False, "errors": []}
-    pa = getattr(mail, "PropertyAccessor", None)
+    try:
+        pa = getattr(mail, "PropertyAccessor", None)
+    except Exception as e:
+        result["errors"].append("PropertyAccessor 不可用: %s" % e)
+        return result
     if pa is None:
         result["errors"].append("PropertyAccessor 不可用")
         return result
@@ -2825,7 +2825,11 @@ def _apply_codepage_hardening(mail):
 def _readback_codepage_hardening(mail):
     """Save 后读回代码页属性，验证持久化；读不到的项标记为 None。"""
     out = {}
-    pa = getattr(mail, "PropertyAccessor", None)
+    try:
+        pa = getattr(mail, "PropertyAccessor", None)
+    except Exception as e:
+        return {**{key: None for _, _, key in _CODEPAGE_HARDENING_PROPS},
+                "accessor_error": str(e)}
     if pa is None:
         return {key: None for _, _, key in _CODEPAGE_HARDENING_PROPS}
     for prop, value, key in _CODEPAGE_HARDENING_PROPS:
@@ -2915,6 +2919,12 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None
             hardening.get("readback", {}).get(key) == value
             for _, value, key in _CODEPAGE_HARDENING_PROPS
         )
+        for _, value, key in _CODEPAGE_HARDENING_PROPS:
+            actual = hardening["readback"].get(key)
+            if actual != value:
+                reason = hardening["readback"].get(key + "_error") or hardening["readback"].get("accessor_error")
+                hardening["errors"].append("%s: 保存后读回%s" %
+                                           (key, "失败（%s）" % reason if reason else "不一致"))
         hardening["ok"] = bool(hardening.get("ok")) and hardening["persisted"]
         hardening_result.clear()
         hardening_result.update(hardening)
@@ -3443,6 +3453,8 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
                         note = "；编码加固: 全部生效"
                     elif hardening.get("errors"):
                         note = "；编码加固: 失败（%s）" % "；".join(hardening["errors"])
+                        item["encoding_warning"] = "编码加固未验证，请核对已保存的草稿，避免重复生成"
+                        run["warnings"].append("%s：%s" % (item["name"], item["encoding_warning"]))
                     else:
                         note = ""
                     _log("[草稿OK] %s -> Outlook 草稿箱（未发送）%s" % (item["name"], note))
@@ -3556,7 +3568,10 @@ def run_batch_events(store, events, outdir, word, progress=None):
                               create_drafts=True, reuse_processed=True)
             stats = draft.get("stats") or {}
             detail = "成功 %d，失败 %d，跳过 %d" % (stats.get("ok", 0), stats.get("fail", 0), stats.get("skip", 0))
-            results.append({"name": name, "status": "完成" if draft.get("status") == "ok" else "部分完成", "detail": detail})
+            encoding_warnings = [item for item in draft.get("items", []) if item.get("encoding_warning")]
+            if encoding_warnings:
+                detail += "；%d 封草稿编码需核对（已保存，请勿重复生成）" % len(encoding_warnings)
+            results.append({"name": name, "status": ("完成（需核对）" if encoding_warnings and draft.get("status") == "ok" else "完成" if draft.get("status") == "ok" else "部分完成"), "detail": detail})
         except Exception as error:
             results.append({"name": name, "status": "失败", "detail": str(error)})
         finally:
