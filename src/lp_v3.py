@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.16"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.17"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -2848,6 +2848,19 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None
         mail.SentOnBehalfOfName = from_addr
     for f in attachments:
         mail.Attachments.Add(str(Path(f).resolve()))  # Outlook 是独立进程，必须绝对路径
+    # v3.9.17 编码加固（2026-10-30 NAV乱码事件）：
+    # 显式声明代码页，杜绝草稿在导出 .msg / 跨区域(中英文系统)打开与发送时的码制回退歧义。
+    # 背景：事发草稿缺失 PR_MESSAGE_CODEPAGE / PR_INTERNET_CPID，中文系统(CP_ACP=936)
+    # 回退解码 RTF 的 cp1252 转义字节（\'93/\'94 弯引号→"窶…"），并疑似触发云端签名
+    # 改写的 UTF-16 误解码，导致整封正文乱码。显式声明后不再依赖机器区域设置。
+    # 注：此为加固措施；该事件的最终根因（云端窗口期故障 vs 本地转换变体）仍以
+    #     复现实验结论为准。
+    try:
+        _pa = mail.PropertyAccessor
+        _pa.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3FFD0003", 1252)   # PR_MESSAGE_CODEPAGE = 1252（与RTF \ansicpg1252 一致）
+        _pa.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3FDE0003", 65001)  # PR_INTERNET_CPID = UTF-8(65001)
+    except Exception:
+        pass  # 属性写入失败不阻断草稿创建（兼容旧版Outlook）
     try:
         mail.Save()  # 只存草稿；不调用 Send
     finally:
