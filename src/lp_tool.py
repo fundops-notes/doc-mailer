@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.14"
+APP_VERSION = "3.9.15"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -327,15 +327,15 @@ def render_filename(tpl, src_path, rec):
     """按模板生成输出文件名（不含扩展名）。字段：{{原件名}} {{LP名称}} {{水印名称}} {{日期}}"""
     mapping = {
         "{{原件名}}": Path(src_path).stem,
-        "{{LP名称}}": sanitize_filename(rec.get("name", ""), 60),   # 兼容旧模板
-        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), 60),
-        "{{水印名称}}": sanitize_filename(rec.get("wm", ""), 60),
+        "{{LP名称}}": sanitize_filename(rec.get("name", ""), None),   # 兼容旧模板
+        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), None),
+        "{{水印名称}}": sanitize_filename(rec.get("wm", ""), None),
         "{{日期}}": date.today().strftime("%Y%m%d"),
     }
     out = tpl or DEFAULT_FILENAME_TPL
     for k, v in mapping.items():
         out = out.replace(k, v)
-    out = sanitize_filename(out.strip(), 90)
+    out = sanitize_filename(out.strip(), None)
     return out or "output"
 
 

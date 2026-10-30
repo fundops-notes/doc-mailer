@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.14"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.15"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -79,7 +79,7 @@ def sanitize_filename(s, maxlen=40):
         s = s.replace(c, "_")
     s = "".join(ch for ch in s if ord(ch) >= 32)  # 去控制字符
     s = s.strip().rstrip(chr(46)).strip()          # 结尾的点/空格
-    return s[:maxlen] if s else "unnamed"
+    return (s if maxlen is None else s[:maxlen]) if s else "unnamed"
 
 
 def pw_fingerprint(pw):
@@ -2197,12 +2197,12 @@ def item_output_name(event, unit, source_path, orig_name=None, filename_tpl=None
     fields = build_field_map(rec, event)
     stem = Path(source_path).stem if source_path else ""
     if orig_name is not None and str(orig_name).strip():
-        stem = sanitize_filename(str(orig_name).strip(), 60)
+        stem = sanitize_filename(str(orig_name).strip(), None)
     mapping = {
         "{{原件名}}": stem,
-        "{{LP名称}}": sanitize_filename(rec.get("name", ""), 60),
-        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), 60),
-        "{{水印名称}}": sanitize_filename(rec.get("wm") or rec.get("name", ""), 60),
+        "{{LP名称}}": sanitize_filename(rec.get("name", ""), None),
+        "{{收件人名称}}": sanitize_filename(rec.get("name", ""), None),
+        "{{水印名称}}": sanitize_filename(rec.get("wm") or rec.get("name", ""), None),
         "{{日期}}": date.today().strftime("%Y%m%d"),
     }
     out = tpl
@@ -2214,8 +2214,8 @@ def item_output_name(event, unit, source_path, orig_name=None, filename_tpl=None
             if inner in ("name", "名称", "收件人名称", "lp名称", "lp_name",
                          "lpname", "wm", "水印", "水印名称", "wm_name"):
                 continue      # 已经用带清洗的版本替换过了
-            out = out.replace(k, sanitize_filename(str(v), 40))
-    out = sanitize_filename(out.strip(), 90)
+            out = out.replace(k, sanitize_filename(str(v), None))
+    out = sanitize_filename(out.strip(), None)
     return out or "output"
 
 
@@ -2281,6 +2281,16 @@ def default_word_batch():
     return wb
 
 
+def _validate_output_path(path):
+    """Conservative Win32/Office limit, measured in UTF-16 code units including extension."""
+    path = Path(path).absolute()
+    units = lambda s: len(str(s).encode("utf-16-le")) // 2
+    if units(path.name) > 255:
+        raise ValueError("输出文件名超过 255 个 UTF-16 字符单位，请缩短文件名模板。")
+    if units(path) > 259:
+        raise ValueError("输出完整路径超过 259 个 UTF-16 字符单位，请缩短输出目录或文件名模板。")
+
+
 class RunContext:
     """一次流水线执行期的上下文。"""
 
@@ -2292,7 +2302,7 @@ class RunContext:
         self._output_names = set()
         self.warnings = []
 
-    def reserve_output(self, directory, base, suffix, to_pdf=False):
+    def reserve_output(self, directory, base, suffix, to_pdf=False, pdf_temp=False):
         """为本轮处理预留输入和最终 PDF 名，防止跨收件人覆盖。"""
         index = 1
         while True:
@@ -2301,10 +2311,13 @@ class RunContext:
             paths = [candidate]
             if to_pdf:
                 paths.append(directory / (stem + ".pdf"))
+            if pdf_temp:
+                paths.append(directory / (stem + ".pdf.tmp"))
             keys = {str(p).casefold() for p in paths}
             if not (keys & self._output_names):
                 for path in paths:
                     _check_attachment_name(path.name, self.event)
+                    _validate_output_path(path)
                 self._output_names.update(keys)
                 return candidate
             index += 1
@@ -2394,6 +2407,7 @@ def execute_item(item, unit, event, ctx):
     params = item.get("params") or {}
     item_id = item.get("id") or "item"
     outdir = ctx.outdir / sanitize_filename(item_id, 40)
+    _validate_output_path(outdir / "x")
     outdir.mkdir(parents=True, exist_ok=True)
     warnings = []
     opts = event.get("options") or {}
@@ -2414,7 +2428,8 @@ def execute_item(item, unit, event, ctx):
             event, unit, tpl,
             orig_name=(item.get("name") or "").strip() or None,
             filename_tpl=(params.get("filename_tpl") or ""))
-        docx = ctx.reserve_output(outdir, base, ".docx", bool(params.get("to_pdf")))
+        docx = ctx.reserve_output(outdir, base, ".docx", bool(params.get("to_pdf")),
+                                  bool(params.get("watermark") or params.get("encrypt")))
         wm.generate_notice_docx(tpl, str(docx), fmap, batch=ctx.word)
         cur = docx
     else:
@@ -2445,7 +2460,8 @@ def execute_item(item, unit, event, ctx):
             if params.get("preserve_name") and not filename_tpl:
                 base = Path(sp).stem
             dst = ctx.reserve_output(outdir, base, Path(sp).suffix,
-                                     bool(params.get("to_pdf")))
+                                     bool(params.get("to_pdf")),
+                                     bool(params.get("watermark") or params.get("encrypt")))
             shutil.copy2(sp, str(dst))
             cur.append(dst)
         if not cur:
@@ -3081,7 +3097,10 @@ def _item_preview_files(event, item, unit):
         if kind == "attach":
             paths, _ = resolve_item_paths(item, one, event)
             for sp in paths:
-                base = item_output_name(event, one, str(sp))
+                template = (params.get("filename_tpl") or "").strip()
+                base = item_output_name(event, one, str(sp), filename_tpl=template)
+                if params.get("preserve_name") and not template:
+                    base = Path(str(sp)).stem
                 extension = ".pdf" if params.get("to_pdf") else Path(str(sp)).suffix
                 out.append(base + extension)
         else:
