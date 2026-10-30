@@ -1,10 +1,14 @@
 """Four workflow entries, final file selections, Next actions and compact editors."""
 from pathlib import Path
 import json
+import sys
 import fitz
 import openpyxl
 import pytest
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 import lp_tool
 import lp_v3
 import watermark_encrypt as wm
@@ -168,7 +172,7 @@ def test_prepared_files_reused_for_drafts_and_invalidated_on_source_change(tmp_p
     event['process_signature']=processed['process_signature']
     assert lp_v3.prepared_files_current(event)
     calls=[]
-    monkeypatch.setattr(lp_v3,'create_outlook_draft',lambda recipient,files,*args:calls.append((recipient['name'],[str(p) for p in files])))
+    monkeypatch.setattr(lp_v3,'create_outlook_draft',lambda recipient,files,*args,**kwargs:calls.append((recipient['name'],[str(p) for p in files])))
     monkeypatch.setattr(lp_v3,'run_items',lambda *a,**k:(_ for _ in ()).throw(AssertionError('must not rerun')))
     run=lp_v3.run_event(store,event,reuse_processed=True,outdir=tmp_path/'out')
     assert run['status']=='ok' and len(calls)==2

@@ -2789,11 +2789,62 @@ def _merge_addresses(members, key, extra=""):
     return out
 
 
+# v3.9.17 编码加固（2026-10-30 NAV乱码事件）：显式声明代码页，杜绝草稿在导出
+# .msg / 跨区域(中英文系统)打开与发送时的码制回退歧义。背景：事发草稿缺失
+# PR_MESSAGE_CODEPAGE / PR_INTERNET_CPID，中文系统(CP_ACP=936)回退解码 RTF 的
+# cp1252 转义字节（\'93/\'94 弯引号→"窶…"），并疑似触发云端签名改写的 UTF-16
+# 误解码，导致整封正文乱码。显式声明后不再依赖机器区域设置。
+_CODEPAGE_HARDENING_PROPS = (
+    ("http://schemas.microsoft.com/mapi/proptag/0x3FFD0003", 1252,
+     "message_codepage"),   # PR_MESSAGE_CODEPAGE = 1252（与RTF \ansicpg1252 一致）
+    ("http://schemas.microsoft.com/mapi/proptag/0x3FDE0003", 65001,
+     "internet_cpid"),      # PR_INTERNET_CPID = UTF-8(65001)
+)
+
+
+def _apply_codepage_hardening(mail):
+    """逐项写入代码页属性，返回逐项结果；单项失败不影响其余项，也绝不抛出。"""
+    result = {"items": [], "ok": False, "errors": []}
+    pa = getattr(mail, "PropertyAccessor", None)
+    if pa is None:
+        result["errors"].append("PropertyAccessor 不可用")
+        return result
+    for prop, value, key in _CODEPAGE_HARDENING_PROPS:
+        entry = {"prop": key, "set": False}
+        try:
+            pa.SetProperty(prop, value)
+            entry["set"] = True
+        except Exception as e:
+            entry["error"] = str(e)
+            result["errors"].append("%s: %s" % (key, e))
+        result["items"].append(entry)
+    result["ok"] = bool(result["items"]) and all(e.get("set") for e in result["items"])
+    return result
+
+
+def _readback_codepage_hardening(mail):
+    """Save 后读回代码页属性，验证持久化；读不到的项标记为 None。"""
+    out = {}
+    pa = getattr(mail, "PropertyAccessor", None)
+    if pa is None:
+        return {key: None for _, _, key in _CODEPAGE_HARDENING_PROPS}
+    for prop, value, key in _CODEPAGE_HARDENING_PROPS:
+        try:
+            out[key] = pa.GetProperty(prop)
+        except Exception as e:
+            out[key] = None
+            out[key + "_error"] = str(e)
+    return out
+
+
 def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None,
-                          owner_pw="", extra_cc="", extra_bcc=""):
+                          owner_pw="", extra_cc="", extra_bcc="",
+                          hardening_result=None):
     """在 Outlook 草稿箱创建邮件（只 Save，绝不 Send）。
 
     铁律：正文/标题里的权限口令会被 scrub 掉（架构 + 兜底双保险）。
+    v3.9.17：若传入 hardening_result=dict，编码加固（代码页显式声明）的
+    逐项写入结果与保存后读回值会填入该字典，供执行记录/日志呈现。
     """
     for attachment in attachments:
         _check_attachment_name(Path(attachment).name,
@@ -2848,19 +2899,7 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None
         mail.SentOnBehalfOfName = from_addr
     for f in attachments:
         mail.Attachments.Add(str(Path(f).resolve()))  # Outlook 是独立进程，必须绝对路径
-    # v3.9.17 编码加固（2026-10-30 NAV乱码事件）：
-    # 显式声明代码页，杜绝草稿在导出 .msg / 跨区域(中英文系统)打开与发送时的码制回退歧义。
-    # 背景：事发草稿缺失 PR_MESSAGE_CODEPAGE / PR_INTERNET_CPID，中文系统(CP_ACP=936)
-    # 回退解码 RTF 的 cp1252 转义字节（\'93/\'94 弯引号→"窶…"），并疑似触发云端签名
-    # 改写的 UTF-16 误解码，导致整封正文乱码。显式声明后不再依赖机器区域设置。
-    # 注：此为加固措施；该事件的最终根因（云端窗口期故障 vs 本地转换变体）仍以
-    #     复现实验结论为准。
-    try:
-        _pa = mail.PropertyAccessor
-        _pa.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3FFD0003", 1252)   # PR_MESSAGE_CODEPAGE = 1252（与RTF \ansicpg1252 一致）
-        _pa.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3FDE0003", 65001)  # PR_INTERNET_CPID = UTF-8(65001)
-    except Exception:
-        pass  # 属性写入失败不阻断草稿创建（兼容旧版Outlook）
+    hardening = _apply_codepage_hardening(mail)
     try:
         mail.Save()  # 只存草稿；不调用 Send
     finally:
@@ -2870,6 +2909,15 @@ def create_outlook_draft(rec, attachments, subject_tpl, body_tpl, field_map=None
                 Path(_p).unlink(missing_ok=True)
             except Exception:
                 pass
+    if hardening_result is not None:
+        hardening["readback"] = _readback_codepage_hardening(mail)
+        hardening["persisted"] = all(
+            hardening.get("readback", {}).get(key) == value
+            for _, value, key in _CODEPAGE_HARDENING_PROPS
+        )
+        hardening["ok"] = bool(hardening.get("ok")) and hardening["persisted"]
+        hardening_result.clear()
+        hardening_result.update(hardening)
     return mail
 
 
@@ -3385,11 +3433,19 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
                     owner_pw = rep.get("owner_pw", "")
                     if opts.get("gp_owner_mode") and opts.get("gp_owner_pw"):
                         owner_pw = opts["gp_owner_pw"]
+                    hardening = {}
                     create_outlook_draft(rec, files, subject_tpl, body_tpl,
-                                         fmap, owner_pw)
+                                         fmap, owner_pw,
+                                         hardening_result=hardening)
                     item["draft"] = "ok"
                     run["stats"]["ok"] += 1
-                    _log("[草稿OK] %s -> Outlook 草稿箱（未发送）" % item["name"])
+                    if hardening.get("ok"):
+                        note = "；编码加固: 全部生效"
+                    elif hardening.get("errors"):
+                        note = "；编码加固: 失败（%s）" % "；".join(hardening["errors"])
+                    else:
+                        note = ""
+                    _log("[草稿OK] %s -> Outlook 草稿箱（未发送）%s" % (item["name"], note))
                 except Exception as e:
                     item["draft"] = "失败:%s" % str(e)[:60]
                     item["error"] = str(e)
