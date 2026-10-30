@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.15"
+APP_VERSION = "3.9.16"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -117,6 +117,22 @@ def app_dir() -> Path:
     return Path(__file__).parent
 
 
+def _clear_update_staging(base):
+    """Discard only updater staging after checking for protected data and links."""
+    import shutil
+    base = Path(base).resolve()
+    staging = base / '.update_staging'
+    if staging.resolve().parent != base or staging.name != '.update_staging':
+        raise RuntimeError('更新临时目录校验失败')
+    if staging.exists():
+        blocked = {'lp_data', 'lp_data.json', 'lp_data.json.bak', 'lp_run_log.csv'}
+        def unsafe(p):
+            return p.is_symlink() or getattr(p, 'is_junction', lambda: False)() or p.name.lower() in blocked
+        if unsafe(staging) or any(unsafe(p) for p in staging.rglob('*')):
+            raise RuntimeError('更新临时目录包含用户数据或链接，请手动检查')
+        shutil.rmtree(staging)
+
+
 def _write_update_helper(base, source):
     """Install with native PowerShell file operations and a second progress window."""
     base, source = Path(base).resolve(), Path(source).resolve()
@@ -136,7 +152,7 @@ $created=New-Object 'System.Collections.Generic.List[string]'
 function Protected([string]$relative) {
     $parts=$relative -split '[\\/]'
     return ($parts -contains 'lp_data' -or $parts -contains '.update_backups' -or
-        [IO.Path]::GetFileName($relative) -in @('lp_data.json','lp_data.json.bak','lp_data.json.tmp','lp_run_log.csv','lp_data.example.json','run_update.ps1','run_update.bat'))
+        [IO.Path]::GetFileName($relative) -in @('lp_data.json','lp_data.json.bak','lp_data.json.tmp','lp_run_log.csv','lp_data.example.json','run_update.ps1','run_update.bat','.update_manifest.json'))
 }
 function Destination([string]$relative) {
     $target=[IO.Path]::GetFullPath((Join-Path $root $relative))
@@ -6676,6 +6692,7 @@ class App:
 
         # --- 2) API：补充更新说明 / 资产大小与 digest（拿不到不算失败） ---
         body, asset_url, asset_size, asset_digest = "", None, None, None
+        light_asset = None
         try:
             api = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
             headers = {"User-Agent": "doc-mailer",
@@ -6696,6 +6713,11 @@ class App:
                 asset_url = asset.get("browser_download_url")
                 asset_size = asset.get("size")
                 asset_digest = asset.get("digest")
+            light = next((a for a in d.get("assets", [])
+                          if str(a.get("name", "")) == "doc-mailer_v%s_update.zip" % str(tag).lstrip('vV')), None)
+            if light:
+                light_asset = {"asset_url": light.get("browser_download_url"),
+                               "asset_size": light.get("size"), "asset_digest": light.get("digest")}
         except Exception as e:
             msg = "GitHub API：%s" % e
             self._last_update_err = ((self._last_update_err + "；")
@@ -6712,7 +6734,7 @@ class App:
                          "doc-mailer_v%s_portable.zip" % (UPDATE_REPO, tag, ver))
         return {"tag": tag, "body": body, "url": html_url,
                 "asset_url": asset_url, "asset_size": asset_size,
-                "asset_digest": asset_digest}
+                "asset_digest": asset_digest, "light_asset": light_asset}
 
     def check_update(self, auto=False):
         def work():
@@ -6833,6 +6855,7 @@ class App:
             import stat
             staging = base / ".update_staging"
             zip_path = base / ".update_pkg.zip"
+            staging_owned = False
             class Cancelled(Exception):
                 pass
             def check_cancel():
@@ -6842,75 +6865,120 @@ class App:
                 check_cancel()
                 self._q.put(("update_progress", (title, percent, detail)))
             def clear_staging():
-                if staging.resolve().parent != base or staging.name != ".update_staging":
-                    raise RuntimeError("更新临时目录校验失败")
-                if staging.exists():
-                    shutil.rmtree(staging)
+                _clear_update_staging(base)
             try:
-                report("正在下载更新", 0, "正在连接下载服务器…")
-                last = [None]
-                def progress(blocknum, blocksize=1, totalsize=0):
-                    check_cancel()
-                    total = int(totalsize or 0)
-                    if total <= 0:
-                        total = int(info.get("asset_size") or 0)
-                    done = max(0, int(blocknum) * int(blocksize))
-                    if total > 0:
-                        done = min(done, total)
-                        percent = min(70, int(done * 70 / total))
-                        detail = "已下载 %.1f / %.1f MB（%d%%）" % (done / 1048576, total / 1048576, int(done * 100 / total))
-                    else:
-                        percent = None
-                        detail = "已下载 %.1f MB，服务器未提供总大小" % (done / 1048576)
-                    if percent != last[0] or percent is None:
-                        last[0] = percent
-                        report("正在下载更新", percent, detail)
-                import urllib.request
-                urllib.request.urlretrieve(info["asset_url"], zip_path, reporthook=progress)
-                check_cancel()
-                size = zip_path.stat().st_size
-                if info.get("asset_size") and size != int(info["asset_size"]):
-                    raise RuntimeError("下载大小不符，请重试")
-                report("正在校验下载文件", 72, "正在核对大小和 SHA256…")
-                digest = info.get("asset_digest") or ""
-                if digest.startswith("sha256:"):
-                    with zip_path.open("rb") as stream:
-                        actual = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
-                    if actual.lower() != digest.lower():
-                        raise RuntimeError("下载文件 SHA256 校验失败，请重试")
-                report("正在检查更新包", 78, "正在检查 ZIP 完整性与文件路径…")
-                with zipfile.ZipFile(zip_path) as archive:
-                    if archive.testzip():
-                        raise RuntimeError("下载包损坏，请重试")
-                    members = archive.infolist()
-                    for member in members:
-                        target = (staging / member.filename.replace("\\", "/")).resolve()
-                        if not target.is_relative_to(staging.resolve()) or stat.S_ISLNK(member.external_attr >> 16):
-                            raise RuntimeError("更新包包含不安全的文件路径")
-                        parts = [p.lower() for p in Path(member.filename.replace("\\", "/")).parts]
-                        if "lp_data" in parts or (parts and parts[-1] in ("lp_data.json", "lp_data.json.bak", "lp_run_log.csv")):
-                            raise RuntimeError("更新包不应包含用户数据，已停止更新")
-                    clear_staging()
-                    staging.mkdir()
-                    total = max(1, sum(m.file_size for m in members))
-                    done, last_percent = 0, -1
-                    for member in members:
+                light = info.get("light_asset") or {}
+                marker = base / "runtime" / ".docmailer-runtime-id"
+                python = base / "runtime" / "python.exe"
+                use_light = bool(light.get("asset_url") and marker.is_file() and python.is_file())
+                chosen = light if use_light else info
+                while True:
+                    report("正在下载更新", 0, "正在连接下载服务器…")
+                    last = [None]
+                    def progress(blocknum, blocksize=1, totalsize=0):
                         check_cancel()
-                        archive.extract(member, staging)
-                        done += member.file_size
-                        percent = 82 + int(13 * done / total)
-                        if percent != last_percent:
-                            report("正在解压更新", percent, "已解压 %d%%" % int(done * 100 / total))
-                            last_percent = percent
-                source = staging / "app" if (staging / "app").is_dir() else staging
-                for filename in ("lp_tool.py", "lp_v3.py", "watermark_encrypt.py", "start.bat"):
-                    if not (source / filename).is_file():
-                        raise RuntimeError("更新包缺少必需文件：" + filename)
-                expected_version = str(info["tag"]).lstrip("vV")
-                for filename in ("lp_tool.py", "lp_v3.py"):
-                    match = re.search(r'APP_VERSION\s*=\s*"([^\"]+)"', (source / filename).read_text(encoding="utf-8"))
-                    if not match or match.group(1) != expected_version:
-                        raise RuntimeError("更新包版本与目标版本不一致")
+                        total = int(totalsize or 0)
+                        if total <= 0:
+                            total = int(chosen.get("asset_size") or 0)
+                        done = max(0, int(blocknum) * int(blocksize))
+                        if total > 0:
+                            done = min(done, total)
+                            percent = min(70, int(done * 70 / total))
+                            detail = "已下载 %.1f / %.1f MB（%d%%）" % (done / 1048576, total / 1048576, int(done * 100 / total))
+                        else:
+                            percent = None
+                            detail = "已下载 %.1f MB，服务器未提供总大小" % (done / 1048576)
+                        if percent != last[0] or percent is None:
+                            last[0] = percent
+                            report("正在下载更新", percent, detail)
+                    import urllib.request
+                    try:
+                        urllib.request.urlretrieve(chosen["asset_url"], zip_path, reporthook=progress)
+                    except Cancelled:
+                        raise
+                    except Exception:
+                        if not use_light:
+                            raise
+                        zip_path.unlink(missing_ok=True)
+                        report("正在准备完整更新", 0, "轻量更新包暂不可用，改用完整安装包。")
+                        chosen, use_light = info, False
+                        continue
+                    check_cancel()
+                    size = zip_path.stat().st_size
+                    if chosen.get("asset_size") and size != int(chosen["asset_size"]):
+                        raise RuntimeError("下载大小不符，请重试")
+                    report("正在校验下载文件", 72, "正在核对大小和 SHA256…")
+                    digest = chosen.get("asset_digest") or ""
+                    if digest.startswith("sha256:"):
+                        with zip_path.open("rb") as stream:
+                            actual = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+                        if actual.lower() != digest.lower():
+                            raise RuntimeError("下载文件 SHA256 校验失败，请重试")
+                    report("正在检查更新包", 78, "正在检查 ZIP 完整性与文件路径…")
+                    with zipfile.ZipFile(zip_path) as archive:
+                        if archive.testzip():
+                            raise RuntimeError("下载包损坏，请重试")
+                        members = archive.infolist()
+                        for member in members:
+                            target = (staging / member.filename.replace("\\", "/")).resolve()
+                            if not target.is_relative_to(staging.resolve()) or stat.S_ISLNK(member.external_attr >> 16):
+                                raise RuntimeError("更新包包含不安全的文件路径")
+                            parts = [p.lower() for p in Path(member.filename.replace("\\", "/")).parts]
+                            if "lp_data" in parts or (parts and parts[-1] in ("lp_data.json", "lp_data.json.bak", "lp_run_log.csv")):
+                                raise RuntimeError("更新包不应包含用户数据，已停止更新")
+                        clear_staging()
+                        staging.mkdir()
+                        staging_owned = True
+                        total = max(1, sum(m.file_size for m in members))
+                        done, last_percent = 0, -1
+                        for member in members:
+                            check_cancel()
+                            archive.extract(member, staging)
+                            done += member.file_size
+                            percent = 82 + int(13 * done / total)
+                            if percent != last_percent:
+                                report("正在解压更新", percent, "已解压 %d%%" % int(done * 100 / total))
+                                last_percent = percent
+                    source = staging / "app" if (staging / "app").is_dir() else staging
+                    for filename in ("lp_tool.py", "lp_v3.py", "watermark_encrypt.py", "start.bat"):
+                        if not (source / filename).is_file():
+                            raise RuntimeError("更新包缺少必需文件：" + filename)
+                    expected_version = str(info["tag"]).lstrip("vV")
+                    for filename in ("lp_tool.py", "lp_v3.py"):
+                        match = re.search(r'APP_VERSION\s*=\s*"([^\"]+)"', (source / filename).read_text(encoding="utf-8"))
+                        if not match or match.group(1) != expected_version:
+                            raise RuntimeError("更新包版本与目标版本不一致")
+                    if use_light:
+                        manifest_path = source / ".update_manifest.json"
+                        if not manifest_path.is_file():
+                            raise RuntimeError("轻量更新包缺少运行库标识")
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        allowed = {"lp_tool.py", "lp_v3.py", "watermark_encrypt.py", "start.bat", "icon.ico", "使用说明.txt", "源码获取说明.txt", ".update_manifest.json"}
+                        if manifest.get("version") != expected_version or any(p.is_dir() or p.name not in allowed for p in source.iterdir()):
+                            raise RuntimeError("轻量更新包内容或版本不正确")
+                        runtime_id = manifest.get("runtime_id")
+                        try:
+                            installed_id = marker.read_text(encoding="ascii").strip()
+                        except (OSError, UnicodeError):
+                            installed_id = ""
+                        runtime_ok = (isinstance(runtime_id, str) and re.fullmatch(r"[0-9a-f]{64}", runtime_id)
+                                      and installed_id == runtime_id)
+                        if runtime_ok:
+                            import subprocess
+                            try:
+                                check = subprocess.run([str(python), "-E", "-s", "-B", "-c", "import lp_tool,lp_v3; assert lp_tool.APP_VERSION==lp_v3.APP_VERSION"], cwd=str(source), capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                runtime_ok = check.returncode == 0
+                            except (OSError, subprocess.TimeoutExpired):
+                                runtime_ok = False
+                        if not runtime_ok:
+                            clear_staging()
+                            staging_owned = False
+                            zip_path.unlink(missing_ok=True)
+                            report("正在准备完整更新", 0, "运行库不匹配或依赖检查失败，改用完整安装包。")
+                            chosen = info
+                            use_light = False
+                            continue
+                    break
                 report("正在准备安装", 97, "版本已核对；准备备份、替换和重启程序…")
                 _write_update_helper(base, source)
                 zip_path.unlink()
@@ -6918,10 +6986,16 @@ class App:
                 self._q.put(("update_ready", None))
             except Cancelled:
                 zip_path.unlink(missing_ok=True)
-                clear_staging()
+                if staging_owned:
+                    clear_staging()
                 self._q.put(("update_cancelled", None))
             except Exception as error:
                 zip_path.unlink(missing_ok=True)
+                try:
+                    if staging_owned:
+                        clear_staging()
+                except Exception:
+                    pass
                 self._q.put(("update_err", "自动更新失败：%s\n当前程序与数据未替换，可重试或到 Releases 下载。" % error))
         self._update_thread = threading.Thread(target=work, daemon=True)
         self._update_thread.start()
@@ -7023,6 +7097,10 @@ class App:
                                 self._close_update_progress()
                                 self.root.destroy()
                     else:
+                        try:
+                            _clear_update_staging(app_dir())
+                        except Exception as error:
+                            messagebox.showwarning("清理更新临时文件", str(error))
                         self._close_update_progress()
                 elif kind == "done":
                     self.running = False
