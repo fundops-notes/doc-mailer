@@ -396,10 +396,10 @@ def test_run_items_reports_missing_attach_file(tmp_path):
     assert errs and "不存在" in errs[0][2]
 
 
-def test_run_items_reports_empty_pipeline():
+def test_run_items_warns_empty_pipeline(tmp_path):
     ev = _event(recips=[{"name": "甲"}], pipeline=[])
-    outputs, warns, errs = run_items(ev, Path("out"))
-    assert errs and "流水线为空" in errs[0][2]
+    outputs, warns, errs = run_items(ev, tmp_path)
+    assert not errs and not outputs and any("流水线为空" in w for w in warns)
 
 
 # ---------------------------------------------------------------- Word 环节

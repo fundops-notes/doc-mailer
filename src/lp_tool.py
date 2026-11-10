@@ -63,7 +63,7 @@ from lp_v3 import (DEFAULT_FILENAME_TPL, GRANULARITIES, GRANULARITY_LABELS,
                    parse_import_rows, parse_import_rows_v3, pw_fingerprint,
                    read_spreadsheet, sanitize_filename, split_mails, split_paths)
 
-APP_VERSION = "3.9.17"
+APP_VERSION = "3.9.18"
 # lp_v3.py 里也有一份版本号（导出备份会带上）。两处必须一致。
 # 注意：发布检查要求这里保留当前版本的 APP_VERSION 字面量，别改成 import。
 assert lp_v3.APP_VERSION == APP_VERSION, "版本号不一致：lp_tool.py 与 lp_v3.py 必须同步"
@@ -4120,6 +4120,9 @@ class App:
                                  "以下问题必须先修正：\n\n"
                                  + "\n".join("· " + e for e in errs[:15]))
             return False
+        if not any(i.get("enabled", True) for i in ev.get("pipeline") or []):
+            if not messagebox.askyesno("流水线为空", "没有启用的流水线，不会自动处理文档。\n\n请确认附件设置；没有附件也可以生成邮件草稿。\n\n继续？"):
+                return False
         self._show_duplicate_password_warning(_warns)
         # v3.6.0：统一以「设置 → 默认输出目录」为准（未设置 = 程序所在文件夹）
         outdir = self._default_outdir()
@@ -4204,6 +4207,8 @@ class App:
             files = custom.get(name, results.get(name) or [])
             if isinstance(files, str): files=lp_v3.split_paths(files)
             state = "已处理" if files else ("失败/未处理" if done else "未处理")
+            if not files and not any(i.get("enabled", True) for i in ev.get("pipeline") or []):
+                state = "无附件"
             if name in custom: state="已自定义"
             tree.insert("", "end", values=[
                 name,
@@ -6239,7 +6244,8 @@ class App:
         if not messagebox.askyesno(
                 "确认生成",
                 "即将为「%s」生成全部文件与 Outlook 草稿。\n\n"
-                "草稿只写入草稿箱，不会自动发送。\n\n开始？" % ev.get("name", "")):
+                "草稿只写入草稿箱，不会自动发送。%s\n\n开始？" %
+                (ev.get("name", ""), "\n\n流水线为空，请确认是否需要附件。" if not any(i.get("enabled", True) for i in ev.get("pipeline") or []) else "")):
             return
         # v3.6.0：草稿生成同样使用统一的默认输出目录
         outdir = self._default_outdir()

@@ -38,7 +38,7 @@ import watermark_encrypt as wm
 # 基础工具
 # ============================================================================
 
-APP_VERSION = "3.9.17"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
+APP_VERSION = "3.9.18"   # 必须与 lp_tool.py 的 APP_VERSION 一致（lp_tool 启动时会断言）
 
 DATA_DIR_NAME = "lp_data"
 LEGACY_DATA_FILE = "lp_data.json"
@@ -2552,7 +2552,7 @@ def run_items(event, outdir, word=None, only_recips=None, log=None, progress=Non
     errors = []
     warnings = []
     if not items:
-        return outputs, warnings, [("", "", "流水线为空，没有任何启用的条目")]
+        return outputs, ["流水线为空：不会自动处理文档，可以生成无附件草稿"], []
 
     ctx = RunContext(event, outdir, word=word)
     if only_recips is not None:
@@ -2959,12 +2959,12 @@ def preflight(event, store=None):
             for m in split_mails(r.get("to", "")):
                 if "@" not in m or "." not in m.split("@")[-1]:
                     warnings.append("%s：邮箱格式可疑：%s" % (tag, m))
-        if not r.get("open_pw"):
+        if steps and not r.get("open_pw"):
             errors.append("%s：打开口令为空" % tag)
         gp_on = bool(opts.get("gp_owner_mode")) and bool(opts.get("gp_owner_pw"))
-        if not r.get("owner_pw") and not gp_on:
+        if steps and not r.get("owner_pw") and not gp_on:
             errors.append("%s：权限口令为空（留档缺失将无法解除限制）" % tag)
-        elif r.get("open_pw") and r.get("open_pw") == r.get("owner_pw"):
+        elif steps and r.get("open_pw") and r.get("open_pw") == r.get("owner_pw"):
             errors.append("%s：权限口令与打开口令相同（收件人将获得全部权限）" % tag)
         if r.get("open_pw"):
             seen_pw.setdefault(r["open_pw"], []).append(tag)
@@ -2974,7 +2974,7 @@ def preflight(event, store=None):
 
     # --- GP 统一口令冲突 ---
     gp = opts.get("gp_owner_pw") if opts.get("gp_owner_mode") else ""
-    if gp:
+    if gp and steps:
         clash = [r.get("name", "") for r in recips if r.get("open_pw") == gp]
         if clash:
             errors.append("GP 统一权限口令与以下收件人的打开口令相同（对方将获得全部权限）：%s"
@@ -3012,7 +3012,7 @@ def preflight(event, store=None):
                 errors.append("%s：保存的自定义文件不存在：%s" % (name, path))
     # --- 流水线条目 ---
     if not steps and automatic:
-        errors.append("流水线为空，没有任何启用的条目")
+        warnings.append("流水线为空：不会自动处理文档，请确认附件；可以生成无附件草稿")
     for i, it in enumerate(steps if automatic else []):
         label = "第%d条 %s" % (i + 1, it.get("name") or
                                ITEM_KIND_LABELS.get(it.get("kind"), ""))
@@ -3242,8 +3242,6 @@ def preview_plan(event):
     """
     steps = [s for s in (event.get("pipeline") or []) if s.get("enabled", True)]
     out = []
-    if not steps and not event.get("process_overrides"):
-        return out
     prepared = prepared_files_current(event)
     for key, unit in draft_units(event):
         if prepared:
@@ -3419,7 +3417,7 @@ def run_event(store, event, only_recips=None, log=None, progress=None,
             item["draft"] = "跳过(附件缺失)"
             run["stats"]["skip"] += 1
             _log("[附件缺失] %s：%s" % (item["name"], "、".join(missing[:3])))
-        elif not files:
+        elif not files and steps:
             item["draft"] = "跳过(无附件)"
             run["stats"]["skip"] += 1
         elif not unit.get("rep", {}).get("to") and len(names) == 1:

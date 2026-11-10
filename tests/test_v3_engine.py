@@ -53,6 +53,7 @@ def test_preflight_blocks_missing_and_matching_owner_but_warns_duplicate_open():
         {"name": "丙", "to": "c@x.com", "open_pw": "dup", "owner_pw": "ow3"},
         {"name": "丁", "to": "d@x.com", "open_pw": "dup", "owner_pw": "ow4"},
     ])
+    ev['pipeline'] = [normalize_item({'kind': 'pdf'})]
     errors, warnings, _i = preflight(ev)
     assert any("打开口令为空" in e for e in errors)
     assert any("相同" in e for e in errors)
@@ -64,6 +65,7 @@ def test_preflight_gp_password_conflict():
     ev = _event(recips=[{"name": "甲", "to": "a@x.com", "open_pw": "gppw",
                          "owner_pw": "ow1"}],
                 gp_owner_mode=True, gp_owner_pw="gppw")
+    ev['pipeline'] = [normalize_item({'kind': 'pdf'})]
     errors, _w, _i = preflight(ev)
     assert any("GP 统一权限口令" in e for e in errors)
 
@@ -87,11 +89,12 @@ def test_preflight_blocks_missing_template_file(tmp_path):
     assert any("Word 模板不存在" in e for e in errors)
 
 
-def test_preflight_blocks_empty_pipeline():
+def test_preflight_warns_empty_pipeline():
     ev = _event(recips=[{"name": "甲", "to": "a@x.com", "open_pw": "op1",
                          "owner_pw": "ow1"}])
-    errors, _w, _i = preflight(ev)
-    assert any("流水线为空" in e for e in errors)
+    errors, warnings, _i = preflight(ev)
+    assert not errors
+    assert any("流水线为空" in w for w in warnings)
 
 
 def test_preflight_detects_dangling_placeholder_in_real_docx(word_template):
@@ -281,6 +284,7 @@ def test_run_event_preflight_failure_produces_nothing(tmp_path):
     store = Store(tmp_path)
     store.ensure_dirs()
     ev = _event(recips=[{"name": "甲", "to": "a@x.com", "open_pw": "", "owner_pw": ""}])
+    ev['pipeline'] = [normalize_item({'kind': 'pdf'})]
     run = run_event(store, ev, create_drafts=False, outdir=str(tmp_path / "out"))
     assert run["status"] == "preflight_failed"
     assert run["items"] == []
