@@ -2035,3 +2035,10 @@ CI 40629049898 success；Release 426244653；两个资产重下载与本地哈�
 ## v3.9.17 Outlook 编码与核对提示
 
 逐项设置代码页，Save后读回；读回不符、属性异常记警告并说明草稿已保存，批量汇总提醒核对，避免重复生成。同步后pytest 463 passed；真实Tk/Office E2E 79 PASS / 0 FAIL（Outlook fake）；真实Outlook无收件人测试草稿保存后重打开，1252/65001和中英文正文读回通过，测试草稿保留未发送；未验证Exclaimer及跨区域处理结果。v3.9.16轻量升级隔离实测7文件6.13秒。CI 41099805236 success，Release 429316129，三个资产重下载哈希一致、ZIP完整、exe签名Valid。
+
+
+### v3.9.18 空流水线支持纯邮件（2026-11-10）
+
+空流水线经确认可进入邮件模板并生成无附件 Outlook 草稿；已启用流水线但无产出仍跳过。空流水线不要求文件加密口令。批量预检提示并支持纯邮件。仅保存草稿，不发送。
+
+代码 3c9a307，tag v3.9.18；本机 pytest 467 passed，真实 Tk/Office E2E 79 PASS、0 FAIL（Outlook 为 fake）。CI 42747272024 success；Release 439900741；完整包、轻量包和 win64 包重新下载 SHA256 一致，下载 EXE 签名 Valid。目标机真实 Outlook 未验；现存归属不明 Word 进程未终止。
